@@ -1563,7 +1563,8 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
+    // Parse the OAI "reasoning_effort" field; "none" disables reasoning. Any other level also turns
+    // thinking on for templates with an enable_thinking switch, unless the request set enable_thinking itself.
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
         if (reasoning_effort == "none") {
@@ -1571,6 +1572,11 @@ json oaicompat_chat_params_parse(
             inputs.chat_template_kwargs.erase("reasoning_effort");
         } else if (!reasoning_effort.empty()) {
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+            if (!chat_template_kwargs_object.contains("enable_thinking")
+                && common_chat_templates_support_enable_thinking(opt.tmpls.get())) {
+                inputs.enable_thinking = true;
+                inputs.chat_template_kwargs["enable_thinking"] = "true";   // override a command-line false
+            }
         }
     }
 

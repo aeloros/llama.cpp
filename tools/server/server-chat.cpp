@@ -657,6 +657,15 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
             int budget_tokens = json_value(thinking, "budget_tokens", 10000);
             oai_body["thinking_budget_tokens"] = budget_tokens;
         }
+        // "enabled"/"adaptive" turn thinking on and "disabled" turns it off for this request,
+        // unless the request's own chat_template_kwargs already set enable_thinking
+        if (thinking_type == "enabled" || thinking_type == "adaptive" || thinking_type == "disabled") {
+            json kwargs = json_value(oai_body, "chat_template_kwargs", json::object());
+            if (!kwargs.contains("enable_thinking")) {
+                kwargs["enable_thinking"] = thinking_type != "disabled";
+                oai_body["chat_template_kwargs"] = kwargs;
+            }
+        }
     }
 
     // Handle Anthropic-specific metadata param
