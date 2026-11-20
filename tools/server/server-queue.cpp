@@ -87,7 +87,7 @@ int server_queue::get_new_id() {
     return new_id;
 }
 
-void server_queue::pop_deferred_task(int id_slot) {
+void server_queue::pop_deferred_task(int id_slot, int n_ctx_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!queue_tasks_deferred.empty()) {
         // try to find a task that uses the specified slot
@@ -99,6 +99,19 @@ void server_queue::pop_deferred_task(int id_slot) {
                 queue_tasks_deferred.erase(it);
                 found = true;
                 break;
+            }
+        }
+        // slots with their own limits: the first task may need a larger slot than the released one, so
+        // retry the first unpinned task that fits it instead (a prompt must be shorter than the slot's context)
+        if (!found && n_ctx_slot > 0) {
+            for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
+                if (it->id_slot == -1 && it->n_tokens() < n_ctx_slot) {
+                    QUE_DBG("pop deferred task (fits slot %d, n_ctx = %d), id_task = %d\n", id_slot, n_ctx_slot, it->id);
+                    queue_tasks.emplace_front(std::move(*it));
+                    queue_tasks_deferred.erase(it);
+                    found = true;
+                    break;
+                }
             }
         }
         // if not tasks found using the slot, just pop the first deferred task (default behavior)

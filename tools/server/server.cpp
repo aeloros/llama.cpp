@@ -127,10 +127,29 @@ static bool server_prepare_params(common_params & params, server_role_type role_
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+            if (!params.kv_unified_per_slot_list.empty()) {
+                params.n_parallel = (int32_t) params.kv_unified_per_slot_list.size();
+                SRV_TRC("n_parallel is set to auto, using one slot per --kv-unified-per-slot limit: n_parallel = %d and kv_unified = true\n",
+                        params.n_parallel);
+            } else {
+                SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
+                params.n_parallel = 4;
+            }
 
-            params.n_parallel = 4;
             params.kv_unified = true;
+        }
+
+        // a list of per-slot limits: one per slot, all in one shared pool
+        if (!params.kv_unified_per_slot_list.empty()) {
+            if ((int32_t) params.kv_unified_per_slot_list.size() != params.n_parallel) {
+                SRV_ERR("--kv-unified-per-slot has %zu limits but --parallel is %d: give one limit per slot\n",
+                        params.kv_unified_per_slot_list.size(), params.n_parallel);
+                return false;
+            }
+            if (!params.kv_unified) {
+                SRV_ERR("%s", "a list of --kv-unified-per-slot limits needs --kv-unified (one shared KV pool)\n");
+                return false;
+            }
         }
     }
 
@@ -140,7 +159,18 @@ static bool server_prepare_params(common_params & params, server_role_type role_
                                      params.n_ctx == 0 &&
                                      (uint32_t) params.fit_params_min_ctx != UINT32_MAX;
 
-    if (ctx_pool_auto_sized) {
+    if (ctx_pool_auto_sized && !params.kv_unified_per_slot_list.empty()) {
+        long long sum = 0;
+        for (const int32_t limit : params.kv_unified_per_slot_list) {
+            sum += limit;
+        }
+        if (sum > INT32_MAX) {
+            SRV_ERR("the --kv-unified-per-slot limits add up to %lld tokens, too many for one KV pool\n", sum);
+            return false;
+        }
+        params.n_ctx = (int32_t) sum;
+        SRV_INF("--kv-unified-per-slot: sizing KV pool to the sum of the slot limits = %d\n", params.n_ctx);
+    } else if (ctx_pool_auto_sized) {
         params.n_ctx = params.n_parallel * params.kv_unified_per_slot;
         SRV_INF("--kv-unified-per-slot: sizing KV pool to n_parallel * kv_unified_per_slot = %d * %d = %d\n", params.n_parallel,
                 params.kv_unified_per_slot, params.n_ctx);

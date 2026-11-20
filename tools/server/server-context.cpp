@@ -1449,7 +1449,23 @@ private:
             // note: the capping itself is done in n_ctx_slot(), here we only report it
             const int n_ctx_seq = llama_n_ctx_seq(ctx_tgt);
 
-            if (params_base.kv_unified_per_slot > 0) {
+            if (!params_base.kv_unified_per_slot_list.empty()) {
+                // one limit per slot: the pool can't overflow when the limits fit in it, since a slot's tokens,
+                // drafts included, never exceed its own limit and any free cell of the pool can hold them
+                long long sum = 0;
+                std::string limits;
+                for (const int32_t limit : params_base.kv_unified_per_slot_list) {
+                    sum += std::min(limit, n_ctx_seq);
+                    limits += (limits.empty() ? "" : ",") + std::to_string(limit);
+                }
+                SRV_INF("per-slot context limits: %s (sum %lld, KV pool %d)\n", limits.c_str(), sum, n_ctx_seq);
+                if (sum > n_ctx_seq) {
+                    SRV_WRN("the slot limits add up to %lld tokens, more than the KV pool (%d): the pool can overflow "
+                            "when every slot fills (raise -c, or unset it to size the pool to the sum)\n", sum, n_ctx_seq);
+                } else {
+                    SRV_INF("%s", "the slot limits fit in the KV pool, so it can't overflow\n");
+                }
+            } else if (params_base.kv_unified_per_slot > 0) {
                 if (n_ctx_seq > params_base.kv_unified_per_slot) {
                     SRV_INF("capping per-slot context (%d) to --kv-unified-per-slot (%d)\n",
                             n_ctx_seq, params_base.kv_unified_per_slot);
@@ -1529,7 +1545,7 @@ private:
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
-            slot.n_ctx   = n_ctx_slot();
+            slot.n_ctx   = n_ctx_slot(i);
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1541,7 +1557,9 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
-                queue_tasks.pop_deferred_task(id_slot);
+                // with per-slot limits, retry a deferred task that fits the released slot, not just the first one
+                const int n_ctx_released = params_base.kv_unified_per_slot_list.empty() ? 0 : slots[id_slot].n_ctx;
+                queue_tasks.pop_deferred_task(id_slot, n_ctx_released);
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -1805,6 +1823,9 @@ private:
 
         bool update_cache = false;
 
+        // with per-slot limits, only a slot whose context holds the prompt can serve an unpinned task
+        const int n_ctx_min = n_ctx_needed(task);
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1830,6 +1851,12 @@ private:
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
+                    continue;
+                }
+
+                // skip the slot if its context can't hold the prompt (pinned tasks keep their slot)
+                if (task.id_slot == -1 && slot.n_ctx < n_ctx_min) {
+                    SLT_TRC(slot, " - skipping, n_ctx = %d < %d needed\n", slot.n_ctx, n_ctx_min);
                     continue;
                 }
 
@@ -1872,7 +1899,8 @@ private:
 
         // find an empty slot, or the one that has been least recently used
         if (ret == nullptr) {
-            const auto free_slots = get_free_slots(1, -1);
+            // none free that is large enough: the caller defers the task until one is released
+            const auto free_slots = get_free_slots(1, -1, n_ctx_min);
 
             if (!free_slots.empty()) {
                 ret = free_slots[0];
@@ -2656,10 +2684,11 @@ private:
     }
 
     // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
-    std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
+    // n_ctx_min: only slots with at least this context (per-slot limits; 0 = any slot)
+    std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot, int n_ctx_min = 0) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (!slot.is_processing() && slot.id != exclude_id_slot && slot.n_ctx >= n_ctx_min) {
                 free_slots.push_back(&slot);
             }
         }
@@ -3067,7 +3096,11 @@ private:
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
-                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id);
+                        int n_ctx_min_child = 0;
+                        for (const auto & child : task.child_tasks) {
+                            n_ctx_min_child = std::max(n_ctx_min_child, n_ctx_needed(child));
+                        }
+                        std::vector<server_slot *> child_slots = get_free_slots(n_child_tasks, slot->id, n_ctx_min_child);
                         if (child_slots.size() < n_child_tasks) {
                             SRV_DBG("not enough free slots for child tasks, n_free = %zu, n_children = %zu, defer task, id_task = %d\n", child_slots.size(), n_child_tasks, id_task);
                             queue_tasks.defer(std::move(task));
@@ -5097,6 +5130,35 @@ private:
         }
 
         return std::min(res, llama_model_n_ctx_train(model_tgt));
+    }
+
+    // context size of slot id: its own --kv-unified-per-slot limit when a list is given, otherwise n_ctx_slot()
+    int n_ctx_slot(int id) const {
+        const auto & limits = params_base.kv_unified_per_slot_list;
+        if (limits.empty()) {
+            return n_ctx_slot();
+        }
+        GGML_ASSERT(id >= 0 && id < (int) limits.size());
+
+        const int res = std::min((int) llama_n_ctx_seq(ctx_tgt), (int) limits[id]);
+
+        return std::min(res, (int) llama_model_n_ctx_train(model_tgt));
+    }
+
+    // smallest slot context that can serve the task's prompt (a prompt must be shorter than the slot's context);
+    // 0 when slots have no individual limits, or when no slot could ever hold it, so that the usual choice and
+    // the usual context-size error apply instead of deferring the task forever
+    int n_ctx_needed(const server_task & task) const {
+        if (params_base.kv_unified_per_slot_list.empty()) {
+            return 0;
+        }
+        const int n_needed = task.n_tokens() + 1;
+        for (const auto & slot : slots) {
+            if (slot.n_ctx >= n_needed) {
+                return n_needed;
+            }
+        }
+        return 0;
     }
 
     server_response_reader get_response_reader() {

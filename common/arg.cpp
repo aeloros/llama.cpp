@@ -1626,11 +1626,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
-        { "--kv-unified-per-slot" }, "N",
+        { "--kv-unified-per-slot" }, "N[,N...]",
         "context limit per parallel slot (default: unset, behavior unchanged).\n"
-        "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
-        [](common_params & params, int value) {
-            params.kv_unified_per_slot = value;
+        "one value applies to every slot; a comma-separated list gives each slot its own limit, in slot order\n"
+        "(one value per slot, needs --kv-unified; requests that are not pinned with id_slot go to a slot large enough for their prompt).\n"
+        "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N, or to the sum of the list",
+        [](common_params & params, const std::string & value) {
+            const auto parts = string_split<std::string>(value, ',');
+            if (parts.size() <= 1) {
+                params.kv_unified_per_slot = std::stoi(value);
+                params.kv_unified_per_slot_list.clear();
+                return;
+            }
+            std::vector<int32_t> limits;
+            for (const auto & part : parts) {
+                const int limit = std::stoi(part);
+                if (limit <= 0) {
+                    throw std::invalid_argument("each --kv-unified-per-slot limit must be positive");
+                }
+                limits.push_back(limit);
+            }
+            params.kv_unified_per_slot      = *std::max_element(limits.begin(), limits.end());
+            params.kv_unified_per_slot_list = std::move(limits);
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
