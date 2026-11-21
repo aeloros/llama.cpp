@@ -48,8 +48,15 @@ typedef float (*vec_dot_KQ_t)(
 struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t K;
     uintptr_t V;
+    uintptr_t K_rows; // the rows of kv_rows as they are in K, copied next to each other; 0 if all of K is converted
+    uintptr_t V_rows;
     uintptr_t end;
 };
+
+// true if the rows of t ([ne0, n_rows, ne2, 1], f.ex. the K/V cache) are contiguous blocks of memory
+static inline bool ggml_cuda_flash_attn_ext_rows_are_blocks(const ggml_tensor * t) {
+    return t->ne[3] == 1 && t->nb[2] == ggml_row_size(t->type, t->ne[0]) && t->nb[1] == (size_t) t->ne[2]*t->nb[2];
+}
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
@@ -58,6 +65,8 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
+    const ggml_tensor * kv_rows = dst->src[5];
+
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
 
@@ -65,6 +74,35 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
+
+    // with kv_rows only the listed rows are converted, if they are clearly fewer than the rows of K and V:
+    // a sequence does not pay for the cells of the other sequences in the cache
+    // the rows are copied next to each other first, the result is K and V with one block of rows per slice
+    const int64_t n_rows = kv_rows ? kv_rows->ne[0]*kv_rows->ne[1] : 0;
+    if (kv_rows && need_f16_K && K->type != GGML_TYPE_F16 && need_f16_V && V->type != GGML_TYPE_F16 &&
+            4*n_rows <= 3*K->ne[1] && K->ne[1] == V->ne[1] &&
+            ggml_cuda_flash_attn_ext_rows_are_blocks(K) && ggml_cuda_flash_attn_ext_rows_are_blocks(V)) {
+        data.end    = GGML_PAD(data.end, 128);
+        data.K_rows = data.end;
+        data.end   += n_rows*K->nb[1];
+        data.end    = GGML_PAD(data.end, 128);
+        data.K      = data.end;
+        data.end   += n_rows*K->ne[0]*K->ne[2]*ggml_type_size(GGML_TYPE_F16);
+
+        if (V_is_K_view) {
+            data.V_rows = data.K_rows;
+            data.V      = data.K;
+        } else {
+            data.end    = GGML_PAD(data.end, 128);
+            data.V_rows = data.end;
+            data.end   += n_rows*V->nb[1];
+            data.end    = GGML_PAD(data.end, 128);
+            data.V      = data.end;
+            data.end   += n_rows*V->ne[0]*V->ne[2]*ggml_type_size(GGML_TYPE_F16);
+        }
+
+        return data;
+    }
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         data.end = GGML_PAD(data.end, 128);
@@ -1028,6 +1066,37 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// copies the rows of x listed in rows next to each other, a row has row_size elements of type T
+// a negative row is padding: it reads row 0, like the kernel does when it reads K/V through kv_rows
+template <typename T>
+static __global__ void flash_attn_gather_rows(
+        const T * __restrict__ x, T * __restrict__ y, const int32_t * __restrict__ rows, const int64_t row_size) {
+    const int64_t i = blockIdx.x;
+
+    const T * xi = x + int64_t(max(rows[i], 0))*row_size;
+    T       * yi = y + i*row_size;
+
+    for (int64_t j = threadIdx.x; j < row_size; j += blockDim.x) {
+        yi[j] = xi[j];
+    }
+}
+
+static inline void ggml_cuda_flash_attn_ext_gather_rows(
+        const char * x, char * y, const int32_t * rows, const int64_t n_rows, const size_t row_size, cudaStream_t stream) {
+    const dim3 blocks_num(n_rows, 1, 1);
+    const dim3 block_dim(4*WARP_SIZE, 1, 1);
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, 0, stream);
+    if (row_size % sizeof(uint32_t) == 0 && (uintptr_t) x % sizeof(uint32_t) == 0 && (uintptr_t) y % sizeof(uint32_t) == 0) {
+        ggml_cuda_kernel_launch(flash_attn_gather_rows<uint32_t>, launch_params,
+            (const uint32_t *) x, (uint32_t *) y, rows, (int64_t) (row_size/sizeof(uint32_t)));
+    } else {
+        ggml_cuda_kernel_launch(flash_attn_gather_rows<uint8_t>, launch_params,
+            (const uint8_t *) x, (uint8_t *) y, rows, (int64_t) row_size);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1084,7 +1153,37 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    // only the rows of kv_rows are converted: the kernel gets K/V with one block of rows per slice and no kv_rows
+    const bool gather_rows = f16_extra.K_rows != 0;
+
+    if (gather_rows) {
+        const int64_t n_rows = kv_rows->ne[0]*kv_rows->ne[1];
+
+        ggml_cuda_flash_attn_ext_gather_rows(K_data, (char *) f16_extra.K_rows, (const int32_t *) kv_rows->data, n_rows, K->nb[1], main_stream);
+        ggml_get_to_fp16_cuda(K->type)((const void *) f16_extra.K_rows, (half *) f16_extra.K, n_rows*K->ne[0]*K->ne[2], main_stream);
+
+        K_data = (const char *) f16_extra.K;
+        nb12   = K->ne[0]*sizeof(half);
+        nb11   = K->ne[2]*nb12;
+        nb13   = kv_rows->ne[0]*nb11;
+
+        if (V_is_K_view) {
+            V_data = K_data;
+            nb21   = nb11;
+            nb22   = nb12;
+            nb23   = nb13;
+        } else {
+            ggml_cuda_flash_attn_ext_gather_rows(V_data, (char *) f16_extra.V_rows, (const int32_t *) kv_rows->data, n_rows, V->nb[1], main_stream);
+            ggml_get_to_fp16_cuda(V->type)((const void *) f16_extra.V_rows, (half *) f16_extra.V, n_rows*V->ne[0]*V->ne[2], main_stream);
+
+            V_data = (const char *) f16_extra.V;
+            nb22   = V->ne[0]*sizeof(half);
+            nb21   = V->ne[2]*nb22;
+            nb23   = kv_rows->ne[0]*nb21;
+        }
+    }
+
+    if (!gather_rows && need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1112,7 +1211,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (!gather_rows && need_f16_V && V->type != GGML_TYPE_F16) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1189,7 +1288,7 @@ void launch_fattn(
     }
 
     // K/V are shared by all slices when read through kv_rows
-    if (kv_rows) {
+    if (kv_rows && !gather_rows) {
         nb13 = 0;
         nb23 = 0;
     }
@@ -1317,7 +1416,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
-        kv_rows ? (const int *) kv_rows->data : nullptr,
+        kv_rows && !gather_rows ? (const int *) kv_rows->data : nullptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
