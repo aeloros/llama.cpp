@@ -1954,7 +1954,8 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                // an empty slot (selected by id, the loop above skips it) keeps nothing: it takes the best match of the prompt cache
+                const float f_keep = ret->prompt.tokens.empty() ? 0.0f : (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
