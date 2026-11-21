@@ -1494,6 +1494,11 @@ private:
             }
         }
 
+        if (params_base.n_batch_busy > 0) {
+            SRV_INF("a slot reads at most %d prompt tokens per batch while other slots wait for that batch\n",
+                    params_base.n_batch_busy);
+        }
+
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
@@ -4591,8 +4596,18 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // the batch already holds tokens of other slots, which wait for it: read in smaller steps
+                    // the end of the prompt is left alone, the checkpoints below cut it at 4 + n_ubatch
+                    int32_t n_batch_slot = n_batch;
+                    if (params_base.n_batch_busy > 0 && n_tokens_prev > 0 && slot.can_split() && n_decision_first < 0) {
+                        const int32_t n_left = slot.task->n_tokens() - slot.prompt.n_tokens();
+                        if (!do_checkpoint || n_left >= 4 + n_ubatch + params_base.n_batch_busy) {
+                            n_batch_slot = std::min(n_batch, n_tokens_prev + params_base.n_batch_busy);
+                        }
+                    }
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

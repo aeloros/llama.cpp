@@ -1722,6 +1722,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--batch-size-busy"}, "N",
+        string_format("max prompt tokens a slot adds to a batch that other slots wait for, so that a long prompt "
+            "does not hold back the slots that generate (default: %d, 0 = no limit)", params.n_batch_busy),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--batch-size-busy must not be negative");
+            }
+            params.n_batch_busy = value;
+        }
+    ).set_env("LLAMA_ARG_BATCH_BUSY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
