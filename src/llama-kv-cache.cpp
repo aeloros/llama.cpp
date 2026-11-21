@@ -1289,7 +1289,8 @@ const std::vector<uint32_t> * llama_kv_cache::get_seq_groups() const {
 }
 
 int32_t llama_kv_cache::stream_add(ggml_backend_buffer_type_t buft, uint32_t size) {
-    if (!unified || other || size == 0) {
+    // not for a cache that shares cells: the other cache has its own stream map and tensors
+    if (!unified || other || v_cells_impl.use_count() > 1 || size == 0) {
         return -1;
     }
 

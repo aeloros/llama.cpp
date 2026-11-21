@@ -1651,6 +1651,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--kv-overflow-device" }, "<dev>",
+        "device for a second pool of KV cells, used by the slots of --kv-overflow-slots (default: none).\n"
+        "the model stays on the devices of --device, only the attention of these slots runs on <dev>.\n"
+        "needs --kv-unified, --kv-overflow-size and --kv-overflow-slots",
+        [](common_params & params, const std::string & value) {
+            const auto devices = parse_device_list(value);
+            if (devices.size() != 2 || devices[0] == nullptr) {
+                throw std::invalid_argument("--kv-overflow-device takes one device");
+            }
+            params.kv_overflow_device = devices[0];
+        }
+    ).set_env("LLAMA_ARG_KV_OVERFLOW_DEVICE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--kv-overflow-size" }, "N",
+        "number of KV cells on --kv-overflow-device, shared by the slots of --kv-overflow-slots",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--kv-overflow-size must be positive");
+            }
+            params.kv_overflow_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OVERFLOW_SIZE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--kv-overflow-slots" }, "N[,N...]",
+        "ids of the slots that keep their KV cells on --kv-overflow-device instead of the shared KV pool",
+        [](common_params & params, const std::string & value) {
+            params.kv_overflow_slots.clear();
+            for (const auto & part : string_split<std::string>(value, ',')) {
+                const int id = std::stoi(part);
+                if (id < 0) {
+                    throw std::invalid_argument("--kv-overflow-slots takes slot ids, starting at 0");
+                }
+                params.kv_overflow_slots.push_back(id);
+            }
+        }
+    ).set_env("LLAMA_ARG_KV_OVERFLOW_SLOTS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

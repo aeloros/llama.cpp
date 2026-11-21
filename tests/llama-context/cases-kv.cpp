@@ -270,6 +270,89 @@ struct case_streams_batch : ctx_test {
     }
 };
 
+// - add a second stream to the cache and take the cells of sequence 1 from it
+// - decode the prompt into both sequences
+// - save sequence 1, remove it, restore it: it continues like sequence 0
+// - restore the state of sequence 0 into sequence 1, across the streams: it continues like sequence 0
+struct case_streams_state : ctx_test {
+    case_streams_state(bool on_device) : on_device(on_device) {}
+
+    const char * name() const override { return on_device ? "streams_sd" : "streams_sh"; }
+
+    const char * description() const override {
+        return on_device ?
+            "the state of a sequence is saved and restored within and across streams (device buffers)" :
+            "the state of a sequence is saved and restored within and across streams (host buffers)";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx.get());
+
+        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192);
+        if (strm < 0) {
+            return case_result::skip("the memory has no streams");
+        }
+        CTX_REQUIRE(llama_memory_seq_set_stream(mem, 1, strm), "failed to assign seq 1 to the new stream");
+
+        const uint32_t flags = on_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : LLAMA_STATE_SEQ_FLAGS_NONE;
+
+        // keep two tokens of the prompt to continue with
+        const llama_pos n_tokens = (llama_pos) std::min<size_t>(mr.tokens.size(), 128) - 2;
+        CTX_REQUIRE(n_tokens >= 1, "the prompt is too short");
+
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            if (!decode_seq(ctx.get(), mr.tokens, 0, n_tokens, seq_id, false)) {
+                TLOG_ERR("%s: failed to decode the prompt for sequence %d\n", __func__, seq_id);
+                return case_result::fail();
+            }
+        }
+
+        // decode the next token of the prompt in both sequences and compare the logits
+        auto step_equal = [&](llama_pos pos, logits_diff & diff) {
+            std::vector<float> logits[2];
+            for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+                if (!decode_one(ctx.get(), mr.tokens[pos], pos, seq_id) || !get_current_logits(ctx.get(), logits[seq_id])) {
+                    return false;
+                }
+            }
+            diff = compare_logits(logits[0].data(), logits[1].data(), logits[0].size());
+            return true;
+        };
+
+        std::vector<uint8_t> state;
+        logits_diff diff;
+
+        if (!get_seq_state(ctx.get(), 1, flags, state) || !seq_rm(ctx.get(), 1) || !set_seq_state(ctx.get(), 1, flags, state)) {
+            return case_result::fail("failed to save and restore seq 1");
+        }
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == n_tokens - 1, "the restored seq 1 does not hold the prompt");
+        CTX_REQUIRE(step_equal(n_tokens, diff), "failed to continue after the restore of seq 1");
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "the restored seq 1 continued differently than seq 0" + diff_str(diff));
+
+        if (!get_seq_state(ctx.get(), 0, flags, state) || !seq_rm(ctx.get(), 1) || !set_seq_state(ctx.get(), 1, flags, state)) {
+            return case_result::fail("failed to restore the state of seq 0 into seq 1");
+        }
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == n_tokens, "seq 1 does not hold the state of seq 0");
+        CTX_REQUIRE(step_equal(n_tokens + 1, diff), "failed to continue after the restore across the streams");
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 1 with the state of seq 0 continued differently" + diff_str(diff));
+
+        return case_result::pass();
+    }
+
+private:
+    bool on_device;
+};
+
 // - load the state saved by the baseline case
 // - replay its last token
 // - generate again and compare against the baseline logits
@@ -979,6 +1062,8 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_seq_rm_isolated>());
     cases.push_back(std::make_unique<case_streams>());
     cases.push_back(std::make_unique<case_streams_batch>());
+    cases.push_back(std::make_unique<case_streams_state>(false));
+    cases.push_back(std::make_unique<case_streams_state>(true));
     cases.push_back(std::make_unique<case_state_load>());
     cases.push_back(std::make_unique<case_seq_cp>(false));
     cases.push_back(std::make_unique<case_seq_cp>(true));

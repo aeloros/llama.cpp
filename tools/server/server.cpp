@@ -151,6 +151,41 @@ static bool server_prepare_params(common_params & params, server_role_type role_
                 return false;
             }
         }
+
+        // a second pool of KV cells on another device, for some of the slots
+        if (params.kv_overflow_device != nullptr || params.kv_overflow_size > 0 || !params.kv_overflow_slots.empty()) {
+            if (params.kv_overflow_device == nullptr || params.kv_overflow_size <= 0 || params.kv_overflow_slots.empty()) {
+                SRV_ERR("%s", "--kv-overflow-device, --kv-overflow-size and --kv-overflow-slots have to be given together\n");
+                return false;
+            }
+            if (!params.kv_unified) {
+                SRV_ERR("%s", "--kv-overflow-device needs --kv-unified (one shared KV pool)\n");
+                return false;
+            }
+            for (const int32_t id : params.kv_overflow_slots) {
+                if (id >= params.n_parallel) {
+                    SRV_ERR("--kv-overflow-slots: there is no slot %d, --parallel is %d\n", id, params.n_parallel);
+                    return false;
+                }
+            }
+
+            // the context makes a backend for each device of the model, so the device is listed with no share of the model
+            auto & devices = params.devices; // ends with a nullptr
+            if (!devices.empty() && std::find(devices.begin(), devices.end(), params.kv_overflow_device) == devices.end()) {
+                const size_t n_devices = devices.size() - 1;
+
+                bool has_split = false;
+                for (size_t i = 0; i < n_devices; i++) {
+                    has_split = has_split || params.tensor_split[i] != 0.0f;
+                }
+                for (size_t i = 0; i < n_devices && !has_split; i++) {
+                    params.tensor_split[i] = 1.0f;
+                }
+                params.tensor_split[n_devices] = 0.0f;
+
+                devices.insert(devices.end() - 1, params.kv_overflow_device);
+            }
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c

@@ -661,6 +661,10 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset (with a list: the largest limit)
     std::vector<int32_t> kv_unified_per_slot_list; // one limit per slot, in slot order; empty = kv_unified_per_slot for every slot
+
+    ggml_backend_dev_t   kv_overflow_device = nullptr; // device of the added KV stream; nullptr = no added stream
+    int32_t              kv_overflow_size   = 0;       // cells of the added KV stream
+    std::vector<int32_t> kv_overflow_slots;            // slots that take their KV cells from the added stream
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise

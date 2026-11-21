@@ -13,6 +13,8 @@
 #include "server-stream.h"
 
 #include "build-info.h"
+
+#include "../../src/llama-ext.h" // staging API: llama_memory_stream_add
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -1535,6 +1537,28 @@ private:
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
+        }
+
+        if (params_base.kv_overflow_device != nullptr) {
+            llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+            const int32_t strm = llama_memory_stream_add(mem, params_base.kv_overflow_device, params_base.kv_overflow_size);
+            if (strm < 0) {
+                SRV_ERR("%s", "--kv-overflow-device: the memory of this model cannot have a second pool of KV cells\n");
+                return false;
+            }
+
+            std::string ids;
+            for (const int32_t id : params_base.kv_overflow_slots) {
+                if (!llama_memory_seq_set_stream(mem, id, strm)) {
+                    SRV_ERR("--kv-overflow-slots: failed to move slot %d to the second pool of KV cells\n", id);
+                    return false;
+                }
+                ids += (ids.empty() ? "" : ",") + std::to_string(id);
+            }
+
+            SRV_INF("second pool of %d KV cells on %s for the slots %s\n", params_base.kv_overflow_size,
+                    ggml_backend_dev_name(params_base.kv_overflow_device), ids.c_str());
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -5134,13 +5158,19 @@ private:
 
     // context size of slot id: its own --kv-unified-per-slot limit when a list is given, otherwise n_ctx_slot()
     int n_ctx_slot(int id) const {
-        const auto & limits = params_base.kv_unified_per_slot_list;
-        if (limits.empty()) {
-            return n_ctx_slot();
-        }
-        GGML_ASSERT(id >= 0 && id < (int) limits.size());
+        // the cells of the slot come from the shared pool, or from the pool of --kv-overflow-device
+        const auto & overflow = params_base.kv_overflow_slots;
+        const bool is_overflow = std::find(overflow.begin(), overflow.end(), id) != overflow.end();
 
-        const int res = std::min((int) llama_n_ctx_seq(ctx_tgt), (int) limits[id]);
+        int res = is_overflow ? params_base.kv_overflow_size : (int) llama_n_ctx_seq(ctx_tgt);
+
+        const auto & limits = params_base.kv_unified_per_slot_list;
+        if (!limits.empty()) {
+            GGML_ASSERT(id >= 0 && id < (int) limits.size());
+            res = std::min(res, (int) limits[id]);
+        } else if (params_base.kv_unified_per_slot > 0) {
+            res = std::min(res, params_base.kv_unified_per_slot);
+        }
 
         return std::min(res, (int) llama_model_n_ctx_train(model_tgt));
     }
