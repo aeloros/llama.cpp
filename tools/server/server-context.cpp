@@ -1564,6 +1564,19 @@ private:
             SRV_INF("second pool of %d KV cells on %s for the slots %s\n", params_base.kv_overflow_size,
                     ggml_backend_dev_name(params_base.kv_overflow_device), ids.c_str());
 
+            // like the first pool, this one can't overflow when the limits of its slots fit in it
+            long long sum = 0;
+            for (const int32_t id : params_base.kv_overflow_slots) {
+                sum += n_ctx_slot(id);
+            }
+            if (sum > params_base.kv_overflow_size) {
+                SRV_WRN("the limits of these slots add up to %lld tokens, more than the second pool (%d): it can overflow when "
+                        "they fill (raise --kv-overflow-size, or lower their --kv-unified-per-slot limits)\n",
+                        sum, params_base.kv_overflow_size);
+            } else {
+                SRV_INF("%s", "the limits of these slots fit in the second pool, so it can't overflow\n");
+            }
+
             // the draft context has a cache of its own, sized like the first pool: without a second pool of its own
             // it is full long before the slot is
             if (ctx_dft != nullptr) {
