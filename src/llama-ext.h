@@ -110,6 +110,18 @@ struct llama_device_memory_data {
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
+
+//
+// KV streams
+//
+
+// Add a stream of n_cells KV cells on a device (NULL for the CPU) to a unified KV cache.
+// Returns the stream id, or -1 if the memory does not support it.
+LLAMA_API int32_t llama_memory_stream_add(llama_memory_t mem, ggml_backend_dev_t dev, uint32_t n_cells);
+
+// Take the new cells of a sequence from a stream. Stream 0 is the one the cache was created with.
+// Returns false if the sequence still has cells.
+LLAMA_API bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);

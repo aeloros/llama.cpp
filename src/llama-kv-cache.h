@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -148,6 +149,11 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // only for a unified cache that does not share its cells
+    // the stream holds no cells until a sequence is assigned to it
+    int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size) override;
+    bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -158,8 +164,15 @@ public:
     //
 
     uint32_t get_size()     const;
+    uint32_t get_size(uint32_t strm) const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
+
+    bool get_unified() const;
+
+    // the stream of each sequence id if a ubatch must not hold sequences of different streams, otherwise nullptr
+    // pass it to llama_batch_allocr::split_reset
+    const std::vector<uint32_t> * get_seq_groups() const;
 
     bool get_has_shift() const;
 
@@ -287,7 +300,12 @@ private:
     bool v_trans = true;  // the value tensor is transposed
 
     const uint32_t n_seq_max = 1;
-    const uint32_t n_stream  = 1;
+    uint32_t n_stream = 1;
+
+    // one pool of cells for all sequences, instead of one stream per sequence
+    const bool unified = true;
+
+    const std::string name_tag;
 
     // SWA
     const uint32_t n_swa = 0;
@@ -373,6 +391,9 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
+
+    // true for a stream of a unified cache that was added with stream_add: it has K/V tensors of its own
+    bool is_stream_added(uint32_t strm) const;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

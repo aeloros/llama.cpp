@@ -15,6 +15,39 @@ static void init_model(llama_model & model, uint32_t n_layer) {
     model.layers.resize(n_layer);
 }
 
+// a token-less ubatch: n tokens of seq_id starting at position p0, appended to ubatch if it already has tokens
+static void ubatch_add(llama_ubatch & ubatch, llama_seq_id seq_id, llama_pos p0, uint32_t n) {
+    if (!ubatch.data) {
+        ubatch = {};
+        ubatch.data = std::make_shared<llama_ubatch::data_t>();
+        ubatch.data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
+        ubatch.n_seqs = 1;
+        ubatch.n_pos = 1;
+    }
+    auto & data = *ubatch.data;
+    data.seq_idx[seq_id] = (int32_t) data.seq_id_unq.size();
+    data.seq_id_unq.push_back(seq_id);
+    for (uint32_t i = 0; i < n; ++i) {
+        data.pos.push_back(p0 + i);
+        data.n_seq_id.push_back(1);
+        data.seq_id_data.push_back(seq_id);
+        data.output.push_back(0);
+    }
+    data.seq_id.clear();
+    for (auto & id : data.seq_id_data) {
+        data.seq_id.push_back(&id);
+    }
+    ubatch.n_tokens = (uint32_t) data.pos.size();
+    ubatch.n_seq_tokens = ubatch.n_tokens;
+    ubatch.n_seqs_unq = (uint32_t) data.seq_id_unq.size();
+    ubatch.pos = data.pos.data();
+    ubatch.n_seq_id = data.n_seq_id.data();
+    ubatch.seq_id = data.seq_id.data();
+    ubatch.seq_id_unq = data.seq_id_unq.data();
+    ubatch.seq_idx = data.seq_idx.data();
+    ubatch.output = data.output.data();
+}
+
 int main() {
     for (int bit = 0; bit < 64; ++bit) {
         GGML_ASSERT(ctz64(uint64_t{1} << bit) == bit);
@@ -103,6 +136,65 @@ int main() {
                 GGML_ASSERT(shared.get_v_scale(1) == nullptr);
             }
         }
+    }
+
+    // a unified cache with a second stream of its own size: a sequence assigned to it keeps its cells there
+    {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+        init_model(*model, 2);
+
+        llama_kv_cache kv(*model, false, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
+                false, false, true, 32, 2, 0, LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
+
+        const int32_t strm = kv.stream_add(ggml_backend_cpu_buffer_type(), 16);
+        GGML_ASSERT(strm == 1);
+        GGML_ASSERT(kv.get_n_stream() == 2);
+        GGML_ASSERT(kv.get_size() == 32);
+        GGML_ASSERT(kv.get_size(strm) == 16);
+        GGML_ASSERT(kv.memory_breakdown().at(ggml_backend_cpu_buffer_type()) > 0);
+
+        GGML_ASSERT(kv.seq_set_stream(1, strm));
+        GGML_ASSERT(kv.get_stream(0) == 0);
+        GGML_ASSERT(kv.get_stream(1) == 1);
+
+        llama_ubatch ub1;
+        ubatch_add(ub1, 1, 0, 8);
+        auto sinfo = kv.find_slot(ub1, false);
+        GGML_ASSERT(!sinfo.empty() && sinfo.n_stream() == 1 && sinfo.strm[0] == 1 && sinfo.size() == 8);
+        for (uint32_t idx : sinfo.idxs[0]) {
+            GGML_ASSERT(idx < 16);
+        }
+        kv.apply_ubatch(sinfo, ub1);
+        GGML_ASSERT(kv.seq_pos_max(1) == 7);
+        GGML_ASSERT(kv.seq_pos_max(0) == -1);
+        GGML_ASSERT(kv.get_cells(1).get_used() == 8);
+        GGML_ASSERT(kv.get_cells(0).get_used() == 0);
+
+        // the second stream has 8 cells left, the first has all 32
+        llama_ubatch ub1_big;
+        ubatch_add(ub1_big, 1, 8, 9);
+        GGML_ASSERT(kv.find_slot(ub1_big, false).empty());
+
+        llama_ubatch ub0;
+        ubatch_add(ub0, 0, 0, 20);
+        sinfo = kv.find_slot(ub0, false);
+        GGML_ASSERT(!sinfo.empty() && sinfo.strm[0] == 0 && sinfo.size() == 20);
+        kv.apply_ubatch(sinfo, ub0);
+        GGML_ASSERT(kv.get_cells(0).get_used() == 20);
+        GGML_ASSERT(kv.get_cells(1).get_used() == 8);
+
+        // sequences of two streams in one ubatch are refused
+        llama_ubatch ub_mixed;
+        ubatch_add(ub_mixed, 0, 20, 2);
+        ubatch_add(ub_mixed, 1, 8, 2);
+        GGML_ASSERT(kv.find_slot(ub_mixed, false).empty());
+
+        // a sequence changes stream only while it has no cells
+        GGML_ASSERT(!kv.seq_set_stream(1, 0));
+        GGML_ASSERT(kv.seq_rm(1, -1, -1));
+        GGML_ASSERT(kv.get_cells(0).get_used() == 20);
+        GGML_ASSERT(kv.seq_set_stream(1, 0));
+        GGML_ASSERT(!kv.seq_set_stream(1, 2));
     }
 
     llama_backend_free();

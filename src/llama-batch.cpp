@@ -613,16 +613,44 @@ llama_pos llama_batch_allocr::seq_pos_max(llama_seq_id seq_id) const {
     return seq_pos[seq_id].empty() ? -1 : *seq_pos[seq_id].rbegin();
 }
 
-void llama_batch_allocr::split_reset() {
+void llama_batch_allocr::split_reset(const std::vector<uint32_t> * seq_groups) {
     out_ids.clear();
 
     n_used = 0;
 
     used.clear();
     used.resize(get_n_tokens(), false);
+
+    token_group.clear();
+    token_group_ok = true;
+
+    if (seq_groups == nullptr) {
+        return;
+    }
+
+    token_group.resize(get_n_tokens());
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        token_group[i] = seq_groups->at(batch.seq_id[i][0]);
+
+        for (int32_t s = 1; s < batch.n_seq_id[i]; ++s) {
+            if (seq_groups->at(batch.seq_id[i][s]) != token_group[i]) {
+                LLAMA_LOG_ERROR("%s: token %d has the sequences %d and %d, which are in different groups\n", __func__, i, batch.seq_id[i][0], batch.seq_id[i][s]);
+                token_group_ok = false;
+            }
+        }
+    }
+}
+
+uint32_t llama_batch_allocr::get_token_group(int32_t idx) const {
+    return token_group.empty() ? 0 : token_group[idx];
 }
 
 llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+    if (!token_group_ok) {
+        return {};
+    }
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {
@@ -634,6 +662,8 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
         return {};
     }
 
+    const uint32_t group = get_token_group(cur_idx);
+
     std::vector<int32_t> idxs;
 
     while (true) {
@@ -642,7 +672,10 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
         used[cur_idx] = true;
         ++n_used;
 
-        ++cur_idx;
+        // the tokens of the other groups are left for the next ubatches
+        do {
+            ++cur_idx;
+        } while (cur_idx < used.size() && (used[cur_idx] || get_token_group(cur_idx) != group));
 
         if (cur_idx >= used.size()) {
             break;
@@ -663,9 +696,16 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         return {};
     }
 
+    if (!token_group_ok) {
+        return {};
+    }
+
     std::vector<seq_set_t> cur_seq_set;
 
     llama_seq_id last_seq_id = -1;
+
+    // the group of the first sequence set of the ubatch
+    uint32_t group = 0;
 
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
@@ -688,7 +728,11 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             add = add && (cur_seq_set.empty() || batch.seq_id[i][0] == last_seq_id + 1);
         }
 
+        add = add && (cur_seq_set.empty() || get_token_group(i) == group);
+
         if (add) {
+            group = get_token_group(i);
+
             cur_seq_set.push_back(seq_set[i]);
 
             last_seq_id = batch.seq_id[i][0];
@@ -828,6 +872,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+    if (!token_group_ok) {
+        return {};
+    }
+
     // find the first unused token
     uint32_t cur_idx = 0;
     while (cur_idx < used.size() && used[cur_idx]) {

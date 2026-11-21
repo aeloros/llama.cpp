@@ -625,6 +625,110 @@ static void test_split(testing & t) {
         t.assert_equal(3u, ub.n_tokens);
     });
 
+    t.test("split_groups", [&](testing & t) {
+        // sequences 0 and 2 are in group 0, sequence 1 is in group 1
+        std::vector<uint32_t> groups(LLAMA_MAX_SEQ, 0);
+        groups[1] = 1;
+
+        auto group_of = [&](const llama_ubatch & ub) {
+            for (uint32_t s = 0; s < ub.n_seqs_unq; ++s) {
+                t.assert_equal(groups[ub.seq_id_unq[0]], groups[ub.seq_id_unq[s]]);
+            }
+            return groups[ub.seq_id_unq[0]];
+        };
+
+        // two tokens per sequence, interleaved: seq 0, 1, 2, 0, 1, 2
+        batch_builder bb;
+        for (int i = 0; i < 2; ++i) {
+            for (llama_seq_id s = 0; s < 3; ++s) {
+                bb.add(i, {s}, false);
+            }
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        // simple: the tokens of the other group are skipped, not dropped
+        ba.split_reset(&groups);
+        llama_ubatch ub = ba.split_simple(3);
+        t.assert_equal(3u, ub.n_tokens);
+        t.assert_equal(0u, group_of(ub));
+        t.assert_equal(0, ub.seq_id[0][0]);
+        t.assert_equal(2, ub.seq_id[1][0]);
+        t.assert_equal(0, ub.seq_id[2][0]);
+        ub = ba.split_simple(3);
+        t.assert_equal(2u, ub.n_tokens);
+        t.assert_equal(1u, group_of(ub));
+        ub = ba.split_simple(3);
+        t.assert_equal(1u, ub.n_tokens);
+        t.assert_equal(0u, group_of(ub));
+        t.assert_equal(2, ub.seq_id[0][0]);
+        t.assert_equal(6u, ba.get_n_used());
+        t.assert_equal("batch is consumed", 0u, ba.split_simple(3).n_tokens);
+
+        // equal: the sequence sets of a ubatch are of one group
+        ba.split_reset(&groups);
+        ub = ba.split_equal(8, false, 0);
+        t.assert_equal(4u, ub.n_tokens);
+        t.assert_equal(2u, ub.n_seqs);
+        t.assert_equal(0u, group_of(ub));
+        ub = ba.split_equal(8, false, 0);
+        t.assert_equal(2u, ub.n_tokens);
+        t.assert_equal(1u, ub.n_seqs);
+        t.assert_equal(1u, group_of(ub));
+        t.assert_equal(6u, ba.get_n_used());
+        t.assert_equal("batch is consumed", 0u, ba.split_equal(8, false, 0).n_tokens);
+
+        // seq: one sequence per ubatch, so one group
+        ba.split_reset(&groups);
+        uint32_t n_ubatches = 0;
+        while ((ub = ba.split_seq(8)).n_tokens > 0) {
+            t.assert_equal(1u, ub.n_seqs_unq);
+            n_ubatches++;
+        }
+        t.assert_equal(3u, n_ubatches);
+        t.assert_equal(6u, ba.get_n_used());
+
+        // without groups the split is as before
+        ba.split_reset();
+        ub = ba.split_simple(8);
+        t.assert_equal(6u, ub.n_tokens);
+        t.assert_equal(3u, ub.n_seqs_unq);
+    });
+
+    t.test("split_groups_coupled", [&](testing & t) {
+        std::vector<uint32_t> groups(LLAMA_MAX_SEQ, 0);
+        groups[1] = 1;
+
+        // a token shared by sequences 0 and 2 is fine, one shared by 0 and 1 cannot be in any ubatch
+        batch_builder bb_ok;
+        bb_ok.add(0, {0, 2}, false);
+        bb_ok.add(0, {1}, false);
+
+        llama_batch_allocr ba_ok(1);
+        t.assert_true(ba_ok.init(bb_ok.b, vocab, false));
+        ba_ok.split_reset(&groups);
+        t.assert_equal(1u, ba_ok.split_simple(8).n_tokens);
+        t.assert_equal(1u, ba_ok.split_simple(8).n_tokens);
+        t.assert_equal(2u, ba_ok.get_n_used());
+
+        batch_builder bb_bad;
+        bb_bad.add(0, {0, 1}, false);
+        bb_bad.add(1, {0}, false);
+
+        llama_batch_allocr ba_bad(1);
+        t.assert_true(ba_bad.init(bb_bad.b, vocab, false));
+        ba_bad.split_reset(&groups);
+        t.assert_equal(0u, ba_bad.split_simple(8).n_tokens);
+        t.assert_equal(0u, ba_bad.split_equal(8, false, 0).n_tokens);
+        t.assert_equal(0u, ba_bad.split_seq(8).n_tokens);
+        t.assert_equal(0u, ba_bad.get_n_used());
+
+        // the refusal ends with the grouping
+        ba_bad.split_reset();
+        t.assert_equal(2u, ba_bad.split_simple(8).n_tokens);
+    });
+
     t.test("split_equal_unequal_lengths", [&](testing & t) {
         batch_builder bb;
         for (int i = 0; i < 4; ++i) {

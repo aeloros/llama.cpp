@@ -82,7 +82,7 @@ llama_kv_cache::llama_kv_cache(
                const char * name_tag,
                      bool   is_indexer) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), unified(unified), name_tag(name_tag), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -516,6 +516,13 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
 
     const auto s0 = seq_to_stream[seq_id_src];
+
+    // a copy in a unified cache shares the cells of the source, so the destination follows it to its stream
+    if (unified && seq_to_stream[seq_id_dst] != s0) {
+        GGML_ASSERT(v_cells[seq_to_stream[seq_id_dst]].seq_pos_max(seq_id_dst) < 0 && "TODO: a sequence with cells in two streams");
+        seq_to_stream[seq_id_dst] = s0;
+    }
+
     const auto s1 = seq_to_stream[seq_id_dst];
 
     if (s0 == s1) {
@@ -755,11 +762,11 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             uint32_t n_ubatch,
             bool embd_all) {
     do {
-        balloc.split_reset();
+        balloc.split_reset(get_seq_groups());
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = unified ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -1018,7 +1025,15 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     uint32_t n_tokens = ubatch.n_tokens;
     uint32_t n_seqs   = 1;
 
-    if (n_stream > 1) {
+    if (unified) {
+        // the K/V of a ubatch are one tensor, so the split keeps its sequences in one stream (see get_seq_groups)
+        for (uint32_t s = 1; s < ubatch.n_seqs_unq; ++s) {
+            if (seq_to_stream[ubatch.seq_id_unq[s]] != seq_to_stream[ubatch.seq_id_unq[0]]) {
+                LLAMA_LOG_ERROR("%s: sequences %d and %d of the ubatch are in different streams\n", __func__, ubatch.seq_id_unq[0], ubatch.seq_id_unq[s]);
+                return { };
+            }
+        }
+    } else {
         GGML_ASSERT(n_tokens % ubatch.n_seqs_unq == 0);
 
         n_seqs   = ubatch.n_seqs_unq;
@@ -1037,7 +1052,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const auto seq_id = ubatch.seq_id_unq[s];
 
-        if (n_stream > 1) {
+        if (!unified) {
             GGML_ASSERT(ubatch.n_seq_id[s*n_tokens]    == 1);
             GGML_ASSERT(ubatch.seq_id  [s*n_tokens][0] == seq_id);
         }
@@ -1245,13 +1260,91 @@ bool llama_kv_cache::get_can_shift() const {
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
+    // TODO: the K-shift graph covers only the tensors the cache was created with
+    if (unified && n_stream > 1) {
+        return false;
+    }
     return true;
 }
 
-uint32_t llama_kv_cache::get_size() const {
-    const auto & cells = v_cells[seq_to_stream[0]];
+bool llama_kv_cache::is_stream_added(uint32_t strm) const {
+    return unified && strm > 0;
+}
 
-    return cells.size();
+uint32_t llama_kv_cache::get_size() const {
+    return get_size(0);
+}
+
+uint32_t llama_kv_cache::get_size(uint32_t strm) const {
+    return v_cells.at(strm).size();
+}
+
+bool llama_kv_cache::get_unified() const {
+    return unified;
+}
+
+const std::vector<uint32_t> * llama_kv_cache::get_seq_groups() const {
+    // the streams of a non-unified cache are slices of one tensor, a ubatch can span them
+    return unified && n_stream > 1 ? &seq_to_stream : nullptr;
+}
+
+int32_t llama_kv_cache::stream_add(ggml_backend_buffer_type_t buft, uint32_t size) {
+    if (!unified || other || size == 0) {
+        return -1;
+    }
+
+    const uint32_t strm = n_stream;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t(2u*layers.size()*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create ggml context for kv cache");
+    }
+
+    for (auto & layer : layers) {
+        ggml_tensor * k = layer.k ? ggml_new_tensor_2d(ctx.get(), layer.k->type, layer.k->ne[0], size) : nullptr;
+        ggml_tensor * v = layer.v ? ggml_new_tensor_2d(ctx.get(), layer.v->type, layer.v->ne[0], size) : nullptr;
+
+        k && ggml_format_name(k, "cache_%sk_l%d_s%d", name_tag.c_str(), layer.il, strm);
+        v && ggml_format_name(v, "cache_%sv_l%d_s%d", name_tag.c_str(), layer.il, strm);
+
+        layer.k_stream.push_back(k);
+        layer.v_stream.push_back(v);
+    }
+
+    ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
+
+    LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB (stream %u, %u cells)\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0, strm, size);
+
+    v_heads.push_back(0);
+
+    v_cells.emplace_back();
+    v_cells.back().resize(size);
+
+    n_stream++;
+
+    return (int32_t) strm;
+}
+
+bool llama_kv_cache::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (!unified || strm >= n_stream) {
+        return false;
+    }
+
+    if (v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id) >= 0) {
+        return false;
+    }
+
+    seq_to_stream[seq_id] = strm;
+
+    return true;
 }
 
 uint32_t llama_kv_cache::get_n_seq_max() const {
@@ -1389,13 +1482,14 @@ static std::vector<llama_kv_rows_slice> get_kv_rows_slices(const llama_ubatch & 
 }
 
 uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch) const {
-    if (n_stream != 1) {
+    if (!unified) {
         return 0;
     }
 
     const uint32_t n_slices = get_n_kv_slices(ubatch);
 
-    const auto & cells = v_cells[0];
+    // find_slot keeps the sequences of a ubatch in one stream
+    const auto & cells = v_cells[seq_to_stream[ubatch.seq_id_unq[0]]];
 
     const uint32_t n_pad_cur = 256;
 
@@ -1415,16 +1509,20 @@ uint32_t llama_kv_cache::get_n_kv_rows(const llama_ubatch & ubatch) const {
 
     // pad like n_kv so that the graph can be reused
     // never 0, it means that kv_rows are not used (f.ex. the sequences have no cells yet in a cache that shares the cells of another one)
-    return std::min(std::max(n_pad_cur, GGML_PAD(n_max, n_pad_cur)), get_size());
+    return std::min(std::max(n_pad_cur, GGML_PAD(n_max, n_pad_cur)), cells.size());
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * k = layers[ikv].k;
+    // an added stream is a tensor of its own, the others are slices of one tensor
+    const bool is_added = is_stream_added(sinfo.s0);
 
-    const uint64_t kv_size      = get_size();
+    auto * k = is_added ? layers[ikv].k_stream[sinfo.s0] : layers[ikv].k;
+
+    const uint64_t kv_size      = get_size(sinfo.s0);
     const uint64_t n_embd_k_gqa = k->ne[0];
+    const uint64_t strm_offs    = is_added ? 0 : sinfo.s0;
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
@@ -1435,16 +1533,19 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*strm_offs);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    const bool is_added = is_stream_added(sinfo.s0);
 
-    const uint64_t kv_size      = get_size();
+    auto * v = is_added ? layers[ikv].v_stream[sinfo.s0] : layers[ikv].v;
+
+    const uint64_t kv_size      = get_size(sinfo.s0);
     const uint64_t n_embd_v_gqa = v->ne[0];
+    const uint64_t strm_offs    = is_added ? 0 : sinfo.s0;
 
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
@@ -1458,7 +1559,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*strm_offs);
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1467,7 +1568,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*strm_offs);
 }
 
 static bool is_type_scaled(ggml_type type) {
@@ -1495,11 +1596,9 @@ ggml_tensor * llama_kv_cache::get_v_scale(int32_t il) const {
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
-
     const int32_t ikv = map_layer_ids.at(il);
 
-    ggml_tensor * k = layers[ikv].k;
+    ggml_tensor * k = is_stream_added(sinfo.s0) ? layers[ikv].k_stream[sinfo.s0] : layers[ikv].k;
 
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
@@ -1530,11 +1629,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
-
     const int32_t ikv = map_layer_ids.at(il);
 
-    auto * v = layers[ikv].v;
+    auto * v = is_stream_added(sinfo.s0) ? layers[ikv].v_stream[sinfo.s0] : layers[ikv].v;
 
     const int64_t n_embd_head = v_cur->ne[0];
     const int64_t n_head      = v_cur->ne[1];
@@ -1637,7 +1734,8 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const int64_t offs = sinfo.strm[s]*get_size();
+        // the idxs of an added stream address its own tensor
+        const int64_t offs = is_stream_added(sinfo.strm[s]) ? 0 : sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
@@ -1654,7 +1752,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*get_size();
+            const int64_t offs = is_stream_added(sinfo.strm[s]) ? 0 : sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
@@ -1662,12 +1760,12 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
         }
     } else {
         // note: the V cache is transposed when not using flash attention
-        const int64_t kv_size = get_size();
+        const int64_t kv_size = get_size(sinfo.s0);
 
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
 
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
+            const int64_t offs = is_stream_added(sinfo.strm[s]) ? 0 : sinfo.strm[s]*kv_size*n_embd_v_gqa;
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
@@ -1923,12 +2021,12 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
     // fill the cell rows of each slice
     if (attn_mask.rows && attn_mask.rows->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(attn_mask.rows->buffer));
-        GGML_ASSERT(n_stream == 1);
+        GGML_ASSERT(unified);
 
         const int64_t n_rows   = attn_mask.rows->ne[0];
         const int64_t n_slices = attn_mask.rows->ne[1];
 
-        const auto & cells = v_cells[0];
+        const auto & cells = v_cells[seq_to_stream[ubatch->seq_id_unq[0]]];
         int32_t * data = (int32_t *) attn_mask.rows->data;
 
         cells.get_seq_cells(get_kv_rows_slices(*ubatch, n_slices, n_swa, swa_type), data, n_rows);
@@ -1995,8 +2093,8 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
-    GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
-    const auto & cells = v_cells[0];
+    GGML_ASSERT(unified && "TODO: support multiple streams");
+    const auto & cells = v_cells[seq_to_stream[ubatch->seq_id_unq[0]]];
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
@@ -2993,9 +3091,10 @@ llama_kv_cache_context::llama_kv_cache_context(
     n_kv = kv->get_size();
 
     // worst case for graph reservation, only a unified cache splits into per-sequence lists
-    n_kv_rows = kv->get_n_stream() == 1 ? n_kv : 0;
+    n_kv_rows = kv->get_unified() ? n_kv : 0;
 
-    const uint32_t n_stream = kv->get_n_stream();
+    // TODO: reserve for the added streams of a unified cache too, they can be larger or on another device
+    const uint32_t n_stream = kv->get_unified() ? 1 : kv->get_n_stream();
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);

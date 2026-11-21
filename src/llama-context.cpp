@@ -4963,6 +4963,22 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+int32_t llama_memory_stream_add(llama_memory_t mem, ggml_backend_dev_t dev, uint32_t n_cells) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->stream_add(dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type(), n_cells);
+}
+
+bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm) {
+    if (!mem || strm < 0) {
+        return false;
+    }
+
+    return mem->seq_set_stream(seq_id, (uint32_t) strm);
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;

@@ -182,7 +182,8 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const;
 
     // call once before splitting the batch to reset the internal state
-    void split_reset();
+    // seq_groups: optional, the group of each sequence id. a ubatch never holds sequences of different groups
+    void split_reset(const std::vector<uint32_t> * seq_groups = nullptr);
 
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
@@ -247,6 +248,14 @@ private:
 
     // helper flag to quickly determine if there are any coupled sequences in the batch
     bool has_cpl = false;
+
+    // the group of each token for the current split, empty if the sequences are not grouped (see split_reset)
+    std::vector<uint32_t> token_group;
+
+    // false if a token has sequences of different groups, the batch cannot be split then
+    bool token_group_ok = true;
+
+    uint32_t get_token_group(int32_t idx) const;
 
     std::vector<pos_set_t> seq_pos; // seq_pos[s]: the set of positions in sequence s
     std::vector<seq_cpl_t> seq_cpl; // seq_cpl[s0][s1]: if sequence s0 is coupled to sequence s1

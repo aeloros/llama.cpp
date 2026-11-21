@@ -67,6 +67,19 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // TODO: the indexer caches mirror the cells of the attention cache and have no streams of their own
+    int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size) override {
+        GGML_UNUSED(buft);
+        GGML_UNUSED(size);
+        return -1;
+    }
+
+    bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(strm);
+        return false;
+    }
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

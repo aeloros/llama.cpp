@@ -67,7 +67,7 @@ llama_memory_hybrid::llama_memory_hybrid(
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
-        balloc.split_reset();
+        balloc.split_reset(mem_attn->get_seq_groups());
 
         // follow the recurrent pattern for creating the ubatch splits
         std::vector<llama_ubatch> ubatches;
@@ -80,7 +80,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
-                const bool unified = (mem_attn->get_n_stream() == 1);
+                const bool unified = mem_attn->get_unified();
 
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
@@ -281,4 +281,12 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
+}
+
+int32_t llama_memory_hybrid::stream_add(ggml_backend_buffer_type_t buft, uint32_t size) {
+    return mem_attn->stream_add(buft, size);
+}
+
+bool llama_memory_hybrid::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
+    return mem_attn->seq_set_stream(seq_id, strm);
 }
