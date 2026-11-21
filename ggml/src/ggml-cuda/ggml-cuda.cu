@@ -5467,8 +5467,14 @@ static void ggml_cuda_keep_awake_loop(int device) {
 
         // one kernel after the other: half busy did not hold the clocks of a device that also runs graphs
         ggml_cuda_keep_awake_spin<<<1, 1, 0, stream>>>(2000000, dst);
-        cudaStreamSynchronize(stream);
+        if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess) {
+            GGML_LOG_ERROR("%s: the keep-awake loop of device %d stopped on a CUDA error\n", __func__, device);
+            break;
+        }
     }
+
+    cudaFree(dst);
+    cudaStreamDestroy(stream);
 }
 
 static void ggml_cuda_keep_awake_touch(int device) {
