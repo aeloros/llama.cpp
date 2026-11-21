@@ -1564,6 +1564,26 @@ private:
             SRV_INF("second pool of %d KV cells on %s for the slots %s\n", params_base.kv_overflow_size,
                     ggml_backend_dev_name(params_base.kv_overflow_device), ids.c_str());
 
+            // the draft context has a cache of its own, sized like the first pool: without a second pool of its own
+            // it is full long before the slot is
+            if (ctx_dft != nullptr) {
+                llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+
+                // a draft model of its own may have no backend for the device
+                const int32_t strm_dft = llama_get_model(ctx_dft) == model_tgt ?
+                    llama_memory_stream_add(mem_dft, params_base.kv_overflow_device, params_base.kv_overflow_size) : -1;
+
+                bool ok = strm_dft >= 0;
+                for (const int32_t id : params_base.kv_overflow_slots) {
+                    ok = ok && llama_memory_seq_set_stream(mem_dft, id, strm_dft);
+                }
+                if (!ok) {
+                    SRV_ERR("%s", "--kv-overflow-device: the draft context cannot have a second pool of KV cells, "
+                            "run without speculative decoding or without --kv-overflow-device\n");
+                    return false;
+                }
+            }
+
             // only the attention of these slots runs on the device, too little to keep its clocks up
             if (params_base.kv_overflow_keep_awake) {
                 auto * reg = ggml_backend_dev_backend_reg(params_base.kv_overflow_device);
