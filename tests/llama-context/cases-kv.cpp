@@ -270,6 +270,115 @@ struct case_streams_batch : ctx_test {
     }
 };
 
+// - decode three different token lists into three sequences in the same batches, their tokens interleaved
+// - do the same in a second context, where sequences 1 and 2 take their cells from an added stream
+// - verify that every sequence produces the same logits in both
+// note: the reference is the same batches without the stream, that is what a stream must not change
+struct case_streams_multi : ctx_test {
+    const char * name() const override { return "streams_m"; }
+
+    const char * description() const override {
+        return "two sequences that share a second stream decode as in the first stream, in the same batches as a third sequence";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+
+        // plamo2 does not decode several sequences in one batch correctly, with or without a stream: the logits of a
+        // sequence differ from the same sequence decoded alone, and a ubatch that holds some of the sequences trips an
+        // out-of-bounds view of the mamba states (models/plamo2.cpp). The streams make such ubatches
+        if (llama_arch_from_string(arch_name) == LLM_ARCH_PLAMO2) {
+            return "plamo2 does not decode several sequences in one batch";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const llama_seq_id n_seqs = 3;
+
+        // a batch holds the tokens of the three sequences, and it cannot be larger than the context
+        ctx_opts opts;
+        opts.n_ctx      = 512;
+        opts.n_batch    = 512;
+        opts.n_ubatch   = 64;
+        opts.n_seq_max  = n_seqs;
+        opts.kv_unified = 1;
+
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        const llama_pos n_tokens = (llama_pos) std::min<size_t>(mr.tokens.size(), 128);
+        CTX_REQUIRE(n_tokens >= 2, "the prompt is too short");
+
+        // the sequences hold different tokens, so that the K/V of one cannot stand in for another
+        llama_tokens tokens[n_seqs];
+        tokens[0].assign(mr.tokens.begin(), mr.tokens.begin() + n_tokens);
+        tokens[1].assign(tokens[0].rbegin(), tokens[0].rend());
+        tokens[2].resize(n_tokens);
+        std::rotate_copy(tokens[0].begin(), tokens[0].begin() + n_tokens/2, tokens[0].end(), tokens[2].begin());
+
+        // the logits of the last token of every sequence, with and without the stream
+        // the context with the stream comes first, so that a memory without streams is skipped before any decode
+        std::vector<float> logits[2][n_seqs];
+        for (int with_stream = 1; with_stream >= 0; --with_stream) {
+            auto ctx = mr.ctx(opts);
+            if (!ctx) {
+                return case_result::fail();
+            }
+
+            llama_memory_t mem = llama_get_memory(ctx.get());
+
+            if (with_stream) {
+                // room for the two sequences that share the stream
+                const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 256);
+                if (strm < 0) {
+                    return case_result::skip("the memory has no streams");
+                }
+                for (llama_seq_id seq_id = 1; seq_id < n_seqs; ++seq_id) {
+                    CTX_REQUIRE(llama_memory_seq_set_stream(mem, seq_id, strm), "failed to assign seq " + std::to_string(seq_id) + " to the new stream");
+                }
+            }
+
+            {
+                common_batch batch(ctx.get());
+                for (llama_pos pos = 0; pos < n_tokens - 1; ++pos) {
+                    for (llama_seq_id seq_id = 0; seq_id < n_seqs; ++seq_id) {
+                        batch.add(tokens[seq_id][pos], pos, seq_id, false);
+                    }
+                }
+                CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
+                        "failed to decode a batch with the three sequences");
+            }
+
+            {
+                common_batch batch(ctx.get());
+                for (llama_seq_id seq_id = 0; seq_id < n_seqs; ++seq_id) {
+                    batch.add(tokens[seq_id][n_tokens - 1], n_tokens - 1, seq_id, true);
+                }
+                CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
+                        "failed to decode the last token of the three sequences");
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < n_seqs; ++seq_id) {
+                CTX_REQUIRE(llama_memory_seq_pos_max(mem, seq_id) == n_tokens - 1, "seq " + std::to_string(seq_id) + " does not hold its tokens");
+
+                const float * ptr = llama_get_logits_ith(ctx.get(), seq_id);
+                CTX_REQUIRE(ptr != nullptr, "missing logits of seq " + std::to_string(seq_id));
+
+                logits[with_stream][seq_id].assign(ptr, ptr + n_vocab);
+            }
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < n_seqs; ++seq_id) {
+            const logits_diff diff = compare_logits(logits[0][seq_id].data(), logits[1][seq_id].data(), n_vocab);
+            CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq " + std::to_string(seq_id) + " produced different logits with the stream than without" + diff_str(diff));
+        }
+
+        return case_result::pass();
+    }
+};
+
 // - add a second stream to the cache and take the cells of sequence 1 from it
 // - decode the prompt into both sequences
 // - save sequence 1, remove it, restore it: it continues like sequence 0
@@ -1062,6 +1171,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_seq_rm_isolated>());
     cases.push_back(std::make_unique<case_streams>());
     cases.push_back(std::make_unique<case_streams_batch>());
+    cases.push_back(std::make_unique<case_streams_multi>());
     cases.push_back(std::make_unique<case_streams_state>(false));
     cases.push_back(std::make_unique<case_streams_state>(true));
     cases.push_back(std::make_unique<case_state_load>());

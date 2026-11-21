@@ -82,7 +82,7 @@ llama_kv_cache::llama_kv_cache(
                const char * name_tag,
                      bool   is_indexer) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), unified(unified), name_tag(name_tag), n_swa(n_swa), is_indexer(is_indexer),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), unified(unified || n_seq_max == 1), name_tag(name_tag), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -133,6 +133,9 @@ llama_kv_cache::llama_kv_cache(
     };
 
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
+
+    // one stream at creation is one pool of cells for all sequences, also for a single sequence that is not unified
+    GGML_ASSERT(this->unified == (n_stream == 1));
 
     v_heads.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {

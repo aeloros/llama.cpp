@@ -303,6 +303,8 @@ private:
     uint32_t n_stream = 1;
 
     // one pool of cells for all sequences, instead of one stream per sequence
+    // true for a unified cache and for a cache with a single sequence: the cache is created with one stream
+    // n_stream only grows past that with stream_add
     const bool unified = true;
 
     const std::string name_tag;

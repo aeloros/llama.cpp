@@ -138,6 +138,56 @@ int main() {
         }
     }
 
+    // a cache for one sequence has one stream whether it was created unified or not, and takes the same paths:
+    // the simple batch split, and the position buckets of the T5 decoder
+    {
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_T5, llama_model_default_params()));
+        init_model(*model, 2);
+        model->hparams.n_rel_attn_bkts = 32;
+
+        llama_vocab vocab;
+
+        for (bool unified : { false, true }) {
+            llama_kv_cache kv(*model, false, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16,
+                    false, false, unified, 32, 1, 0, LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
+
+            GGML_ASSERT(kv.get_n_stream() == 1);
+
+            // 5 embeddings of sequence 0 in ubatches of 8: one ubatch that is not split into equal sequences
+            llama_batch_ext batch(64, 2, 2, 1, nullptr, 0, 1);
+            const std::vector<float> embd(2, 1.0f);
+            for (llama_pos p = 0; p < 5; ++p) {
+                const llama_pos pos[GGML_MROPE_SECTIONS] = { p, 0, 0, 0 };
+                const int32_t idx = batch.add_token(0);
+                GGML_ASSERT(idx >= 0);
+                GGML_ASSERT(batch.set_token_embd(idx, { embd.data(), 1, 2 }));
+                GGML_ASSERT(batch.set_token_pos(idx, pos));
+                GGML_ASSERT(batch.set_output(idx, p == 4));
+            }
+            llama_batch_allocr balloc(1);
+            GGML_ASSERT(balloc.init(batch, vocab, false));
+
+            auto mctx = kv.init_batch(balloc, 8, false);
+            GGML_ASSERT(mctx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS);
+            GGML_ASSERT(mctx->get_ubatch().n_tokens == 5);
+            GGML_ASSERT(!mctx->get_ubatch().equal_seqs());
+            GGML_ASSERT(mctx->apply());
+
+            ggml_context_ptr ctx(ggml_init({ 2*ggml_tensor_overhead(), nullptr, true }));
+            ggml_tensor * buckets = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 32, 5);
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type()));
+            GGML_ASSERT(buf);
+
+            kv.set_input_pos_bucket(buckets, &mctx->get_ubatch());
+            for (int i = 0; i < 32*5; ++i) {
+                const int32_t bucket = ((const int32_t *) buckets->data)[i];
+                GGML_ASSERT(bucket >= 0 && bucket < 32);
+            }
+
+            GGML_ASSERT(kv.get_unified());
+        }
+    }
+
     // a unified cache with a second stream of its own size: a sequence assigned to it keeps its cells there
     {
         std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
