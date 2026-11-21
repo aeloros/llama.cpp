@@ -115,7 +115,7 @@ LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 // KV streams
 //
 
-// Add a stream of n_cells KV cells on a device (NULL for the CPU) to a unified KV cache.
+// Add a stream of n_cells KV cells (padded to a multiple of 256) on a device (NULL for the CPU) to a unified KV cache.
 // Returns the stream id, or -1 if the memory does not support it.
 LLAMA_API int32_t llama_memory_stream_add(llama_memory_t mem, ggml_backend_dev_t dev, uint32_t n_cells);
 

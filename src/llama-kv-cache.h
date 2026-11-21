@@ -150,7 +150,7 @@ public:
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // only for a unified cache that does not share its cells
-    // the stream holds no cells until a sequence is assigned to it
+    // the size is padded to a multiple of 256, the stream holds no cells until a sequence is assigned to it
     int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size) override;
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
 
@@ -440,6 +440,9 @@ public:
 
     uint32_t get_n_kv() const;
     uint32_t get_n_kv_rows() const;
+
+    // the first stream of the current ubatch, get_k / get_v / cpy_k / cpy_v use its tensors
+    uint32_t get_strm() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

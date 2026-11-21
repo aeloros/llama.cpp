@@ -150,7 +150,8 @@ int main() {
         GGML_ASSERT(strm == 1);
         GGML_ASSERT(kv.get_n_stream() == 2);
         GGML_ASSERT(kv.get_size() == 32);
-        GGML_ASSERT(kv.get_size(strm) == 16);
+        // padded like n_ctx
+        GGML_ASSERT(kv.get_size(strm) == 256);
         GGML_ASSERT(kv.memory_breakdown().at(ggml_backend_cpu_buffer_type()) > 0);
 
         GGML_ASSERT(kv.seq_set_stream(1, strm));
@@ -162,7 +163,7 @@ int main() {
         auto sinfo = kv.find_slot(ub1, false);
         GGML_ASSERT(!sinfo.empty() && sinfo.n_stream() == 1 && sinfo.strm[0] == 1 && sinfo.size() == 8);
         for (uint32_t idx : sinfo.idxs[0]) {
-            GGML_ASSERT(idx < 16);
+            GGML_ASSERT(idx < 256);
         }
         kv.apply_ubatch(sinfo, ub1);
         GGML_ASSERT(kv.seq_pos_max(1) == 7);
@@ -170,9 +171,9 @@ int main() {
         GGML_ASSERT(kv.get_cells(1).get_used() == 8);
         GGML_ASSERT(kv.get_cells(0).get_used() == 0);
 
-        // the second stream has 8 cells left, the first has all 32
+        // the second stream has 248 cells left, the first has all 32
         llama_ubatch ub1_big;
-        ubatch_add(ub1_big, 1, 8, 9);
+        ubatch_add(ub1_big, 1, 8, 249);
         GGML_ASSERT(kv.find_slot(ub1_big, false).empty());
 
         llama_ubatch ub0;

@@ -1293,6 +1293,9 @@ int32_t llama_kv_cache::stream_add(ggml_backend_buffer_type_t buft, uint32_t siz
         return -1;
     }
 
+    // same padding as n_ctx, the attention relies on it (see llama_context)
+    size = GGML_PAD(size, 256);
+
     const uint32_t strm = n_stream;
 
     ggml_init_params params = {
@@ -3168,6 +3171,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 
 uint32_t llama_kv_cache_context::get_n_kv_rows() const {
     return n_kv_rows;
+}
+
+uint32_t llama_kv_cache_context::get_strm() const {
+    return sinfos[i_cur].s0;
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

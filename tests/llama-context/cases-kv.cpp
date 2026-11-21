@@ -117,6 +117,22 @@ struct case_seq_rm_isolated : ctx_test {
     }
 };
 
+// the device of the added stream of the stream cases: LLAMA_TEST_STREAM_DEV names it (f.ex. CUDA1), the default is the CPU
+// the context needs a backend for it, f.ex. --device CUDA0,CUDA1 -ts 1,0 keeps the model on CUDA0
+// two different GPUs can round a large ubatch differently, use -ub 64 to compare them
+static ggml_backend_dev_t stream_dev() {
+    const char * name = getenv("LLAMA_TEST_STREAM_DEV");
+
+    return name ? ggml_backend_dev_by_name(name) : nullptr;
+}
+
+static std::string diff_str(const logits_diff & diff) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), " (nmse %g, max diff %g, nan %zu)", diff.nmse(), (double) diff.diff_max, diff.n_nan);
+
+    return buf;
+}
+
 // - add a second stream to the cache and take the cells of sequence 1 from it
 // - decode the same prompt into sequence 0 and sequence 1, the last token in a decode of its own
 // - verify that both sequences produce the same logits
@@ -140,7 +156,7 @@ struct case_streams : ctx_test {
 
         llama_memory_t mem = llama_get_memory(ctx.get());
 
-        const int32_t strm = llama_memory_stream_add(mem, nullptr, 192);
+        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192);
         if (strm < 0) {
             return case_result::skip("the memory has no streams");
         }
@@ -164,16 +180,16 @@ struct case_streams : ctx_test {
         CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == n_tokens - 1, "seq 1 does not hold the prompt");
 
         const logits_diff diff = compare_logits(logits[0].data(), logits[1].data(), logits[0].size());
-        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 1 in the second stream produced different logits than seq 0");
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 1 in the second stream produced different logits than seq 0" + diff_str(diff));
 
         return case_result::pass();
     }
 };
 
 // - add a second stream to the cache and take the cells of sequence 1 from it
-// - decode the prompt into sequence 0 alone, as the reference
-// - decode the prompt into both sequences in the same batches, their tokens interleaved
-// - verify that both sequences produce the reference logits
+// - decode the prompt and the reversed prompt alone, as the references
+// - decode the prompt into sequence 0 and the reversed prompt into sequence 1 in the same batches, their tokens interleaved
+// - verify that both sequences produce their reference logits
 struct case_streams_batch : ctx_test {
     const char * name() const override { return "streams_b"; }
 
@@ -196,7 +212,7 @@ struct case_streams_batch : ctx_test {
 
         llama_memory_t mem = llama_get_memory(ctx.get());
 
-        const int32_t strm = llama_memory_stream_add(mem, nullptr, 192);
+        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192);
         if (strm < 0) {
             return case_result::skip("the memory has no streams");
         }
@@ -205,19 +221,26 @@ struct case_streams_batch : ctx_test {
         const llama_pos n_tokens = (llama_pos) std::min<size_t>(mr.tokens.size(), 128);
         CTX_REQUIRE(n_tokens >= 2, "the prompt is too short");
 
-        std::vector<float> logits_ref;
-        if (!decode_seq(ctx.get(), mr.tokens, 0, n_tokens - 1, 0, false) ||
-            !decode_seq(ctx.get(), mr.tokens, n_tokens - 1, n_tokens, 0, true) ||
-            !get_current_logits(ctx.get(), logits_ref) ||
-            !seq_rm(ctx.get(), 0)) {
-            return case_result::fail();
+        // the sequences hold different tokens, so that the K/V of one cannot stand in for the other
+        llama_tokens tokens[2];
+        tokens[0].assign(mr.tokens.begin(), mr.tokens.begin() + n_tokens);
+        tokens[1].assign(tokens[0].rbegin(), tokens[0].rend());
+
+        std::vector<float> logits_ref[2];
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            if (!decode_seq(ctx.get(), tokens[seq_id], 0, n_tokens - 1, 0, false) ||
+                !decode_seq(ctx.get(), tokens[seq_id], n_tokens - 1, n_tokens, 0, true) ||
+                !get_current_logits(ctx.get(), logits_ref[seq_id]) ||
+                !seq_rm(ctx.get(), 0)) {
+                return case_result::fail();
+            }
         }
 
         {
             common_batch batch(ctx.get());
             for (llama_pos pos = 0; pos < n_tokens - 1; ++pos) {
                 for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
-                    batch.add(mr.tokens[pos], pos, seq_id, false);
+                    batch.add(tokens[seq_id][pos], pos, seq_id, false);
                 }
             }
             CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
@@ -227,7 +250,7 @@ struct case_streams_batch : ctx_test {
         {
             common_batch batch(ctx.get());
             for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
-                batch.add(mr.tokens[n_tokens - 1], n_tokens - 1, seq_id, true);
+                batch.add(tokens[seq_id][n_tokens - 1], n_tokens - 1, seq_id, true);
             }
             CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
                     "failed to decode the last token of both sequences");
@@ -239,8 +262,8 @@ struct case_streams_batch : ctx_test {
             const float * logits = llama_get_logits_ith(ctx.get(), seq_id);
             CTX_REQUIRE(logits != nullptr, "missing logits of seq " + std::to_string(seq_id));
 
-            const logits_diff diff = compare_logits(logits_ref.data(), logits, logits_ref.size());
-            CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq " + std::to_string(seq_id) + " produced different logits in the shared batch");
+            const logits_diff diff = compare_logits(logits_ref[seq_id].data(), logits, logits_ref[seq_id].size());
+            CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq " + std::to_string(seq_id) + " produced different logits in the shared batch" + diff_str(diff));
         }
 
         return case_result::pass();

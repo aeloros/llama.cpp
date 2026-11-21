@@ -76,6 +76,11 @@ static bool can_reuse_attn_mask(
     const uint32_t n_slices  = llama_kv_cache::get_n_kv_slices(ubatch);
     const auto     n_tokens  = ubatch.n_tokens;
 
+    // the K/V tensors of another stream are other nodes of the graph
+    if (attn_mask.strm != mctx->get_strm()) {
+        return false;
+    }
+
     // the current ubatch uses rows only when rows are enabled and it can split into streams
     const bool use_rows = n_kv_rows > 0 && n_slices > 0;
 
@@ -108,6 +113,7 @@ static llm_attn_mask build_attn_inp_attn_mask(
     llm_attn_mask attn_mask;
 
     attn_mask.n_kv = mctx->get_n_kv();
+    attn_mask.strm = mctx->get_strm();
 
     const uint32_t n_kv_rows = cparams.fused_kv_rows ? mctx->get_n_kv_rows() : 0;
 

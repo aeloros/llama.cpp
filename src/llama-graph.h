@@ -338,6 +338,9 @@ struct llm_attn_mask {
     ggml_tensor * rows = nullptr; // I32 [n_kv_rows, n_slices]
     uint32_t      n_kv = 0;
 
+    // the first stream of the K/V tensors that the graph reads and writes
+    uint32_t strm = 0;
+
     // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
     bool block_uniform = false;
 };
