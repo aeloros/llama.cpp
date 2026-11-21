@@ -196,8 +196,12 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 
     if (ctx_pool_auto_sized && !params.kv_unified_per_slot_list.empty()) {
         long long sum = 0;
-        for (const int32_t limit : params.kv_unified_per_slot_list) {
-            sum += limit;
+        for (size_t i = 0; i < params.kv_unified_per_slot_list.size(); i++) {
+            // the slots of --kv-overflow-slots take no cells from this pool
+            const auto & overflow = params.kv_overflow_slots;
+            if (std::find(overflow.begin(), overflow.end(), (int32_t) i) == overflow.end()) {
+                sum += params.kv_unified_per_slot_list[i];
+            }
         }
         if (sum > INT32_MAX) {
             SRV_ERR("the --kv-unified-per-slot limits add up to %lld tokens, too many for one KV pool\n", sum);

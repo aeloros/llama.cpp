@@ -1456,8 +1456,12 @@ private:
                 // drafts included, never exceed its own limit and any free cell of the pool can hold them
                 long long sum = 0;
                 std::string limits;
-                for (const int32_t limit : params_base.kv_unified_per_slot_list) {
-                    sum += std::min(limit, n_ctx_seq);
+                for (size_t i = 0; i < params_base.kv_unified_per_slot_list.size(); i++) {
+                    const int32_t limit = params_base.kv_unified_per_slot_list[i];
+                    // the slots of --kv-overflow-slots take no cells from this pool
+                    if (!is_kv_overflow_slot((int) i)) {
+                        sum += std::min(limit, n_ctx_seq);
+                    }
                     limits += (limits.empty() ? "" : ",") + std::to_string(limit);
                 }
                 SRV_INF("per-slot context limits: %s (sum %lld, KV pool %d)\n", limits.c_str(), sum, n_ctx_seq);
@@ -5157,12 +5161,15 @@ private:
     }
 
     // context size of slot id: its own --kv-unified-per-slot limit when a list is given, otherwise n_ctx_slot()
+    bool is_kv_overflow_slot(int id) const {
+        const auto & overflow = params_base.kv_overflow_slots;
+
+        return std::find(overflow.begin(), overflow.end(), id) != overflow.end();
+    }
+
     int n_ctx_slot(int id) const {
         // the cells of the slot come from the shared pool, or from the pool of --kv-overflow-device
-        const auto & overflow = params_base.kv_overflow_slots;
-        const bool is_overflow = std::find(overflow.begin(), overflow.end(), id) != overflow.end();
-
-        int res = is_overflow ? params_base.kv_overflow_size : (int) llama_n_ctx_seq(ctx_tgt);
+        int res = is_kv_overflow_slot(id) ? params_base.kv_overflow_size : (int) llama_n_ctx_seq(ctx_tgt);
 
         const auto & limits = params_base.kv_unified_per_slot_list;
         if (!limits.empty()) {
