@@ -418,7 +418,16 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
-static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+// room to grow for a chunk that turned out too small, within the max size of a chunk
+// graphs that need a little more memory each time (f.ex. an attention mask over a cache that fills)
+// would otherwise re-create the buffer for every graph
+static size_t ggml_vbuffer_grow_room(size_t size, size_t max_size) {
+    const size_t room = MIN(size/8, (size_t) 256*1024*1024);
+    return size < max_size ? MIN(room, max_size - size) : 0;
+}
+
+// grow: the buffer replaces one that was too small
+static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage, bool grow) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
@@ -426,7 +435,14 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
-        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+        size_t room = grow ? ggml_vbuffer_grow_room(chunk_size, talloc->max_chunk_size) : 0;
+        if (room > 0) {
+            buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size + room);
+        }
+        if (buf->chunks[n] == NULL) {
+            // the exact size, also when there is no memory for the room
+            buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+        }
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
             return NULL;
@@ -920,6 +936,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         if (realloc) {
+            const bool grow = galloc->buffers[i] != NULL;
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
@@ -933,7 +950,7 @@ static bool ggml_gallocr_reserve_n_impl(
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE, grow);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;

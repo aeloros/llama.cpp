@@ -25,6 +25,8 @@ struct dummy_backend_context {
     bool custom_alloc_buffer_n_called   = false;
     bool custom_get_alloc_size_n_called = false;
 
+    int n_alloc_buffer = 0;
+
     size_t allocated_total() const {
         size_t n = 0;
         for (ggml_backend_buffer_t buf : buffers) {
@@ -44,6 +46,7 @@ static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
+    ctx->n_alloc_buffer++;
     return buffer;
 }
 
@@ -638,8 +641,50 @@ static void test_reallocation() {
         bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
         GGML_ASSERT(result);
         check_all_allocated(graph);
-        GGML_ASSERT(backend.context->allocated_total() == 40);
+        // a buffer that has to grow gets some room on top, see test_growth_is_amortized
+        GGML_ASSERT(backend.context->allocated_total() >= 40);
+        GGML_ASSERT(backend.context->allocated_total() <= 40 + 40 / 8);
     }
+}
+
+// A graph that needs a little more memory each time it is allocated, like an attention mask
+// over a cache that fills. The buffer is re-created now and then with room to grow, not once per graph.
+static void test_growth_is_amortized() {
+    const size_t size_0   = 1024 * 1024;
+    const size_t step     = 256;
+    const int    n_graphs = 1000;
+
+    const auto build = [](ggml_context * ctx, ggml_cgraph * graph, size_t size) {
+        ggml_tensor * x[3];
+        x[0] = make_input_with_size(ctx, size);
+        x[1] = make_input_with_size(ctx, size);
+        x[2] = ggml_add(ctx, x[0], x[1]);
+        assign_names(ctx);
+        ggml_set_output(x[2]);
+        ggml_build_forward_expand(graph, x[2]);
+    };
+
+    dummy_backend    backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    for (int i = 0; i < n_graphs; i++) {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build(ctx, graph, size_0 + i * step);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        check_no_overlap(graph);
+    }
+
+    // what the last graph needs when it is the first one of an allocator
+    dummy_backend    backend_exact = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_gallocr_ptr galloc_exact(ggml_gallocr_new(&backend_exact.buffer_type));
+    auto [ctx, graph, ctx_ptr] = make_context();
+    build(ctx, graph, size_0 + (n_graphs - 1) * step);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc_exact.get(), graph));
+    const size_t exact = backend_exact.context->allocated_total();
+
+    GGML_ASSERT(backend.context->allocated_total() >= exact);
+    GGML_ASSERT(backend.context->allocated_total() <= exact + exact / 8);
+    GGML_ASSERT(backend.context->n_alloc_buffer <= 8);
 }
 
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
@@ -1120,6 +1165,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_growth_is_amortized", test_growth_is_amortized);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
