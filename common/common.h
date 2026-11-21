@@ -665,6 +665,7 @@ struct common_params {
     ggml_backend_dev_t   kv_overflow_device = nullptr; // device of the added KV stream; nullptr = no added stream
     int32_t              kv_overflow_size   = 0;       // cells of the added KV stream
     std::vector<int32_t> kv_overflow_slots;            // slots that take their KV cells from the added stream
+    bool                 kv_overflow_keep_awake = true; // keep kv_overflow_device at full clocks while it is in use
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise

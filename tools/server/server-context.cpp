@@ -1563,6 +1563,16 @@ private:
 
             SRV_INF("second pool of %d KV cells on %s for the slots %s\n", params_base.kv_overflow_size,
                     ggml_backend_dev_name(params_base.kv_overflow_device), ids.c_str());
+
+            // only the attention of these slots runs on the device, too little to keep its clocks up
+            if (params_base.kv_overflow_keep_awake) {
+                auto * reg = ggml_backend_dev_backend_reg(params_base.kv_overflow_device);
+                auto * set_keep_awake = (void (*)(ggml_backend_dev_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_set_keep_awake");
+                if (set_keep_awake) {
+                    set_keep_awake(params_base.kv_overflow_device, true);
+                    SRV_INF("%s is kept at full clocks while it is in use\n", ggml_backend_dev_name(params_base.kv_overflow_device));
+                }
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {

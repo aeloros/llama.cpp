@@ -1688,6 +1688,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OVERFLOW_SLOTS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--kv-overflow-keep-awake" },
+        { "--no-kv-overflow-keep-awake" },
+        "keep --kv-overflow-device at full clocks while it is in use (default: enabled).\n"
+        "the driver clocks a lightly used device down, which makes its part of each step much slower",
+        [](common_params & params, bool value) {
+            params.kv_overflow_keep_awake = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OVERFLOW_KEEP_AWAKE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

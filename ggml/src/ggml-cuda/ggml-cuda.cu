@@ -94,6 +94,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -5419,10 +5420,77 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// keep-awake: the driver clocks a device down when it does little work per graph, and that work then runs many times slower.
+// while such a device is in use, a loop of tiny kernels keeps it busy, which holds the clocks up.
+static __global__ void ggml_cuda_keep_awake_spin(const uint32_t n, uint32_t * dst) {
+    uint32_t x = threadIdx.x + 1u;
+    for (uint32_t i = 0; i < n; i++) {
+        x = x*1664525u + 1013904223u;
+    }
+    *dst = x;
+}
+
+struct ggml_cuda_keep_awake {
+    std::atomic<bool> enabled = false;
+
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    // the last graph compute on the device
+    std::chrono::steady_clock::time_point t_use;
+
+    bool started = false;
+};
+
+static ggml_cuda_keep_awake g_keep_awake[GGML_CUDA_MAX_DEVICES];
+
+static void ggml_cuda_keep_awake_loop(int device) {
+    auto & ka = g_keep_awake[device];
+
+    // the device is left alone this long after its last graph
+    const auto t_hold = std::chrono::milliseconds(1000);
+
+    ggml_cuda_set_device(device);
+
+    cudaStream_t stream;
+    uint32_t * dst;
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess || cudaMalloc((void **) &dst, sizeof(uint32_t)) != cudaSuccess) {
+        GGML_LOG_ERROR("%s: failed to set up the keep-awake loop of device %d\n", __func__, device);
+        return;
+    }
+
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(ka.mutex);
+            ka.cv.wait(lock, [&] { return std::chrono::steady_clock::now() - ka.t_use < t_hold; });
+        }
+
+        // one kernel after the other: half busy did not hold the clocks of a device that also runs graphs
+        ggml_cuda_keep_awake_spin<<<1, 1, 0, stream>>>(2000000, dst);
+        cudaStreamSynchronize(stream);
+    }
+}
+
+static void ggml_cuda_keep_awake_touch(int device) {
+    auto & ka = g_keep_awake[device];
+
+    if (!ka.enabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ka.mutex);
+        ka.t_use = std::chrono::steady_clock::now();
+    }
+    ka.cv.notify_one();
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_cuda_keep_awake_touch(cuda_ctx->device);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6854,8 +6922,27 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// the loop thread is started on the first use and stays for the life of the process
+static void ggml_backend_cuda_dev_set_keep_awake(ggml_backend_dev_t dev, bool enable) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+
+    auto & ka = g_keep_awake[ctx->device];
+
+    std::lock_guard<std::mutex> lock(ka.mutex);
+
+    ka.enabled = enable;
+
+    if (enable && !ka.started) {
+        ka.started = true;
+        std::thread(ggml_cuda_keep_awake_loop, ctx->device).detach();
+    }
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_set_keep_awake") == 0) {
+        return (void *)ggml_backend_cuda_dev_set_keep_awake;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
