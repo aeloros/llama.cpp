@@ -4109,7 +4109,24 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            // the slots that have prompt tokens to add, minus the ones that had their turn (see n_batch_slot)
+            const auto is_reading = [](const server_slot & slot) {
+                return slot.is_processing() &&
+                    (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) &&
+                    slot.task->type != SERVER_TASK_TYPE_TTS && slot.task->type != SERVER_TASK_TYPE_REALTIME &&
+                    slot.task->type != SERVER_TASK_TYPE_TRANSCRIBE_RT;
+            };
+
+            int32_t n_reading_left = 0;
+            for (const auto & slot : slots) {
+                n_reading_left += is_reading(slot) ? 1 : 0;
+            }
+
             iterate(slots, [&](server_slot & slot) {
+                if (is_reading(slot)) {
+                    n_reading_left--;
+                }
+
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -4596,13 +4613,22 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
-                    // the batch already holds tokens of other slots, which wait for it: read in smaller steps
+                    // other slots wait for this batch: read in smaller steps
+                    //   - the batch holds tokens of other slots already: add at most n_batch_busy
+                    //   - slots after this one read a prompt too: leave n_batch_busy to each of them
                     // the end of the prompt is left alone, the checkpoints below cut it at 4 + n_ubatch
                     int32_t n_batch_slot = n_batch;
-                    if (params_base.n_batch_busy > 0 && n_tokens_prev > 0 && slot.can_split() && n_decision_first < 0) {
+                    if (params_base.n_batch_busy > 0 && slot.can_split() && n_decision_first < 0) {
+                        const int32_t n_busy = params_base.n_batch_busy;
                         const int32_t n_left = slot.task->n_tokens() - slot.prompt.n_tokens();
-                        if (!do_checkpoint || n_left >= 4 + n_ubatch + params_base.n_batch_busy) {
-                            n_batch_slot = std::min(n_batch, n_tokens_prev + params_base.n_batch_busy);
+                        if (n_tokens_prev > 0) {
+                            if (!do_checkpoint || n_left >= 4 + n_ubatch + n_busy) {
+                                n_batch_slot = std::min(n_batch, n_tokens_prev + n_busy);
+                            }
+                        } else if (n_reading_left > 0) {
+                            if (!do_checkpoint || n_left >= 4 + n_ubatch + n_batch) {
+                                n_batch_slot = std::min(n_batch, std::max(n_busy, n_batch - n_busy*n_reading_left));
+                            }
                         }
                     }
 
