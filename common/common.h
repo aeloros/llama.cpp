@@ -659,6 +659,7 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_batch_busy        = 0;     // max prompt tokens a slot adds to a batch that other slots wait for; 0 = no limit
+    std::vector<int32_t> batch_priority_slots; // slots that come first: while one of them is in a batch, the other slots add no prompt tokens to it
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset (with a list: the largest limit)
     std::vector<int32_t> kv_unified_per_slot_list; // one limit per slot, in slot order; empty = kv_unified_per_slot for every slot

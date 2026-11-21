@@ -1499,6 +1499,18 @@ private:
                     params_base.n_batch_busy);
         }
 
+        if (!params_base.batch_priority_slots.empty()) {
+            std::string ids;
+            for (const int32_t id : params_base.batch_priority_slots) {
+                if (id >= params_base.n_parallel) {
+                    SRV_ERR("--batch-priority-slots: there is no slot %d, the slots are 0 to %d\n", id, params_base.n_parallel - 1);
+                    return false;
+                }
+                ids += (ids.empty() ? "" : ",") + std::to_string(id);
+            }
+            SRV_INF("the slots %s come first: while one of them reads its prompt or generates, the other slots add no prompt tokens to the batch\n", ids.c_str());
+        }
+
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
@@ -4117,13 +4129,31 @@ private:
                     slot.task->type != SERVER_TASK_TYPE_TRANSCRIBE_RT;
             };
 
+            // the slots of --batch-priority-slots come first: while one of them generates or reads its prompt, the others add no prompt tokens
+            const auto is_prio = [&](const server_slot & slot) {
+                const auto & ids = params_base.batch_priority_slots;
+                return std::find(ids.begin(), ids.end(), slot.id) != ids.end();
+            };
+
+            bool prio_busy = false;
+            for (const auto * slot : generating) {
+                prio_busy = prio_busy || is_prio(*slot);
+            }
+            for (const auto & slot : slots) {
+                prio_busy = prio_busy || (is_prio(slot) && is_reading(slot));
+            }
+
+            const auto may_read = [&](const server_slot & slot) {
+                return is_reading(slot) && (!prio_busy || is_prio(slot));
+            };
+
             int32_t n_reading_left = 0;
             for (const auto & slot : slots) {
-                n_reading_left += is_reading(slot) ? 1 : 0;
+                n_reading_left += may_read(slot) ? 1 : 0;
             }
 
             iterate(slots, [&](server_slot & slot) {
-                if (is_reading(slot)) {
+                if (may_read(slot)) {
                     n_reading_left--;
                 }
 
@@ -4154,6 +4184,11 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // a slot that comes first is in this batch: wait with the prompt
+                    if (!may_read(slot)) {
+                        return;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot

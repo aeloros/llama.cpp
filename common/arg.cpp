@@ -1733,6 +1733,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_BATCH_BUSY").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--batch-priority-slots"}, "N[,N...]",
+        "ids of the slots that come first: while one of them reads its prompt or generates, the other slots add no "
+        "prompt tokens to the batch, so that a long prompt in another slot does not slow them down (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.batch_priority_slots.clear();
+            for (const auto & part : string_split<std::string>(value, ',')) {
+                const int id = std::stoi(part);
+                if (id < 0) {
+                    throw std::invalid_argument("--batch-priority-slots takes slot ids, starting at 0");
+                }
+                params.batch_priority_slots.push_back(id);
+            }
+        }
+    ).set_env("LLAMA_ARG_BATCH_PRIORITY_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {
