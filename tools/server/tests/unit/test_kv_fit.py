@@ -198,3 +198,111 @@ def test_a_task_that_fits_in_neither_pool_waits():
     assert n_busy_max == 2, "three tasks of 1800 were at work at once in two pools of 2560"
     for i in range(3):
         assert_served(results[i], 1800)
+
+
+# An idle slot keeps the cells of its cached prompt (--no-cache-idle-slots) until a task needs them. Then it gives
+# them up, saved to the prompt cache, and its conversation comes back from there when it goes on.
+
+
+def turn(prompt, n_predict: int, id_slot: int):
+    """One turn of a conversation: the prompt is cached, and the tokens of the answer come back with it."""
+    return server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "n_predict": n_predict,
+        "id_slot": id_slot,
+        "ignore_eos": True,
+        "temperature": 0.0,
+        "seed": 42,
+        "cache_prompt": True,
+        "return_tokens": True,
+    })
+
+
+def tokens_of(text: str):
+    res = server.make_request("POST", "/tokenize", data={"content": text, "add_special": True})
+    assert res.status_code == 200
+    return res.body["tokens"]
+
+
+def assert_not_read_again(res):
+    # the slot holds every token of the conversation but the last, which was never decoded: one token is read
+    assert res.status_code == 200, f"{res.status_code} {str(res.body)[:200]}"
+    assert res.body["timings"]["prompt_n"] == 1, "the conversation is read again"
+
+
+def test_an_idle_slot_gives_up_its_cells_to_a_task_and_its_conversation_comes_back():
+    global server
+    server.no_cache_idle_slots = True
+    server.start()
+
+    # a conversation in slot 0: 1500 cells of the home pool, then idle
+    first = turn(PROMPT_OLDER, 1480, 0)
+    assert_served(first, 1480)
+    held = tokens_of(PROMPT_OLDER) + first.body["tokens"]
+
+    # a task in slot 1 that fits at home by the limits of the tasks at work, and not beside those 1500 cells
+    second = turn(PROMPT_NEWER, 1480, 1)
+    assert_served(second, 1480)
+
+    assert_not_read_again(turn(held, 8, 0))
+
+
+def test_a_limit_that_grows_takes_the_cells_of_an_idle_slot_and_saves_them():
+    global server
+    server.no_cache_idle_slots = True
+    server.kv_fit_headroom = 256
+    server.start()
+
+    first = turn(PROMPT_OLDER, 1480, 0)
+    assert_served(first, 1480)
+    held = tokens_of(PROMPT_OLDER) + first.body["tokens"]
+
+    # the task starts with its prompt and 256 tokens of room, which the pool has beside the idle slot's 1500 cells;
+    # it grows by 256 at a time, and at 1300 the pool no longer has both
+    second = turn(PROMPT_NEWER, 1480, 1)
+    assert_served(second, 1480)
+
+    assert_not_read_again(turn(held, 8, 0))
+
+
+def test_a_conversation_whose_slot_changes_pools_is_not_read_again():
+    global server
+    server.no_cache_idle_slots = True
+    server.start()
+
+    # a conversation in slot 0: 500 cells of the home pool, then idle
+    first = turn(PROMPT_OLDER, 480, 0)
+    assert_served(first, 480)
+    held = tokens_of(PROMPT_OLDER) + first.body["tokens"]
+
+    # a task of 1900 tokens at work at home leaves the idle cells where they are: 1900 + 500 <= 2560. The next turn
+    # of the conversation, 500 + 300 tokens, does not fit beside its limit (2560 - 1900 = 660), so it goes to the
+    # second pool, and the slot with it
+    results = {}
+    seen = {}
+
+    def run_long():
+        results["long"] = complete(PROMPT_NEWER, 1880, 1)
+
+    def run_again():
+        results["again"] = turn(held, 300, 0)
+
+    t_long = threading.Thread(target=run_long)
+    t_long.start()
+    t_end = time.time() + 10
+    while not slots_at_work() and time.time() < t_end:
+        time.sleep(0.002)
+    t_again = threading.Thread(target=run_again)
+    t_again.start()
+    while t_again.is_alive():
+        for slot in slots_at_work():
+            seen[slot["id"]] = slot
+        time.sleep(0.002)
+    t_again.join()
+    t_long.join()
+
+    assert_served(results["long"], 1880)
+    assert seen[0]["kv_overflow"], "the next turn went to the second pool"
+    assert not seen[1]["kv_overflow"]
+    assert_not_read_again(results["again"])
+    assert results["again"].body["tokens_predicted"] == 300

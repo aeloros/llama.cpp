@@ -1509,7 +1509,11 @@ private:
                     limits += (limits.empty() ? "" : ",") + std::to_string(limit);
                 }
                 SRV_INF("per-slot context limits: %s (sum %lld, KV pool %d)\n", limits.c_str(), sum, n_ctx_seq);
-                if (sum > n_ctx_seq) {
+                if (sum > n_ctx_seq && params_base.kv_overflow_device != nullptr && params_base.kv_overflow_slots.empty()) {
+                    // a second pool whose tasks are fitted: a task starts in a pool only when its limit is free there
+                    SRV_INF("the slot limits add up to %lld tokens, more than the KV pool (%d): each task is fitted to a pool "
+                            "when it starts, so the limits of the tasks at work stay within it\n", sum, n_ctx_seq);
+                } else if (sum > n_ctx_seq) {
                     SRV_WRN("the slot limits add up to %lld tokens, more than the KV pool (%d): the pool can overflow "
                             "when every slot fills (raise -c, or unset it to size the pool to the sum)\n", sum, n_ctx_seq);
                 } else {
@@ -2062,7 +2066,7 @@ private:
         }
 
         // a second pool whose tasks are fitted: the task waits until one of the pools has the room
-        kv_fit_result fit = { true, ret ? ret->kv_overflow : false, 0 };
+        kv_fit_result fit = { true, ret ? ret->kv_overflow : false, 0, 0 };
         if (ret && kv_fit) {
             fit = kv_fit_task(*ret, task);
             if (!fit.ok) {
@@ -2083,12 +2087,28 @@ private:
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
 
-            // the slot moves to the pool that its task was fitted to, and what it holds is given up: saved first
+            // The slot moves to the pool that its task was fitted to. Cells do not move between the pools (not built):
+            // what the slot holds goes to the prompt cache, and a task that goes on from it takes it from there into
+            // the other pool, a state write and a state read
             if (fit.overflow != ret->kv_overflow) {
-                if (update_cache) {
-                    ret->prompt_save(*prompt_cache);
+                if (prompt_cache) {
+                    const int64_t t_start = ggml_time_us();
+                    const int32_t n_cells = ret->prompt.n_tokens();
+
+                    if (ret->prompt_save(*prompt_cache)) {
+                        prompt_cache->update();
+
+                        SLT_INF(*ret, "the slot changes pools: its %d KV cells are saved to the prompt cache (%.2f ms)\n",
+                                n_cells, (ggml_time_us() - t_start) / 1000.0);
+                    }
+                    update_cache = !task.is_stateless();
                 }
                 kv_set_overflow(*ret, fit.overflow);
+            }
+
+            // by the limits of the tasks at work the pool has the task's cells: the idle slots give theirs up for it
+            if (kv_fit && fit.n_room > 0) {
+                kv_fit_make_room(*ret, fit.overflow, fit.n_room);
             }
 
             if (update_cache) {
@@ -2139,6 +2159,7 @@ private:
         bool    ok;       // false: neither pool has the room now, the task waits
         bool    overflow; // the pool it goes to
         int32_t limit;    // its n_ctx_task there
+        int64_t n_room;   // the cells that it and its children may take there: idle slots make room (kv_fit_make_room)
     };
 
     // A second pool without --kv-overflow-slots: where a task goes when it starts, and with what limit.
@@ -2152,8 +2173,10 @@ private:
     //     room, with that room as its limit.
     // What is free: the pool less the limits of the tasks at work in it. The slots of --batch-priority-slots are at
     // home always, and their whole limit is kept for them there whether they are at work or not.
-    // The cached prompts of idle slots do not count: a step that needs their cells takes them (step_shed).
-    // with_children: the children of the task are still to start, and their sizes are counted with its own
+    // The cached prompts of idle slots do not count: when a task needs their cells, the idle slots give them up, the
+    // least recently used first, saved to the prompt cache (kv_fit_make_room).
+    // with_children (kv_fit_task): the children of the task are still to start, and their sizes are counted with its own
+
     // the cells of the first pool that no limit of another task or slot covers
     int64_t kv_fit_free_home(const server_slot & slot) const {
         int64_t n_home = 0;
@@ -2219,6 +2242,9 @@ private:
 
         SLT_DBG(slot, "the task takes %d more KV cells of the first pool, n_ctx_task = %d\n", (int) n_add, slot.n_ctx_task);
 
+        // the cached prompt of an idle slot may be where it grows to
+        kv_fit_make_room(slot, false, slot.n_ctx_task);
+
         return true;
     }
 
@@ -2226,12 +2252,12 @@ private:
         int64_t size = n_ctx_task_of(slot, task);
 
         if (is_batch_priority_slot(slot.id)) {
-            return { true, false, (int32_t) size };
+            return { true, false, (int32_t) size, 0 }; // its room is kept for it at all times
         }
 
         // a task and its children share the cells of their prompt, which only one pool can do: the children follow
         if (task.is_child()) {
-            return { true, slot.kv_overflow, (int32_t) size };
+            return { true, slot.kv_overflow, (int32_t) size, 0 }; // the room was made for its parent
         }
         if (with_children) {
             for (const auto & child : task.child_tasks) {
@@ -2261,17 +2287,18 @@ private:
         const int64_t n_need = std::min<int64_t>(size, (int64_t) task.n_tokens() + params_base.kv_fit_headroom + 1 + (size - n_own));
 
         if (n_need <= n_free_home) {
-            return { true, false, (int32_t) (n_need - (size - n_own)) };
+            return { true, false, (int32_t) (n_need - (size - n_own)), n_need };
         }
         if (size <= n_free_over) {
-            return { true, true, (int32_t) n_own };
+            return { true, true, (int32_t) n_own, size };
         }
         if (!any_other) {
-            const bool overflow = n_free_over > n_free_home;
-            return { true, overflow, (int32_t) std::max<int64_t>(1, std::min<int64_t>(n_own, (overflow ? n_free_over : n_free_home) - (size - n_own))) };
+            const bool    overflow = n_free_over > n_free_home;
+            const int64_t n_free   = overflow ? n_free_over : n_free_home;
+            return { true, overflow, (int32_t) std::max<int64_t>(1, std::min<int64_t>(n_own, n_free - (size - n_own))), std::min<int64_t>(size, n_free) };
         }
 
-        return { false, false, 0 };
+        return { false, false, 0, 0 };
     }
 
     // moves a slot to the other pool. The cells do not move (not built): what the slot holds is given up
@@ -2292,6 +2319,58 @@ private:
         slot.kv_overflow = overflow;
 
         SLT_INF(slot, "the slot takes its KV cells from the %s pool\n", overflow ? "second" : "first");
+    }
+
+    // An idle slot keeps the cells of its cached prompt for as long as no task needs them. A task that is fitted
+    // into a pool may take n_room cells there. The pool has them when the limits of the tasks at work, what is kept
+    // for the slots of --batch-priority-slots and the cached prompts of the idle slots leave that many: until then
+    // the idle slots give up their cells, the least recently used first, saved to the prompt cache first. Their
+    // conversations come back from there when they go on, into the pool that has the room then.
+    // With that, the cells in a pool never add up to more than it has, and no step is refused for a cached prompt.
+    // slot: the task's own, which is not counted.
+    void kv_fit_make_room(const server_slot & slot, bool overflow, int64_t n_room) {
+        const int64_t n_pool = overflow ? (int64_t) params_base.kv_overflow_size : (int64_t) llama_n_ctx_seq(ctx_tgt);
+
+        while (true) {
+            int64_t       n_held = n_room;
+            server_slot * lru    = nullptr;
+
+            for (auto & other : slots) {
+                if (&other == &slot) {
+                    continue;
+                }
+                if (is_batch_priority_slot(other.id)) {
+                    n_held += overflow ? 0 : other.n_ctx;
+                } else if (other.kv_overflow != overflow) {
+                    continue;
+                } else if (other.is_processing()) {
+                    n_held += other.n_ctx_task;
+                } else if (other.prompt.n_tokens() > 0) {
+                    n_held += other.prompt.n_tokens();
+                    if (!lru || other.t_last_used < lru->t_last_used) {
+                        lru = &other;
+                    }
+                }
+            }
+
+            if (n_held <= n_pool || !lru) {
+                return;
+            }
+
+            const int64_t t_start = ggml_time_us();
+            const int32_t n_cells = lru->prompt.n_tokens();
+
+            const bool saved = prompt_cache && lru->prompt_save(*prompt_cache);
+            if (saved) {
+                prompt_cache->update();
+            }
+            lru->prompt_clear();
+
+            SLT_INF(*lru, "the idle slot gives up its %d KV cells of the %s pool to the task in slot %d, %s (%.2f ms)\n",
+                    n_cells, overflow ? "second" : "first", slot.id,
+                    saved ? "saved to the prompt cache" : "not saved: no prompt cache, or it has the prompt already",
+                    (ggml_time_us() - t_start) / 1000.0);
+        }
     }
 
     // --kv-reserve: whether the task's size fits in the pool of the slot beside the sizes of the tasks at work there.
