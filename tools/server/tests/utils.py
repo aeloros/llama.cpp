@@ -92,6 +92,9 @@ class ServerProcess:
     server_metrics: bool | None = False
     kv_unified: bool | None = False
     kv_reserve: bool | None = False
+    kv_overflow_device: str | None = None
+    kv_overflow_size: int | None = None
+    kv_fit_headroom: int | None = None
     swa_full: bool | None = False
     server_slots: bool | None = False
     pooling: str | None = None
@@ -225,6 +228,12 @@ class ServerProcess:
             server_args.append("--kv-unified")
         if self.kv_reserve:
             server_args.append("--kv-reserve")
+        if self.kv_overflow_device:
+            server_args.extend(["--kv-overflow-device", self.kv_overflow_device])
+        if self.kv_overflow_size is not None:
+            server_args.extend(["--kv-overflow-size", self.kv_overflow_size])
+        if self.kv_fit_headroom is not None:
+            server_args.extend(["--kv-fit-headroom", self.kv_fit_headroom])
         if self.swa_full:
             server_args.append("--swa-full")
         if self.server_slots:

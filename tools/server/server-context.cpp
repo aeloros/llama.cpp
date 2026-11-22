@@ -318,6 +318,10 @@ struct server_slot {
     // The limit of the task that runs in the slot: what that task can grow to, where n_ctx is what the slot may
     // hold. Set when the task is launched (launch_slot_with_task), 0 without a task
     int32_t n_ctx_task = 0;
+
+    // the slot takes its KV cells from the second pool (--kv-overflow-device): always for a slot of
+    // --kv-overflow-slots, and without that option as each task was fitted when it started
+    bool kv_overflow = false;
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
@@ -822,6 +826,7 @@ struct server_slot {
             {"id",            id},
             {"n_ctx",         n_ctx},
             {"n_ctx_task",    n_ctx_task},
+            {"kv_overflow",   kv_overflow},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
         };
@@ -1137,6 +1142,13 @@ private:
 
     // after a refusal: how many prompt tokens the slots that can split their prompt add to a batch, -1 = no limit
     int32_t n_prompt_budget = -1;
+
+    // The second pool of KV cells (--kv-overflow-device): its stream in the memory of the target context and of the
+    // draft context, -1 without one. kv_fit: no slot was given to it (--kv-overflow-slots), each task is fitted to a
+    // pool when it starts (kv_fit_task).
+    int32_t kv_strm_overflow     = -1;
+    int32_t kv_strm_overflow_dft = -1;
+    bool    kv_fit               = false;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -1601,29 +1613,39 @@ private:
                 return false;
             }
 
+            kv_strm_overflow = strm;
+            kv_fit           = params_base.kv_overflow_slots.empty();
+
             std::string ids;
             for (const int32_t id : params_base.kv_overflow_slots) {
-                if (!llama_memory_seq_set_stream(mem, id, strm)) {
+                if (id >= params_base.n_parallel || !llama_memory_seq_set_stream(mem, id, strm)) {
                     SRV_ERR("--kv-overflow-slots: failed to move slot %d to the second pool of KV cells\n", id);
                     return false;
                 }
+                slots[id].kv_overflow = true;
                 ids += (ids.empty() ? "" : ",") + std::to_string(id);
             }
 
-            SRV_INF("second pool of %d KV cells on %s for the slots %s\n", params_base.kv_overflow_size,
-                    ggml_backend_dev_name(params_base.kv_overflow_device), ids.c_str());
-
-            // like the first pool, this one can't overflow when the limits of its slots fit in it
-            long long sum = 0;
-            for (const int32_t id : params_base.kv_overflow_slots) {
-                sum += n_ctx_slot(id);
-            }
-            if (sum > params_base.kv_overflow_size) {
-                SRV_WRN("the limits of these slots add up to %lld tokens, more than the second pool (%d): it can overflow when "
-                        "they fill (raise --kv-overflow-size, or lower their --kv-unified-per-slot limits)\n",
-                        sum, params_base.kv_overflow_size);
+            if (kv_fit) {
+                SRV_INF("second pool of %d KV cells on %s: a task goes there when it does not fit in the first pool, "
+                        "where its prompt and %d tokens for its output have to be free\n", params_base.kv_overflow_size,
+                        ggml_backend_dev_name(params_base.kv_overflow_device), params_base.kv_fit_headroom);
             } else {
-                SRV_INF("%s", "the limits of these slots fit in the second pool, so it can't overflow\n");
+                SRV_INF("second pool of %d KV cells on %s for the slots %s\n", params_base.kv_overflow_size,
+                        ggml_backend_dev_name(params_base.kv_overflow_device), ids.c_str());
+
+                // like the first pool, this one can't overflow when the limits of its slots fit in it
+                long long sum = 0;
+                for (const int32_t id : params_base.kv_overflow_slots) {
+                    sum += n_ctx_slot(id);
+                }
+                if (sum > params_base.kv_overflow_size) {
+                    SRV_WRN("the limits of these slots add up to %lld tokens, more than the second pool (%d): it can overflow when "
+                            "they fill (raise --kv-overflow-size, or lower their --kv-unified-per-slot limits)\n",
+                            sum, params_base.kv_overflow_size);
+                } else {
+                    SRV_INF("%s", "the limits of these slots fit in the second pool, so it can't overflow\n");
+                }
             }
 
             // the draft context has a cache of its own, sized like the first pool: without a second pool of its own
@@ -1634,6 +1656,8 @@ private:
                 // a draft model of its own may have no backend for the device
                 const int32_t strm_dft = llama_get_model(ctx_dft) == model_tgt ?
                     llama_memory_stream_add(mem_dft, params_base.kv_overflow_device, params_base.kv_overflow_size) : -1;
+
+                kv_strm_overflow_dft = strm_dft;
 
                 bool ok = strm_dft >= 0;
                 for (const int32_t id : params_base.kv_overflow_slots) {
@@ -1679,7 +1703,7 @@ private:
             slot.callback_on_release = [this](int id_slot) {
                 // with per-slot limits, retry a deferred task that fits the released slot, not just the first one
                 const int n_ctx_released = params_base.kv_unified_per_slot_list.empty() ? 0 : slots[id_slot].n_ctx;
-                if (params_base.kv_reserve) {
+                if (params_base.kv_reserve || kv_fit) {
                     // the room that the task leaves may be what any waiting task needs, or several of them
                     queue_tasks.pop_deferred_tasks();
                 } else {
@@ -2037,8 +2061,18 @@ private:
             }
         }
 
+        // a second pool whose tasks are fitted: the task waits until one of the pools has the room
+        kv_fit_result fit = { true, ret ? ret->kv_overflow : false, 0 };
+        if (ret && kv_fit) {
+            fit = kv_fit_task(*ret, task);
+            if (!fit.ok) {
+                SLT_DBG(*ret, "the task's size (%d) fits in neither pool beside the tasks at work, id_task = %d\n", n_ctx_task_of(*ret, task), task.id);
+                return nullptr;
+            }
+        }
+
         // with --kv-reserve the task waits until its size fits beside the tasks at work
-        if (ret && params_base.kv_reserve && !kv_reserve_fits(*ret, task)) {
+        if (ret && !kv_fit && params_base.kv_reserve && !kv_reserve_fits(*ret, task)) {
             SLT_DBG(*ret, "the task's size (%d) does not fit beside the tasks at work, id_task = %d\n", n_ctx_task_of(*ret, task), task.id);
             return nullptr;
         }
@@ -2048,6 +2082,14 @@ private:
 
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();
+
+            // the slot moves to the pool that its task was fitted to, and what it holds is given up: saved first
+            if (fit.overflow != ret->kv_overflow) {
+                if (update_cache) {
+                    ret->prompt_save(*prompt_cache);
+                }
+                kv_set_overflow(*ret, fit.overflow);
+            }
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -2069,11 +2111,6 @@ private:
         return ret;
     }
 
-    // return true if at least one slot has been cleared
-    // TODO: improve logic
-    //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
     // The limit of a task in a slot: its prompt and its output, and never more than the slot holds. One more than the
     // two: the stop check in process_token() fires one token before the limit and runs before the check of n_predict,
     // so without it a task that ends by n_predict would be reported as truncated. A task without an output limit has
@@ -2093,15 +2130,179 @@ private:
         return (int32_t) std::min<int64_t>(slot.n_ctx, (int64_t) task.n_tokens() + n_predict + 1);
     }
 
+    bool is_batch_priority_slot(int id) const {
+        const auto & ids = params_base.batch_priority_slots;
+        return std::find(ids.begin(), ids.end(), id) != ids.end();
+    }
+
+    struct kv_fit_result {
+        bool    ok;       // false: neither pool has the room now, the task waits
+        bool    overflow; // the pool it goes to
+        int32_t limit;    // its n_ctx_task there
+    };
+
+    // A second pool without --kv-overflow-slots: where a task goes when it starts, and with what limit.
+    //   - The first pool (home, on the device that holds the model), when the task's prompt and the headroom for its
+    //     output are free there, or its whole size if that is less. That is then its limit, and it takes another
+    //     headroom's worth each time it runs into it, while the pool has it (kv_fit_extend). The limits in the pool
+    //     never add up to more than it has, so no step of a task at home is refused; a task that needs more than
+    //     the pool has left ends as truncated.
+    //   - Otherwise the second pool, whole, when its size is free there.
+    //   - Otherwise it waits, unless nothing is at work that could make room: then it starts in the pool with more
+    //     room, with that room as its limit.
+    // What is free: the pool less the limits of the tasks at work in it. The slots of --batch-priority-slots are at
+    // home always, and their whole limit is kept for them there whether they are at work or not.
+    // The cached prompts of idle slots do not count: a step that needs their cells takes them (step_shed).
+    // with_children: the children of the task are still to start, and their sizes are counted with its own
+    // the cells of the first pool that no limit of another task or slot covers
+    int64_t kv_fit_free_home(const server_slot & slot) const {
+        int64_t n_home = 0;
+        for (const auto & other : slots) {
+            if (&other == &slot) {
+                continue;
+            }
+            if (is_batch_priority_slot(other.id)) {
+                n_home += other.n_ctx;
+            } else if (other.is_processing() && !other.kv_overflow) {
+                n_home += other.n_ctx_task;
+            }
+        }
+        return (int64_t) llama_n_ctx_seq(ctx_tgt) - n_home;
+    }
+
+    // what a task keeps of its room when it gives the rest up: the cells of its next step, its token and its draft
+    static constexpr int64_t KV_FIT_KEEP = 32;
+
+    // A task in the first pool ran into its limit: it takes more room for its output, the headroom at most and never
+    // above its own size, when the pool has it. When the pool has none, a newer task there gives up room that it has
+    // not used, the newest first: of two tasks that both need more than is left, the older one goes on.
+    // Returns false when the task has all it can have.
+    bool kv_fit_extend(server_slot & slot) {
+        if (!kv_fit || slot.kv_overflow || is_batch_priority_slot(slot.id)) {
+            return false;
+        }
+
+        const int64_t size   = n_ctx_task_of(slot, *slot.task);
+        const int64_t n_want = std::min<int64_t>((int64_t) std::max(1, params_base.kv_fit_headroom), size - slot.n_ctx_task);
+        if (n_want <= 0) {
+            return false;
+        }
+
+        int64_t n_free = kv_fit_free_home(slot) - slot.n_ctx_task;
+        if (n_free <= 0) {
+            server_slot * donor = nullptr;
+            for (auto & other : slots) {
+                if (&other == &slot || !other.is_processing() || other.kv_overflow || is_batch_priority_slot(other.id)) {
+                    continue;
+                }
+                if (other.task->id < slot.task->id) {
+                    continue; // an older task keeps what it has
+                }
+                if ((int64_t) other.n_ctx_task - other.prompt.n_tokens() - KV_FIT_KEEP > 0 && (!donor || other.task->id > donor->task->id)) {
+                    donor = &other;
+                }
+            }
+            if (donor) {
+                n_free = std::min<int64_t>(n_want, (int64_t) donor->n_ctx_task - donor->prompt.n_tokens() - KV_FIT_KEEP);
+                donor->n_ctx_task -= (int32_t) n_free;
+
+                SLT_DBG(*donor, "the task gives %d KV cells of its room to an older one, n_ctx_task = %d\n", (int) n_free, donor->n_ctx_task);
+            }
+        }
+
+        const int64_t n_add = std::min<int64_t>(n_want, n_free);
+        if (n_add <= 0) {
+            return false;
+        }
+
+        slot.n_ctx_task += (int32_t) n_add;
+
+        SLT_DBG(slot, "the task takes %d more KV cells of the first pool, n_ctx_task = %d\n", (int) n_add, slot.n_ctx_task);
+
+        return true;
+    }
+
+    kv_fit_result kv_fit_task(const server_slot & slot, const server_task & task, bool with_children = true) const {
+        int64_t size = n_ctx_task_of(slot, task);
+
+        if (is_batch_priority_slot(slot.id)) {
+            return { true, false, (int32_t) size };
+        }
+
+        // a task and its children share the cells of their prompt, which only one pool can do: the children follow
+        if (task.is_child()) {
+            return { true, slot.kv_overflow, (int32_t) size };
+        }
+        if (with_children) {
+            for (const auto & child : task.child_tasks) {
+                size += n_ctx_task_of(slot, child);
+            }
+        }
+
+        int64_t n_home    = 0;
+        int64_t n_over    = 0;
+        bool    any_other = false;
+        for (const auto & other : slots) {
+            if (&other == &slot) {
+                continue;
+            }
+            if (is_batch_priority_slot(other.id)) {
+                n_home += other.n_ctx;
+            } else if (other.is_processing()) {
+                (other.kv_overflow ? n_over : n_home) += other.n_ctx_task;
+                any_other = true;
+            }
+        }
+
+        const int64_t n_free_home = (int64_t) llama_n_ctx_seq(ctx_tgt) - n_home;
+        const int64_t n_free_over = (int64_t) params_base.kv_overflow_size - n_over;
+
+        const int64_t n_own  = n_ctx_task_of(slot, task);
+        const int64_t n_need = std::min<int64_t>(size, (int64_t) task.n_tokens() + params_base.kv_fit_headroom + 1 + (size - n_own));
+
+        if (n_need <= n_free_home) {
+            return { true, false, (int32_t) (n_need - (size - n_own)) };
+        }
+        if (size <= n_free_over) {
+            return { true, true, (int32_t) n_own };
+        }
+        if (!any_other) {
+            const bool overflow = n_free_over > n_free_home;
+            return { true, overflow, (int32_t) std::max<int64_t>(1, std::min<int64_t>(n_own, (overflow ? n_free_over : n_free_home) - (size - n_own))) };
+        }
+
+        return { false, false, 0 };
+    }
+
+    // moves a slot to the other pool. The cells do not move (not built): what the slot holds is given up
+    void kv_set_overflow(server_slot & slot, bool overflow) {
+        if (slot.kv_overflow == overflow) {
+            return;
+        }
+
+        // a sequence changes pools only without cells
+        slot.prompt_clear();
+
+        bool ok = llama_memory_seq_set_stream(llama_get_memory(ctx_tgt), slot.id, overflow ? kv_strm_overflow : 0);
+        if (ctx_dft != nullptr) {
+            ok = ok && llama_memory_seq_set_stream(llama_get_memory(ctx_dft), slot.id, overflow ? kv_strm_overflow_dft : 0);
+        }
+        GGML_ASSERT(ok && "a slot without cells moves to the other pool of KV cells");
+
+        slot.kv_overflow = overflow;
+
+        SLT_INF(slot, "the slot takes its KV cells from the %s pool\n", overflow ? "second" : "first");
+    }
+
     // --kv-reserve: whether the task's size fits in the pool of the slot beside the sizes of the tasks at work there.
     // The cached prompts of idle slots do not count: a step that needs their cells takes them (step_shed).
     // With nothing at work the task starts whatever its size: no other task's end could make room for it.
     bool kv_reserve_fits(const server_slot & slot, const server_task & task) const {
-        const bool overflow = is_kv_overflow_slot(slot.id);
+        const bool overflow = slot.kv_overflow;
 
         int64_t n_reserved = 0;
         for (const auto & other : slots) {
-            if (other.is_processing() && is_kv_overflow_slot(other.id) == overflow) {
+            if (other.is_processing() && other.kv_overflow == overflow) {
                 n_reserved += other.n_ctx_task;
             }
         }
@@ -2225,6 +2426,11 @@ private:
         return step_fail_newest(pool_over);
     }
 
+    // return true if at least one slot has been cleared
+    // TODO: improve logic
+    //       - smarter decision which slot to clear (LRU or longest prompt?)
+    //       - move slot to level 2 cache instead of removing?
+    //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
         bool res = false;
 
@@ -2414,7 +2620,9 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
-        slot.n_ctx_task = n_ctx_task_of(slot, *slot.task);
+        // fitted to a pool in get_available_slot(): nothing has started since but the task's own children, which are
+        // at work by now and counted as such
+        slot.n_ctx_task = kv_fit ? kv_fit_task(slot, *slot.task, false).limit : n_ctx_task_of(slot, *slot.task);
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -2504,7 +2712,7 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx_task) {
+        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx_task && !kv_fit_extend(slot)) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -3019,6 +3227,11 @@ private:
             // keep the state that the child task is about to overwrite
             if (prompt_cache && slot->prompt_save(*prompt_cache)) {
                 prompt_cache->update();
+            }
+
+            // the children share the cells of the parent's prompt, which only one pool can do
+            if (kv_fit) {
+                kv_set_overflow(*slot, parent_slot.kv_overflow);
             }
 
             int id_child = parent_task.child_tasks[idx].id;
@@ -3994,18 +4207,18 @@ private:
 
             std::vector<bool> pool_over(slots.size(), false);
             if (params_base.kv_unified) {
-                // the slots of --kv-overflow-slots share one pool, the other slots the home pool
+                // the slots in the second pool share that one, the other slots the first
                 for (const bool overflow : { false, true }) {
                     int64_t n_cells = 0;
                     for (const auto & slot : slots) {
-                        if (is_kv_overflow_slot(slot.id) == overflow) {
+                        if (slot.kv_overflow == overflow) {
                             n_cells += slot.prompt.n_tokens();
                         }
                     }
 
                     const int64_t n_size = overflow ? params_base.kv_overflow_size : (int64_t) llama_n_ctx_seq(ctx_tgt);
                     for (const auto & slot : slots) {
-                        if (is_kv_overflow_slot(slot.id) == overflow) {
+                        if (slot.kv_overflow == overflow) {
                             pool_over[slot.id] = n_cells > n_size;
                         }
                     }
@@ -4201,7 +4414,7 @@ private:
                 // TTS and realtime conversation slots drive their own decode loop, never enter the shared batch
                 return;
             }
-            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx_task) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx_task && !kv_fit_extend(slot)) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -5610,8 +5823,12 @@ private:
     }
 
     int n_ctx_slot(int id) const {
-        // the cells of the slot come from the shared pool, or from the pool of --kv-overflow-device
+        // the cells of the slot come from the shared pool, or from the pool of --kv-overflow-device; from either one
+        // when each task is fitted
         int res = is_kv_overflow_slot(id) ? params_base.kv_overflow_size : (int) llama_n_ctx_seq(ctx_tgt);
+        if (kv_fit) {
+            res = std::max(res, params_base.kv_overflow_size);
+        }
 
         const auto & limits = params_base.kv_unified_per_slot_list;
         if (!limits.empty()) {

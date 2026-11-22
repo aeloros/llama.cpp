@@ -154,7 +154,7 @@ static bool server_prepare_params(common_params & params, server_role_type role_
 
         // a second pool of KV cells on another device, for some of the slots
         if (params.kv_overflow_device != nullptr || params.kv_overflow_size > 0 || !params.kv_overflow_slots.empty()) {
-            if (params.kv_overflow_device == nullptr || params.kv_overflow_size <= 0 || params.kv_overflow_slots.empty()) {
+            if (params.kv_overflow_device == nullptr || params.kv_overflow_size <= 0) {
                 SRV_ERR("%s", "--kv-overflow-device, --kv-overflow-size and --kv-overflow-slots have to be given together\n");
                 return false;
             }

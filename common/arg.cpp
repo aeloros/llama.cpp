@@ -1661,9 +1661,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_RESERVE").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         { "--kv-overflow-device" }, "<dev>",
-        "device for a second pool of KV cells, used by the slots of --kv-overflow-slots (default: none).\n"
-        "the model stays on the devices of --device, only the attention of these slots runs on <dev>.\n"
-        "needs --kv-unified, --kv-overflow-size and --kv-overflow-slots",
+        "device for a second pool of KV cells (default: none).\n"
+        "the model stays on the devices of --device, only the attention over these cells runs on <dev>.\n"
+        "with --kv-overflow-slots the pool belongs to those slots. without it every task is fitted when it starts:\n"
+        "it goes to the first pool when it fits there (see --kv-fit-headroom), otherwise whole to the second pool,\n"
+        "and it waits when neither has the room.\n"
+        "needs --kv-unified and --kv-overflow-size",
         [](common_params & params, const std::string & value) {
             const auto devices = parse_device_list(value);
             if (devices.size() != 2 || devices[0] == nullptr) {
@@ -1674,7 +1677,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_OVERFLOW_DEVICE").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         { "--kv-overflow-size" }, "N",
-        "number of KV cells on --kv-overflow-device, shared by the slots of --kv-overflow-slots",
+        "number of KV cells on --kv-overflow-device",
         [](common_params & params, int value) {
             if (value <= 0) {
                 throw std::invalid_argument("--kv-overflow-size must be positive");
@@ -1696,6 +1699,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_KV_OVERFLOW_SLOTS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--kv-fit-headroom" }, "N",
+        string_format(
+            "with --kv-overflow-device and no --kv-overflow-slots: a task goes to the first pool of KV cells when its\n"
+            "prompt and N tokens of room for its output are free there, or its whole output limit if that is less\n"
+            "(default: %d). that is its limit to begin with, and it takes N more each time it runs into it, while the\n"
+            "pool has them: a task that needs more than the pool has left ends as truncated.\n"
+            "the first pool is on the device that holds the model", params.kv_fit_headroom),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-fit-headroom must not be negative");
+            }
+            params.kv_fit_headroom = value;
+        }
+    ).set_env("LLAMA_ARG_KV_FIT_HEADROOM").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         { "--kv-overflow-keep-awake" },
         { "--no-kv-overflow-keep-awake" },
