@@ -1871,6 +1871,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        // The whole cached prompt is a prefix of the new one: the new prompt goes on from it, and the state moves to
+        // the slot. Otherwise the two only start alike, and the cached prompt belongs to a conversation that may
+        // still go on (the conversations of one client share their system prompt): the slot gets a copy of the
+        // state, and the cache keeps it.
+        const bool moves = lcp_best == (int) it_best->prompt.tokens.size();
+
         {
             auto & data = it_best->data.main;
 
@@ -1881,9 +1887,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
@@ -1899,22 +1902,21 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
         SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_RESTORE__\n");
 
-        // the whole cached prompt is a prefix of the new one
-        if (lcp_best == (int) it_best->prompt.tokens.size()) {
+        // the cache gives the state up only now that both contexts have it: an entry is whole or it is not there
+        if (moves) {
             SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+
+            prompt = std::move(it_best->prompt);
+
+            states.erase(it_best);
+        } else {
+            prompt = it_best->prompt.clone();
         }
-
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
     }
 
     return true;
