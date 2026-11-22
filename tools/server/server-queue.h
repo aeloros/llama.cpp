@@ -67,6 +67,9 @@ public:
     // n_ctx_slot > 0 (slots with their own context limits): otherwise prefer the first unpinned task whose prompt fits that slot
     void pop_deferred_task(int id_slot, int n_ctx_slot = 0);
 
+    // Call when room was made that any deferred task may fit in: it moves all of them to the main queue, in their order
+    void pop_deferred_tasks();
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     // the server then stays awake until the caller calls release_inflight()

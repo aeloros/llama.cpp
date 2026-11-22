@@ -1472,6 +1472,14 @@ private:
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
         {
+            if (params_base.kv_reserve && !params_base.kv_unified) {
+                SRV_WRN("%s", "--kv-reserve needs --kv-unified: without it every slot has cells of its own, ignored\n");
+                params_base.kv_reserve = false;
+            }
+            if (params_base.kv_reserve) {
+                SRV_INF("%s", "a task starts only when its size fits in the KV cells beside the tasks at work (--kv-reserve)\n");
+            }
+
             // note: the capping itself is done in n_ctx_slot(), here we only report it
             const int n_ctx_seq = llama_n_ctx_seq(ctx_tgt);
 
@@ -1671,7 +1679,12 @@ private:
             slot.callback_on_release = [this](int id_slot) {
                 // with per-slot limits, retry a deferred task that fits the released slot, not just the first one
                 const int n_ctx_released = params_base.kv_unified_per_slot_list.empty() ? 0 : slots[id_slot].n_ctx;
-                queue_tasks.pop_deferred_task(id_slot, n_ctx_released);
+                if (params_base.kv_reserve) {
+                    // the room that the task leaves may be what any waiting task needs, or several of them
+                    queue_tasks.pop_deferred_tasks();
+                } else {
+                    queue_tasks.pop_deferred_task(id_slot, n_ctx_released);
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -2024,6 +2037,12 @@ private:
             }
         }
 
+        // with --kv-reserve the task waits until its size fits beside the tasks at work
+        if (ret && params_base.kv_reserve && !kv_reserve_fits(*ret, task)) {
+            SLT_DBG(*ret, "the task's size (%d) does not fit beside the tasks at work, id_task = %d\n", n_ctx_task_of(*ret, task), task.id);
+            return nullptr;
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -2055,6 +2074,51 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
+    // The limit of a task in a slot: its prompt and its output, and never more than the slot holds. One more than the
+    // two: the stop check in process_token() fires one token before the limit and runs before the check of n_predict,
+    // so without it a task that ends by n_predict would be reported as truncated. A task without an output limit has
+    // the slot's limit, and so has a realtime conversation, a stream with no declared end. A task that ends with its
+    // prompt (an embedding, a rerank, a decision) has its prompt.
+    int32_t n_ctx_task_of(const server_slot & slot, const server_task & task) const {
+        if (task.type == SERVER_TASK_TYPE_REALTIME) {
+            return slot.n_ctx;
+        }
+        if (!task.need_sampling()) {
+            return (int32_t) std::min<int64_t>(slot.n_ctx, (int64_t) task.n_tokens() + 1);
+        }
+        const int32_t n_predict = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+        if (n_predict < 0) {
+            return slot.n_ctx;
+        }
+        return (int32_t) std::min<int64_t>(slot.n_ctx, (int64_t) task.n_tokens() + n_predict + 1);
+    }
+
+    // --kv-reserve: whether the task's size fits in the pool of the slot beside the sizes of the tasks at work there.
+    // The cached prompts of idle slots do not count: a step that needs their cells takes them (step_shed).
+    // With nothing at work the task starts whatever its size: no other task's end could make room for it.
+    bool kv_reserve_fits(const server_slot & slot, const server_task & task) const {
+        const bool overflow = is_kv_overflow_slot(slot.id);
+
+        int64_t n_reserved = 0;
+        for (const auto & other : slots) {
+            if (other.is_processing() && is_kv_overflow_slot(other.id) == overflow) {
+                n_reserved += other.n_ctx_task;
+            }
+        }
+        if (n_reserved == 0) {
+            return true;
+        }
+
+        int64_t n_need = n_ctx_task_of(slot, task);
+        for (const auto & child : task.child_tasks) {
+            n_need += n_ctx_task_of(slot, child);
+        }
+
+        const int64_t n_pool = overflow ? params_base.kv_overflow_size : (int64_t) llama_n_ctx_seq(ctx_tgt);
+
+        return n_reserved + n_need <= n_pool;
+    }
+
     // records where a slot is, before its entries are added to the batch of this step
     void step_mark(server_slot & slot) {
         for (const auto & mark : step_marks) {
@@ -2350,13 +2414,7 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
-        // The task's own limit: its prompt and its output, and never more than the slot holds. One more than the two:
-        // the stop check in process_token() fires one token before the limit and runs before the check of n_predict,
-        // so without it a task that ends by n_predict would be reported as truncated.
-        slot.n_ctx_task = slot.n_ctx;
-        if (slot.n_predict_max >= 0) {
-            slot.n_ctx_task = (int32_t) std::min<int64_t>(slot.n_ctx, (int64_t) slot.task->n_tokens() + slot.n_predict_max + 1);
-        }
+        slot.n_ctx_task = n_ctx_task_of(slot, *slot.task);
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;

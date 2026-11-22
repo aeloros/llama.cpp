@@ -1651,6 +1651,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--kv-reserve" },
+        "start a task only when its size, its prompt and its output limit, fits in the KV cells beside the sizes of\n"
+        "the tasks at work; a task that does not fit waits for its turn (default: disabled, needs --kv-unified).\n"
+        "a task without an output limit has the whole limit of its slot as its size",
+        [](common_params & params) {
+            params.kv_reserve = true;
+        }
+    ).set_env("LLAMA_ARG_KV_RESERVE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         { "--kv-overflow-device" }, "<dev>",
         "device for a second pool of KV cells, used by the slots of --kv-overflow-slots (default: none).\n"
         "the model stays on the devices of --device, only the attention of these slots runs on <dev>.\n"

@@ -663,6 +663,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset (with a list: the largest limit)
     std::vector<int32_t> kv_unified_per_slot_list; // one limit per slot, in slot order; empty = kv_unified_per_slot for every slot
+    bool    kv_reserve          = false; // a task starts only when its size fits in the KV cells beside the tasks at work
 
     ggml_backend_dev_t   kv_overflow_device = nullptr; // device of the added KV stream; nullptr = no added stream
     int32_t              kv_overflow_size   = 0;       // cells of the added KV stream
