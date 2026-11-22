@@ -1114,6 +1114,24 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // The step is a transaction. A mark holds what a slot's entries in the batch of this step change, so that the
+    // step can be taken back when llama_decode refuses the batch: the memory has changed nothing then.
+    struct slot_step_mark {
+        server_slot * slot;
+        size_t        n_tokens; // of slot.prompt.tokens
+        slot_state    state;
+        int32_t       i_batch;
+        uint64_t      n_gen;
+        uint64_t      n_draft_tokens;
+        llama_tokens  spec_draft;
+        std::vector<std::vector<llama_token_data>> spec_draft_q;
+        std::vector<float> inp_embd; // the audio rows that the build consumes
+    };
+    std::vector<slot_step_mark> step_marks;
+
+    // after a refusal: how many prompt tokens the slots that can split their prompt add to a batch, -1 = no limit
+    int32_t n_prompt_budget = -1;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -2031,6 +2049,112 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
+    // records where a slot is, before its entries are added to the batch of this step
+    void step_mark(server_slot & slot) {
+        for (const auto & mark : step_marks) {
+            if (mark.slot == &slot) {
+                return;
+            }
+        }
+        step_marks.push_back({
+            &slot, (size_t) slot.prompt.n_tokens(), slot.state, slot.i_batch, slot.stats.n_gen, slot.stats.n_draft_tokens,
+            slot.spec_draft, slot.spec_draft_q, slot.audio_stream ? slot.inp_embd : std::vector<float>(),
+        });
+    }
+
+    // a chunk that the slot decoded by itself is in the memory: a step that is taken back keeps it
+    void step_mark_decoded(server_slot & slot) {
+        for (auto & mark : step_marks) {
+            if (mark.slot == &slot) {
+                mark.n_tokens = (size_t) slot.prompt.n_tokens();
+            }
+        }
+    }
+
+    // llama_decode refused the batch: every slot in it goes back to its mark
+    void step_rollback() {
+        for (auto it = step_marks.rbegin(); it != step_marks.rend(); ++it) {
+            auto & slot = *it->slot;
+
+            if (!slot.is_processing()) {
+                continue; // released while the batch was built
+            }
+
+            slot.prompt.tokens.keep_first(it->n_tokens);
+
+            slot.state                = it->state;
+            slot.i_batch              = it->i_batch;
+            slot.stats.n_gen          = it->n_gen;
+            slot.stats.n_draft_tokens = it->n_draft_tokens;
+
+            // a draft made for this step is made again by the next build
+            slot.spec_draft   = std::move(it->spec_draft);
+            slot.spec_draft_q = std::move(it->spec_draft_q);
+            slot.spec_i_batch.clear();
+
+            if (slot.audio_stream) {
+                slot.inp_embd = std::move(it->inp_embd);
+            }
+        }
+
+        step_marks.clear();
+        batch.clear();
+    }
+
+    // The last thing to shed after a refusal: one task fails, alone, with the context-size error, and its memory is
+    // cleared. It is the newest of the tasks whose cells are in a pool that the batch did not fit in (pool_over, per
+    // slot); when the count finds no such pool, the newest task of all.
+    bool step_fail_newest(const std::vector<bool> & pool_over) {
+        server_slot * victim = nullptr;
+
+        for (int pass = 0; pass < 2 && !victim; pass++) {
+            for (auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    continue;
+                }
+                if (pass == 0 && !pool_over[slot.id]) {
+                    continue;
+                }
+                if (!victim || slot.task->id > victim->task->id) {
+                    victim = &slot;
+                }
+            }
+        }
+
+        if (!victim) {
+            return false;
+        }
+
+        SLT_WRN(*victim, "the KV cache is full, stopping this task, the newest in it (n_tokens = %d)\n", victim->prompt.n_tokens());
+
+        send_error(*victim,
+                "the context memory is full: this task, the newest in it, was stopped so that the others can continue",
+                victim->task->n_tokens() > 0 ? ERROR_TYPE_EXCEED_CONTEXT_SIZE : ERROR_TYPE_SERVER);
+        victim->release();
+        victim->prompt_clear();
+
+        return true;
+    }
+
+    // After a refused step was taken back, something is shed so that the next build fits, in this order:
+    //   - the prompt tokens above one, of the slots that can split their prompt (n_prompt_split of them were in the batch)
+    //   - the cached prompt of an idle slot
+    //   - one task (step_fail_newest)
+    // returns false when nothing is left to shed
+    bool step_shed(int32_t n_prompt_split, const std::vector<bool> & pool_over) {
+        if (n_prompt_split > 1) {
+            n_prompt_budget = n_prompt_split / 2;
+            SRV_WRN("the next batch reads at most %d prompt tokens\n", n_prompt_budget);
+            return true;
+        }
+
+        if (try_clear_idle_slots()) {
+            return true;
+        }
+
+        return step_fail_newest(pool_over);
+    }
+
     bool try_clear_idle_slots() {
         bool res = false;
 
@@ -3748,27 +3872,100 @@ private:
             abort_all_slots("process_realtime_slots() failed: " + std::string(e.what()));
         }
 
-        GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+        apply_batch_settings();
 
-        if (batch.slot_batched) {
-            auto & slot_batched      = batch.slot_batched;
-            auto & alora_scale       = batch.alora_scale;
-            auto & alora_disabled_id = batch.alora_disabled_id;
+        // A batch that is one llama_decode call is a transaction: when the memory refuses it, nothing has changed
+        // there, so the slots go back to where they were, something is shed and the step is built again.
+        while (batch.size() > 0 && batch.size() <= (int32_t) llama_n_batch(ctx_tgt)) {
+            bool refused = false;
 
-            // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
-            // apply lora, only need to do it once per batch
-            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+            try {
+                scoped_timer t(t_decode, n_decode);
 
-            // if the lora is temporarily disabled for an alora, re-enable it
-            // for next time
-            if (alora_scale > 0.0f) {
-                SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
-                slot_batched->lora[alora_disabled_id].scale = alora_scale;
+                int32_t n_batch_step = llama_n_batch(ctx_tgt);
+
+                batch.render(0, batch.size());
+                if (!decode(n_batch_step, 0, &refused) && !refused) {
+                    throw std::runtime_error("the batch was neither decoded nor refused");
+                }
+#ifdef DEBUG_TIMINGS
+                llama_synchronize(ctx_tgt);
+#endif
+            } catch (const std::exception & e) {
+                SRV_ERR("decode() failed: %s\n", e.what());
+                abort_all_slots("decode() failed: " + std::string(e.what()));
+                return;
             }
 
-            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+            if (!refused) {
+                step_marks.clear();
+                n_prompt_budget = -1;
+
+                try {
+                    scoped_timer t(t_post_decode, n_post_decode);
+                    post_decode(batch.size(), 0);
+                } catch (const std::exception & e) {
+                    SRV_ERR("post_decode() failed: %s\n", e.what());
+                    abort_all_slots("post_decode() failed: " + std::string(e.what()));
+                }
+
+                return;
+            }
+
+            // what the refused batch held, and which pools it did not fit in: counted before the step is taken back
+            int32_t n_prompt_split = 0;
+            for (const auto & tok : batch.tokens) {
+                if (tok.is_prompt && slots[tok.id_slot].can_split()) {
+                    n_prompt_split++;
+                }
+            }
+
+            std::vector<bool> pool_over(slots.size(), false);
+            if (params_base.kv_unified) {
+                // the slots of --kv-overflow-slots share one pool, the other slots the home pool
+                for (const bool overflow : { false, true }) {
+                    int64_t n_cells = 0;
+                    for (const auto & slot : slots) {
+                        if (is_kv_overflow_slot(slot.id) == overflow) {
+                            n_cells += slot.prompt.n_tokens();
+                        }
+                    }
+
+                    const int64_t n_size = overflow ? params_base.kv_overflow_size : (int64_t) llama_n_ctx_seq(ctx_tgt);
+                    for (const auto & slot : slots) {
+                        if (is_kv_overflow_slot(slot.id) == overflow) {
+                            pool_over[slot.id] = n_cells > n_size;
+                        }
+                    }
+                }
+            } else {
+                // every slot has cells of its own
+                for (const auto & slot : slots) {
+                    pool_over[slot.id] = slot.prompt.n_tokens() > (int32_t) llama_n_ctx_seq(ctx_tgt);
+                }
+            }
+
+            step_rollback();
+
+            if (!step_shed(n_prompt_split, pool_over)) {
+                SRV_ERR("%s", "the batch does not fit in the KV cache and nothing is left to shed\n");
+                abort_all_slots("the batch does not fit in the KV cache");
+                return;
+            }
+
+            try {
+                scoped_timer t(t_pre_decode, n_pre_decode);
+                pre_decode();
+            } catch (const std::exception & e) {
+                SRV_ERR("pre_decode() failed: %s\n", e.what());
+                abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+                return;
+            }
+
+            apply_batch_settings();
         }
 
+        // a batch over n_batch is decoded in slices, without the transaction
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -3807,6 +4004,30 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+        }
+    }
+
+    // the adapters and the embeddings mode of the batch that pre_decode() built
+    void apply_batch_settings() {
+        GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+
+        if (batch.slot_batched) {
+            auto & slot_batched      = batch.slot_batched;
+            auto & alora_scale       = batch.alora_scale;
+            auto & alora_disabled_id = batch.alora_disabled_id;
+
+            // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
+            // apply lora, only need to do it once per batch
+            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+
+            // if the lora is temporarily disabled for an alora, re-enable it
+            // for next time
+            if (alora_scale > 0.0f) {
+                SRV_DBG("re-enabling alora with scale %f\n", alora_scale);
+                slot_batched->lora[alora_disabled_id].scale = alora_scale;
+            }
+
+            llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
     }
 
@@ -3971,6 +4192,7 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        step_marks.clear();
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3994,6 +4216,8 @@ private:
             } else if (!slot_batched->can_batch_with(slot)) {
                 return;
             }
+
+            step_mark(slot);
 
             generating.push_back(&slot);
 
@@ -4120,6 +4344,9 @@ private:
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
+
+            // prompt tokens added by the slots that can split their prompt, see n_prompt_budget
+            int32_t n_prompt_added = 0;
 
             // the slots that have prompt tokens to add, minus the ones that had their turn (see n_batch_slot)
             const auto is_reading = [](const server_slot & slot) {
@@ -4531,6 +4758,9 @@ private:
                         if (batch.size() + slot.task->n_tokens() > n_batch) {
                             return;
                         }
+                    } else if (n_prompt_budget >= 0 && n_prompt_added >= n_prompt_budget) {
+                        // a batch was refused: this prompt waits for the next step
+                        return;
                     }
 
                     // note: the prompt timing is advanced in post_decode(), so it does not cover
@@ -4591,6 +4821,8 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    step_mark(slot);
+
                     // TODO: do the same for all models, then remove process_mtmd_chunk()
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
                         if (!add_prompt_mixed(slot)) {
@@ -4640,6 +4872,8 @@ private:
                             slot.prompt.tokens.push_back_placeholder(chunk.get());
                         }
 
+                        step_mark_decoded(slot);
+
                         has_mtmd = true;
                     }
 
@@ -4669,6 +4903,11 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
+                        // a batch was refused: the slots that can split their prompt read less
+                        if (n_prompt_budget >= 0 && slot.can_split() && n_prompt_added >= n_prompt_budget) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4705,6 +4944,7 @@ private:
                             batch.set_decision_order(batch.size() - 1, slot.task->decision.order[slot.prompt.n_tokens()]);
                         }
                         slot.prompt.tokens.push_back(cur_tok);
+                        n_prompt_added += slot.can_split() ? 1 : 0;
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -4862,7 +5102,9 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off) {
+    // with refused, a batch that the memory does not have the cells for is not retried: *refused is set, false is
+    // returned, and the caller takes the step back (the memory has changed nothing)
+    bool decode(int32_t & n_batch, int32_t off, bool * refused = nullptr) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -4902,6 +5144,14 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+
+        if (ret == 1 && refused) {
+            SRV_WRN("the batch does not fit in the KV cache, taking the step back, n_tokens = %d\n", batch.size());
+
+            *refused = true;
+
+            return false;
+        }
 
         if (ret != 0) {
             {

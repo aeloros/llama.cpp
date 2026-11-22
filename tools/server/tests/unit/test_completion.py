@@ -421,15 +421,18 @@ def test_completion_parallel_slots(n_slots: int, n_requests: int):
 
 
 @pytest.mark.parametrize(
-    "n_ctx,n_slots,n_predict_vals,expected_success",
+    "n_ctx,n_slots,n_predict_vals,n_ok_min",
     [
-        (256, 4, [80, 40, 80, 80], [True,  True,  True,  True]),
-        (256, 4, [70, 70, 70, 70], [False, False, False, False]),
-        (256, 4, [90, 90, 40, 90], [False, False, True,  False]),
-        (256, 4, [90, 90, 40, 75], [True,  True,  True,  True]),
+        # how many of the requests are served at least, whatever the order they arrive in and however they overlap:
+        # the newest are stopped until the others fit, each with its 2 prompt tokens and its output but one
+        (256, 4, [80, 40, 80, 80], 3),
+        # four of 71 tokens do not fit in 256, three do
+        (256, 4, [70, 70, 70, 70], 3),
+        (256, 4, [90, 90, 40, 90], 2),
+        (256, 4, [90, 90, 40, 75], 2),
     ],
 )
-def test_completion_unified(n_ctx, n_slots, n_predict_vals, expected_success):
+def test_completion_unified(n_ctx, n_slots, n_predict_vals, n_ok_min):
     global server
     server.n_slots = n_slots
     server.kv_unified = True
@@ -440,20 +443,20 @@ def test_completion_unified(n_ctx, n_slots, n_predict_vals, expected_success):
     for n_predict in n_predict_vals:
         tasks.append((server.make_request, ("POST", "/completion", {"prompt": prompt, "n_predict": n_predict})))
     results = parallel_function_calls(tasks)
-    for res, n_predict, expect_ok in zip(results, n_predict_vals, expected_success):
-        if expect_ok:
-            # the pool is aborted as a whole, so a request that fits on its own
-            # is still dropped when the slots overlap, and it says so explicitly
-            assert res.status_code == 200 or (
-                res.status_code == 500
-                and "context size has been exceeded" in res.body["error"]["message"].lower()
-            )
-
+    n_ok = 0
+    for res, n_predict in zip(results, n_predict_vals):
         # note: https://github.com/ggml-org/llama.cpp/pull/18700#issuecomment-3728695581
         if res.status_code == 200:
+            n_ok += 1
             assert "content" in res.body
             if "timings" in res.body:
                 assert res.body["timings"]["predicted_n"] == n_predict
+        else:
+            # a pool that cannot hold every request to its end stops the newest of them, one at a time, and tells
+            # each why; the others are served
+            assert res.status_code == 400
+            assert res.body["error"]["type"] == "exceed_context_size_error"
+    assert n_ok >= n_ok_min
 
 
 @pytest.mark.parametrize(
