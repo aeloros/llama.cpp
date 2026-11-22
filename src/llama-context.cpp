@@ -4168,6 +4168,51 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+size_t llama_context::release_compute(ggml_backend_dev_t dev) {
+    if (!sched) {
+        return 0;
+    }
+
+    auto get_size = [&]() {
+        size_t res = 0;
+        for (const auto & backend : backends) {
+            res += ggml_backend_sched_get_buffer_size(sched.get(), backend.get());
+        }
+        return res;
+    };
+
+    const size_t size_before = get_size();
+
+    // nothing may still compute, and no copy into the output buffers may be pending
+    synchronize();
+
+    // the graphs of the previous decodes have their tensors in the buffers that go back: none can be reused
+    for (auto & res : gf_res_prev) {
+        res->reset();
+    }
+    gf_res_prev_active = nullptr;
+
+    ggml_backend_sched_reset(sched.get());
+
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev_cur = ggml_backend_get_device(backend.get());
+
+        const bool match = dev ? dev_cur == dev : ggml_backend_dev_type(dev_cur) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (!match) {
+            continue;
+        }
+
+        ggml_backend_sched_free_buffer(sched.get(), backend.get());
+    }
+
+    const size_t size_back = size_before - get_size();
+
+    LLAMA_LOG_DEBUG("%s: %10s compute buffer of %8.2f MiB goes back to the device\n", __func__,
+            dev ? ggml_backend_dev_name(dev) : "CPU", size_back/1024.0/1024.0);
+
+    return size_back;
+}
+
 //
 // training
 //
@@ -5211,6 +5256,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+size_t llama_context_release_compute(struct llama_context * ctx, ggml_backend_dev_t dev) {
+    return ctx->release_compute(dev);
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

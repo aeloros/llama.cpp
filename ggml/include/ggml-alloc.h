@@ -73,6 +73,11 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// free the buffer of one buffer id, together with the ids that use the same buffer type
+// the tensors of the last allocated graph are left with dangling pointers
+// the next graph is reserved again, which allocates the buffer at the size that graph needs
+GGML_API void ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 

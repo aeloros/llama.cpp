@@ -1129,6 +1129,29 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
 }
 
+void ggml_gallocr_free_buffer(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    struct vbuffer * buf = galloc->buffers[buffer_id];
+    if (buf == NULL) {
+        return;
+    }
+
+    // a buffer type that is used multiple times has one buffer
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == buf) {
+            galloc->buffers[i] = NULL;
+        }
+    }
+
+    ggml_vbuffer_free(buf);
+
+    // the assignments of the last reserved graph are addresses in the buffers: no graph matches them from here on,
+    // so that ggml_gallocr_alloc_graph asks for a new reservation
+    galloc->n_nodes = 0;
+    galloc->n_leafs = 0;
+}
+
 // utils
 
 static struct ggml_tensor ** ggml_backend_alloc_ctx_tensors_from_buft_collect(

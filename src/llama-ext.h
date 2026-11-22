@@ -137,6 +137,12 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// Give the memory that the context computes with on a device (NULL for the CPU) back to it: the compute buffer of
+// the device's backend. The next graph that runs on the device takes what it needs again. The memory module keeps
+// its buffers (see llama_memory_stream_release).
+// Returns the size of the compute buffer that went back.
+LLAMA_API size_t llama_context_release_compute(struct llama_context * ctx, ggml_backend_dev_t dev);
+
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 

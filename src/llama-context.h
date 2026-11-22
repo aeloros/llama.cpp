@@ -213,6 +213,9 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    // see llama_context_release_compute
+    size_t release_compute(ggml_backend_dev_t dev);
+
     //
     // training
     //

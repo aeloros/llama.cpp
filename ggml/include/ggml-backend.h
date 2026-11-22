@@ -367,6 +367,10 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
+    // Free the compute buffer of a backend, f.ex. of a device that the graphs stopped using. Reset the scheduler first.
+    // The next graph is reserved again, which allocates the buffer at the size that graph needs on the backend.
+    GGML_API void                       ggml_backend_sched_free_buffer(ggml_backend_sched_t sched, ggml_backend_t backend);
+
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 

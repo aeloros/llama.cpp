@@ -1211,6 +1211,83 @@ struct case_noalloc : ctx_test {
     }
 };
 
+// the memory that the context computes with, over all devices
+static size_t ctx_compute_bytes(const llama_context * ctx) {
+    size_t res = 0;
+    for (const auto & [_, data] : llama_get_memory_breakdown(ctx)) {
+        res += data.compute;
+    }
+
+    return res;
+}
+
+// - decode the prompt into sequence 0
+// - give the compute memory of every device of the context back
+// - decode the prompt into sequence 1: the context takes what it needs again, and the logits are those of sequence 0
+// - sequence 0, decoded before the memory went back, continues like sequence 1
+struct case_comp_release : ctx_test {
+    const char * name() const override { return "comp_release"; }
+
+    const char * description() const override {
+        return "the compute memory of a device goes back, and the next decode takes what it needs again";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        // keep one token of the prompt to continue with
+        const llama_pos n_tokens = (llama_pos) std::min<size_t>(mr.tokens.size(), 128) - 1;
+        CTX_REQUIRE(n_tokens >= 2, "the prompt is too short");
+
+        auto decode_prompt = [&](llama_seq_id seq_id, std::vector<float> & logits) {
+            return decode_seq(ctx.get(), mr.tokens, 0, n_tokens - 1, seq_id, false) &&
+                   decode_seq(ctx.get(), mr.tokens, n_tokens - 1, n_tokens, seq_id, true) &&
+                   get_current_logits(ctx.get(), logits);
+        };
+
+        std::vector<float> logits[2];
+        CTX_REQUIRE(decode_prompt(0, logits[0]), "failed to decode the prompt in seq 0");
+
+        const size_t n_bytes_before = ctx_compute_bytes(ctx.get());
+        CTX_REQUIRE(n_bytes_before > 0, "the context reports no compute memory");
+
+        // the devices of the model, and the CPU
+        size_t n_bytes_back = llama_context_release_compute(ctx.get(), nullptr);
+        for (int i = 0; i < llama_model_n_devices(mr.model); ++i) {
+            n_bytes_back += llama_context_release_compute(ctx.get(), llama_model_get_device(mr.model, i));
+        }
+
+        CTX_REQUIRE(n_bytes_back == n_bytes_before, "the compute memory that went back is not what the context had: " +
+                std::to_string(n_bytes_back) + " of " + std::to_string(n_bytes_before) + " bytes");
+        CTX_REQUIRE(ctx_compute_bytes(ctx.get()) == 0, "compute memory is still counted after it went back");
+
+        CTX_REQUIRE(decode_prompt(1, logits[1]), "failed to decode the prompt after the compute memory went back");
+        CTX_REQUIRE(ctx_compute_bytes(ctx.get()) > 0, "the decode took no compute memory");
+
+        logits_diff diff = compare_logits(logits[0].data(), logits[1].data(), logits[0].size());
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "the decode after the compute memory went back produced different logits" + diff_str(diff));
+
+        // what was decoded before is in the memory module, which kept its buffers
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            CTX_REQUIRE(decode_one(ctx.get(), mr.tokens[n_tokens], n_tokens, seq_id) && get_current_logits(ctx.get(), logits[seq_id]),
+                    "failed to continue seq " + std::to_string(seq_id));
+        }
+
+        diff = compare_logits(logits[0].data(), logits[1].data(), logits[0].size());
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 0, decoded before the compute memory went back, continued differently than seq 1" + diff_str(diff));
+
+        return case_result::pass();
+    }
+};
+
 struct case_comp_padding : ctx_test {
     const char * name() const override { return "comp_padding"; }
 
@@ -1291,6 +1368,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_rotation>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
     cases.push_back(std::make_unique<case_noalloc>());
+    cases.push_back(std::make_unique<case_comp_release>());
     cases.push_back(std::make_unique<case_comp_padding>());
 
     return cases;

@@ -2555,6 +2555,21 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
+void ggml_backend_sched_free_buffer(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(!sched->is_alloc && "the scheduler has to be reset before a buffer of it is freed");
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    // nothing may still compute with the tensors of the buffer
+    ggml_backend_sched_synchronize(sched);
+
+    ggml_gallocr_free_buffer(sched->galloc, backend_index);
+
+    // the next graph is reserved anew, which is no sign of a reservation that was too small [GGML_SCHED_DEBUG_REALLOC]
+    sched->graph_size = 0;
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
