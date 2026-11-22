@@ -314,6 +314,10 @@ struct server_slot {
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
+
+    // The limit of the task that runs in the slot: what that task can grow to, where n_ctx is what the slot may
+    // hold. Set when the task is launched (launch_slot_with_task), 0 without a task
+    int32_t n_ctx_task = 0;
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
@@ -454,6 +458,7 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+        n_ctx_task    = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -591,7 +596,7 @@ struct server_slot {
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
-        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
+        int n_draft_max = n_ctx_task - prompt.n_tokens() - 2;
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
@@ -816,6 +821,7 @@ struct server_slot {
         res = {
             {"id",            id},
             {"n_ctx",         n_ctx},
+            {"n_ctx_task",    n_ctx_task},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
         };
@@ -2344,6 +2350,14 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        // The task's own limit: its prompt and its output, and never more than the slot holds. One more than the two:
+        // the stop check in process_token() fires one token before the limit and runs before the check of n_predict,
+        // so without it a task that ends by n_predict would be reported as truncated.
+        slot.n_ctx_task = slot.n_ctx;
+        if (slot.n_predict_max >= 0) {
+            slot.n_ctx_task = (int32_t) std::min<int64_t>(slot.n_ctx, (int64_t) slot.task->n_tokens() + slot.n_predict_max + 1);
+        }
+
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
         } else {
@@ -2432,13 +2446,13 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx_task) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx_task = %d\n",
+                    slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx_task);
         }
 
         // check the limits
@@ -4129,7 +4143,7 @@ private:
                 // TTS and realtime conversation slots drive their own decode loop, never enter the shared batch
                 return;
             }
-            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx_task) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -4157,7 +4171,7 @@ private:
                     n_keep += 1;
                 }
 
-                n_keep = std::min(slot.n_ctx - 4, n_keep);
+                n_keep = std::min(slot.n_ctx_task - 4, n_keep);
 
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
                 int       n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
