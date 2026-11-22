@@ -116,8 +116,17 @@ LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 //
 
 // Add a stream of n_cells KV cells (padded to a multiple of 256) on a device (NULL for the CPU) to a unified KV cache.
+// alloc: false adds it without its memory, which llama_memory_stream_alloc takes later.
 // Returns the stream id, or -1 if the memory does not support it.
-LLAMA_API int32_t llama_memory_stream_add(llama_memory_t mem, ggml_backend_dev_t dev, uint32_t n_cells);
+LLAMA_API int32_t llama_memory_stream_add(llama_memory_t mem, ggml_backend_dev_t dev, uint32_t n_cells, bool alloc);
+
+// An added stream can be without its memory: it then holds no cells, and no sequence takes its cells from it.
+// llama_memory_stream_alloc takes the memory from the device. Returns false if the device does not have it: the
+// stream stays without.
+// llama_memory_stream_release gives it back. Returns false while a sequence takes its cells from the stream.
+// Both return true when there is nothing left to do.
+LLAMA_API bool llama_memory_stream_alloc  (llama_memory_t mem, int32_t strm);
+LLAMA_API bool llama_memory_stream_release(llama_memory_t mem, int32_t strm);
 
 // Take the new cells of a sequence from a stream. Stream 0 is the one the cache was created with.
 // Returns false if the sequence still has cells.

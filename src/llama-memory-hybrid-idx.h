@@ -68,9 +68,10 @@ public:
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // TODO: the indexer caches mirror the cells of the attention cache and have no streams of their own
-    int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size) override {
+    int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size, bool alloc) override {
         GGML_UNUSED(buft);
         GGML_UNUSED(size);
+        GGML_UNUSED(alloc);
         return -1;
     }
 

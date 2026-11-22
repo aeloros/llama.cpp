@@ -1611,7 +1611,7 @@ private:
         if (params_base.kv_overflow_device != nullptr) {
             llama_memory_t mem = llama_get_memory(ctx_tgt);
 
-            const int32_t strm = llama_memory_stream_add(mem, params_base.kv_overflow_device, params_base.kv_overflow_size);
+            const int32_t strm = llama_memory_stream_add(mem, params_base.kv_overflow_device, params_base.kv_overflow_size, true);
             if (strm < 0) {
                 SRV_ERR("%s", "--kv-overflow-device: the memory of this model cannot have a second pool of KV cells\n");
                 return false;
@@ -1659,7 +1659,7 @@ private:
 
                 // a draft model of its own may have no backend for the device
                 const int32_t strm_dft = llama_get_model(ctx_dft) == model_tgt ?
-                    llama_memory_stream_add(mem_dft, params_base.kv_overflow_device, params_base.kv_overflow_size) : -1;
+                    llama_memory_stream_add(mem_dft, params_base.kv_overflow_device, params_base.kv_overflow_size, true) : -1;
 
                 kv_strm_overflow_dft = strm_dft;
 

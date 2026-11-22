@@ -156,7 +156,7 @@ struct case_streams : ctx_test {
 
         llama_memory_t mem = llama_get_memory(ctx.get());
 
-        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192);
+        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192, true);
         if (strm < 0) {
             return case_result::skip("the memory has no streams");
         }
@@ -212,7 +212,7 @@ struct case_streams_batch : ctx_test {
 
         llama_memory_t mem = llama_get_memory(ctx.get());
 
-        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192);
+        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192, true);
         if (strm < 0) {
             return case_result::skip("the memory has no streams");
         }
@@ -331,7 +331,7 @@ struct case_streams_multi : ctx_test {
 
             if (with_stream) {
                 // room for the two sequences that share the stream
-                const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 256);
+                const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 256, true);
                 if (strm < 0) {
                     return case_result::skip("the memory has no streams");
                 }
@@ -407,7 +407,7 @@ struct case_streams_state : ctx_test {
 
         llama_memory_t mem = llama_get_memory(ctx.get());
 
-        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192);
+        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192, true);
         if (strm < 0) {
             return case_result::skip("the memory has no streams");
         }
@@ -460,6 +460,111 @@ struct case_streams_state : ctx_test {
 
 private:
     bool on_device;
+};
+
+// the memory that the context holds for its KV cells and states, over all devices
+static size_t ctx_mem_bytes(const llama_context * ctx) {
+    size_t res = 0;
+    for (const auto & [_, data] : llama_get_memory_breakdown(ctx)) {
+        res += data.context;
+    }
+
+    return res;
+}
+
+// - add a second stream to the cache without its memory: it takes no sequence
+// - take its memory: sequence 1 decodes in it like sequence 0 in the first stream
+// - the memory stays for as long as sequence 1 takes its cells from the stream, then it goes back
+// - sequence 1 decodes in the first stream meanwhile
+// - take the memory again: sequence 1 decodes in the stream as before
+struct case_streams_release : ctx_test {
+    const char * name() const override { return "streams_r"; }
+
+    const char * description() const override {
+        return "a stream gives its memory back and takes it again, and takes no sequence while it is without";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx.get());
+
+        const size_t n_bytes_before = ctx_mem_bytes(ctx.get());
+
+        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192, false);
+        if (strm < 0) {
+            return case_result::skip("the memory has no streams");
+        }
+
+        CTX_REQUIRE(ctx_mem_bytes(ctx.get()) == n_bytes_before, "a stream that was added without its memory took memory");
+        CTX_REQUIRE(!llama_memory_seq_set_stream(mem, 1, strm), "a stream without its memory took a sequence");
+        CTX_REQUIRE(llama_memory_stream_release(mem, strm), "giving back what a stream does not have is not an error");
+
+        const llama_pos n_tokens = (llama_pos) std::min<size_t>(mr.tokens.size(), 128);
+        CTX_REQUIRE(n_tokens >= 2, "the prompt is too short");
+
+        // the logits of the last token of the prompt, decoded into a sequence
+        auto decode_prompt = [&](llama_seq_id seq_id, std::vector<float> & logits) {
+            return decode_seq(ctx.get(), mr.tokens, 0, n_tokens - 1, seq_id, false) &&
+                   decode_seq(ctx.get(), mr.tokens, n_tokens - 1, n_tokens, seq_id, true) &&
+                   get_current_logits(ctx.get(), logits);
+        };
+
+        std::vector<float> logits_ref;
+        CTX_REQUIRE(decode_prompt(0, logits_ref), "failed to decode the prompt in seq 0");
+
+        size_t n_bytes_held = 0;
+
+        for (int round = 0; round < 2; ++round) {
+            const std::string where = round == 0 ? " (first time)" : " (second time)";
+
+            CTX_REQUIRE(llama_memory_stream_alloc(mem, strm), "the stream failed to take its memory" + where);
+            CTX_REQUIRE(llama_memory_stream_alloc(mem, strm), "taking what a stream has already is not an error" + where);
+
+            if (round == 0) {
+                n_bytes_held = ctx_mem_bytes(ctx.get());
+                CTX_REQUIRE(n_bytes_held > n_bytes_before, "the memory of the stream does not show in the memory of the context");
+            } else {
+                CTX_REQUIRE(ctx_mem_bytes(ctx.get()) == n_bytes_held, "the stream took a different amount of memory" + where);
+            }
+
+            CTX_REQUIRE(llama_memory_seq_set_stream(mem, 1, strm), "failed to assign seq 1 to the stream" + where);
+
+            std::vector<float> logits;
+            CTX_REQUIRE(decode_prompt(1, logits), "failed to decode the prompt in the stream" + where);
+            CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == n_tokens - 1, "seq 1 does not hold the prompt" + where);
+
+            logits_diff diff = compare_logits(logits_ref.data(), logits.data(), logits_ref.size());
+            CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 1 in the stream produced different logits than seq 0" + where + diff_str(diff));
+
+            CTX_REQUIRE(!llama_memory_stream_release(mem, strm), "the stream gave its memory back under the cells of seq 1" + where);
+            CTX_REQUIRE(seq_rm(ctx.get(), 1), "failed to remove seq 1" + where);
+            CTX_REQUIRE(!llama_memory_stream_release(mem, strm), "the stream gave its memory back while seq 1 takes its cells from it" + where);
+            CTX_REQUIRE(llama_memory_seq_set_stream(mem, 1, 0), "failed to assign seq 1 to the first stream" + where);
+            CTX_REQUIRE(llama_memory_stream_release(mem, strm), "the stream failed to give its memory back" + where);
+
+            CTX_REQUIRE(ctx_mem_bytes(ctx.get()) == n_bytes_before, "the memory of the stream is still counted after it went back" + where);
+            CTX_REQUIRE(!llama_memory_seq_set_stream(mem, 1, strm), "a stream without its memory took a sequence" + where);
+
+            // the first stream is as it was
+            CTX_REQUIRE(decode_prompt(1, logits), "failed to decode the prompt in the first stream" + where);
+
+            diff = compare_logits(logits_ref.data(), logits.data(), logits_ref.size());
+            CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 1 in the first stream produced different logits than seq 0" + where + diff_str(diff));
+
+            CTX_REQUIRE(seq_rm(ctx.get(), 1), "failed to remove seq 1 from the first stream" + where);
+        }
+
+        return case_result::pass();
+    }
 };
 
 // - load the state saved by the baseline case
@@ -1174,6 +1279,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_streams_multi>());
     cases.push_back(std::make_unique<case_streams_state>(false));
     cases.push_back(std::make_unique<case_streams_state>(true));
+    cases.push_back(std::make_unique<case_streams_release>());
     cases.push_back(std::make_unique<case_state_load>());
     cases.push_back(std::make_unique<case_seq_cp>(false));
     cases.push_back(std::make_unique<case_seq_cp>(true));

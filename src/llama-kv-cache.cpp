@@ -147,6 +147,8 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(kv_size);
     }
 
+    strm_bufs.resize(n_stream);
+
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
 
@@ -436,6 +438,11 @@ void llama_kv_cache::clear(bool data) {
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+        }
+        for (auto & sb : strm_bufs) {
+            if (sb.buf) {
+                ggml_backend_buffer_clear(sb.buf.get(), 0);
+            }
         }
     }
 }
@@ -755,6 +762,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
 
     for (const auto & [buft, size] : attn_rot_bufs.memory_breakdown()) {
         ret[buft] += size;
+    }
+
+    // the added streams, while they have their memory
+    for (const auto & sb : strm_bufs) {
+        if (!sb.buf) {
+            continue;
+        }
+        if (ctxs_bufs.no_alloc) {
+            ret[sb.buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(sb.ctx.get(), sb.buft);
+        } else {
+            ret[sb.buft] += ggml_backend_buffer_get_size(sb.buf.get());
+        }
     }
 
     return ret;
@@ -1291,7 +1310,11 @@ const std::vector<uint32_t> * llama_kv_cache::get_seq_groups() const {
     return unified && n_stream > 1 ? &seq_to_stream : nullptr;
 }
 
-int32_t llama_kv_cache::stream_add(ggml_backend_buffer_type_t buft, uint32_t size) {
+bool llama_kv_cache::stream_has_memory(uint32_t strm) const {
+    return !is_stream_added(strm) || strm_bufs[strm].buf != nullptr;
+}
+
+int32_t llama_kv_cache::stream_add(ggml_backend_buffer_type_t buft, uint32_t size, bool alloc) {
     // not for a cache that shares cells: the other cache has its own stream map and tensors
     if (!unified || other || v_cells_impl.use_count() > 1 || size == 0) {
         return -1;
@@ -1324,9 +1347,13 @@ int32_t llama_kv_cache::stream_add(ggml_backend_buffer_type_t buft, uint32_t siz
         layer.v_stream.push_back(v);
     }
 
-    ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
+    GGML_ASSERT(strm_bufs.size() == strm);
 
-    LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB (stream %u, %u cells)\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0, strm, size);
+    const size_t n_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+
+    strm_bufs.emplace_back();
+    strm_bufs.back().ctx  = std::move(ctx);
+    strm_bufs.back().buft = buft;
 
     v_heads.push_back(0);
 
@@ -1335,13 +1362,98 @@ int32_t llama_kv_cache::stream_add(ggml_backend_buffer_type_t buft, uint32_t siz
 
     n_stream++;
 
+    // the stream exists from here on, with or without its memory
+    if (alloc) {
+        if (!stream_alloc(strm)) {
+            throw std::runtime_error("failed to allocate buffer for kv cache");
+        }
+    } else {
+        LLAMA_LOG_INFO("%s: %10s KV buffer of %8.2f MiB is not taken yet (stream %u, %u cells)\n", __func__,
+                ggml_backend_buft_name(buft), n_bytes/1024.0/1024.0, strm, size);
+    }
+
     return (int32_t) strm;
+}
+
+bool llama_kv_cache::stream_alloc(uint32_t strm) {
+    if (strm >= n_stream) {
+        return false;
+    }
+    if (stream_has_memory(strm)) {
+        return true;
+    }
+
+    auto & sb = strm_bufs[strm];
+
+    const int64_t t_start_us = ggml_time_us();
+
+    if (ctxs_bufs.no_alloc) {
+        sb.buf = llama_memory_bufs::alloc_buf(sb.ctx.get(), sb.buft, true, "kv cache");
+    } else {
+        sb.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(sb.ctx.get(), sb.buft));
+        if (!sb.buf) {
+            LLAMA_LOG_WARN("%s: %10s does not have the %.2f MiB of stream %u now\n", __func__,
+                    ggml_backend_buft_name(sb.buft), ggml_backend_alloc_ctx_tensors_from_buft_size(sb.ctx.get(), sb.buft)/1024.0/1024.0, strm);
+            return false;
+        }
+
+        // initialize the buffer to avoid NaNs in the padding
+        ggml_backend_buffer_clear(sb.buf.get(), 0);
+    }
+
+    LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB (stream %u, %u cells, taken in %.2f ms)\n", __func__,
+            ggml_backend_buffer_name(sb.buf.get()), ggml_backend_buffer_get_size(sb.buf.get())/1024.0/1024.0, strm, get_size(strm),
+            (ggml_time_us() - t_start_us)/1000.0);
+
+    return true;
+}
+
+bool llama_kv_cache::stream_release(uint32_t strm) {
+    if (strm >= n_stream || !is_stream_added(strm)) {
+        return false;
+    }
+    if (!stream_has_memory(strm)) {
+        return true;
+    }
+
+    // a sequence that takes its cells from the stream keeps the memory, with or without cells
+    for (const uint32_t s : seq_to_stream) {
+        if (s == strm) {
+            return false;
+        }
+    }
+    if (v_cells[strm].get_used() > 0) {
+        return false;
+    }
+
+    auto & sb = strm_bufs[strm];
+
+    const size_t n_bytes = ggml_backend_buffer_get_size(sb.buf.get());
+
+    // the tensors are without data until stream_alloc
+    for (ggml_tensor * t = ggml_get_first_tensor(sb.ctx.get()); t != nullptr; t = ggml_get_next_tensor(sb.ctx.get(), t)) {
+        t->data   = nullptr;
+        t->buffer = nullptr;
+    }
+    sb.buf.reset();
+
+    v_heads[strm] = 0;
+
+    LLAMA_LOG_INFO("%s: %10s KV buffer of %8.2f MiB goes back to the device (stream %u, %u cells)\n", __func__,
+            ggml_backend_buft_name(sb.buft), n_bytes/1024.0/1024.0, strm, get_size(strm));
+
+    return true;
 }
 
 bool llama_kv_cache::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     if (!unified || strm >= n_stream) {
+        return false;
+    }
+
+    // no sequence takes its cells from a stream that is without its memory
+    if (!stream_has_memory(strm)) {
         return false;
     }
 
@@ -2206,6 +2318,9 @@ size_t llama_kv_cache::total_size() const {
     for (const auto & [_, buf] : ctxs_bufs) {
         size += ggml_backend_buffer_get_size(buf.get());
     }
+    for (const auto & sb : strm_bufs) {
+        size += sb.buf ? ggml_backend_buffer_get_size(sb.buf.get()) : 0;
+    }
 
     return size;
 }
@@ -2476,6 +2591,11 @@ const slot_info_vec_t *   sinfos_in) {
         }
 
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
+
+        // a stream that is without its memory holds no cells (a sequence is never assigned to one)
+        if (!stream_has_memory(strm)) {
+            throw std::runtime_error("failed to restore kv cache: the stream is without its memory");
+        }
 
         slot_info sinfo;
 

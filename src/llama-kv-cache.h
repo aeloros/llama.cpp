@@ -151,7 +151,9 @@ public:
 
     // only for a unified cache that does not share its cells
     // the size is padded to a multiple of 256, the stream holds no cells until a sequence is assigned to it
-    int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size) override;
+    int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size, bool alloc) override;
+    bool stream_alloc(uint32_t strm) override;
+    bool stream_release(uint32_t strm) override;
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
 
     // state write/load
@@ -340,6 +342,17 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
 
+    // The tensors of a stream that was added with stream_add, and their buffer. The stream can give the buffer back
+    // to its device while no sequence takes its cells from it (stream_release), and take it again (stream_alloc).
+    struct stream_bufs {
+        ggml_context_ptr           ctx;
+        ggml_backend_buffer_type_t buft = nullptr;
+        ggml_backend_buffer_ptr    buf; // null while the stream is without its memory
+    };
+
+    // [n_stream], the entries of the streams that the cache was created with stay empty
+    std::vector<stream_bufs> strm_bufs;
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
@@ -396,6 +409,9 @@ private:
 
     // true for a stream of a unified cache that was added with stream_add: it has K/V tensors of its own
     bool is_stream_added(uint32_t strm) const;
+
+    // false for an added stream that is without its memory (stream_release)
+    bool stream_has_memory(uint32_t strm) const;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

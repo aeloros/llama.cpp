@@ -283,8 +283,16 @@ const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() c
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
 }
 
-int32_t llama_memory_hybrid::stream_add(ggml_backend_buffer_type_t buft, uint32_t size) {
-    return mem_attn->stream_add(buft, size);
+int32_t llama_memory_hybrid::stream_add(ggml_backend_buffer_type_t buft, uint32_t size, bool alloc) {
+    return mem_attn->stream_add(buft, size, alloc);
+}
+
+bool llama_memory_hybrid::stream_alloc(uint32_t strm) {
+    return mem_attn->stream_alloc(strm);
+}
+
+bool llama_memory_hybrid::stream_release(uint32_t strm) {
+    return mem_attn->stream_release(strm);
 }
 
 bool llama_memory_hybrid::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {

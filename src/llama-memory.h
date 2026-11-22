@@ -151,10 +151,26 @@ struct llama_memory_i {
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     // add a stream of KV cells with its own size and buffer type, returns its id or -1 if not supported
-    virtual int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size) {
+    // alloc: false adds the stream without its memory, see stream_alloc
+    virtual int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size, bool alloc) {
         GGML_UNUSED(buft);
         GGML_UNUSED(size);
+        GGML_UNUSED(alloc);
         return -1;
+    }
+
+    // An added stream can be without its memory: it then holds no cells, and no sequence takes its cells from it.
+    // stream_alloc takes the memory, false if the device does not have it: the stream stays without.
+    // stream_release gives it back, false while a sequence takes its cells from the stream.
+    // Both return true when there is nothing left to do.
+    virtual bool stream_alloc(uint32_t strm) {
+        GGML_UNUSED(strm);
+        return false;
+    }
+
+    virtual bool stream_release(uint32_t strm) {
+        GGML_UNUSED(strm);
+        return false;
     }
 
     // the stream that the new cells of seq_id are taken from, returns false if the sequence still has cells
