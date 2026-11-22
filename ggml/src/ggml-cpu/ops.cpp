@@ -8787,6 +8787,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
 
+    // the partial form (ggml_flash_attn_ext_rows_partial): dst takes the result before the division by the sum, and
+    // the maximum and the sum behind it
+    const bool dst_partial = ggml_flash_attn_ext_is_partial(dst);
+
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
@@ -8800,7 +8804,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne0 == DV + (dst_partial ? 2 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -8819,6 +8823,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
+
+    // the partial form goes to dst and not to the buffer of the split KV path
+    GGML_ASSERT(!dst_partial || !write_partials);
 
     // broadcast factors
     const int64_t rk2 = neq2/nek2;
@@ -8976,6 +8983,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             partial[0] = M;
             partial[1] = S;
             memcpy(partial + 2, VKQ32, DV * sizeof(float));
+        } else if (dst_partial) {
+            // permute(0, 2, 1, 3), as below; a token that sees no row leaves zeros, a maximum of -inf and a sum of 0
+            float * pd = (float *) ((char *) dst->data + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1);
+            memcpy(pd, VKQ32, DV*sizeof(float));
+            pd[DV]     = M;
+            pd[DV + 1] = S;
         } else {
             // V /= S
             const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
@@ -9381,8 +9394,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
+    // the partial form has two more values per head and token, and only the vec path below writes it
+    const bool dst_partial = ggml_flash_attn_ext_is_partial(dst);
 
-    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne0 == DV + (dst_partial ? 2 : 0));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -9413,7 +9428,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && !kv_rows && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !use_ref && !kv_rows && !dst_partial && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9470,7 +9485,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !dst_partial &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -9515,6 +9530,58 @@ void ggml_compute_forward_flash_attn_ext(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_flash_attn_ext_combine
+
+// the finished result of two partial results of ggml_flash_attn_ext_rows_partial, see ggml.h
+void ggml_compute_forward_flash_attn_ext_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(a->nb[0] == sizeof(float) && b->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const int64_t DV = dst->ne[0];
+    GGML_ASSERT(a->ne[0] == DV + 2);
+
+    // one head of one token is a row of a, b and dst alike
+    const int64_t nr = dst->ne[1]*dst->ne[2]*dst->ne[3];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(dst->ne[1]*dst->ne[2]);
+        const int64_t i2 = (ir - i3*dst->ne[1]*dst->ne[2])/dst->ne[1];
+        const int64_t i1 = ir - i3*dst->ne[1]*dst->ne[2] - i2*dst->ne[1];
+
+        const float * pa = (const float *) ((const char *) a->data + i1*a->nb[1] + i2*a->nb[2] + i3*a->nb[3]);
+        const float * pb = (const float *) ((const char *) b->data + i1*b->nb[1] + i2*b->nb[2] + i3*b->nb[3]);
+        float       * pd = (float       *) ((      char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        const float Ma = pa[DV], Sa = pa[DV + 1];
+        const float Mb = pb[DV], Sb = pb[DV + 1];
+
+        // a place that holds nothing for this token has a sum of zero and a maximum of -inf, and takes no part
+        const float M  = fmaxf(Sa != 0.0f ? Ma : -INFINITY, Sb != 0.0f ? Mb : -INFINITY);
+        const float wa = Sa != 0.0f ? expf(Ma - M) : 0.0f;
+        const float wb = Sb != 0.0f ? expf(Mb - M) : 0.0f;
+
+        const float S     = Sa*wa + Sb*wb;
+        const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
+
+        for (int64_t d = 0; d < DV; ++d) {
+            pd[d] = (pa[d]*wa + pb[d]*wb)*S_inv;
+        }
     }
 }
 

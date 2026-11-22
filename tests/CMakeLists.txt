@@ -435,6 +435,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp  LABEL "behavior backend"  LINK ggml)
 endif()
 
+# the partial form of the attention over K/V row lists and its combine, on the CPU backend
+llama_build_and_test(test-flash-attn-partial.cpp  LABEL "behavior backend"  LINK ggml)
+
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)

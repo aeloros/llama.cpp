@@ -396,6 +396,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_COMBINE,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2269,6 +2270,32 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // the partial form of ggml_flash_attn_ext_rows, for K/V rows that are held in more than one place: each place
+    // runs it over its own rows, and ggml_flash_attn_ext_combine makes the finished result of the partial ones
+    // res:     [n_embd_v + 2, n_head, n_batch, ne3] !! permuted !!
+    //          for each head and token: the result before the division by the softmax sum (n_embd_v values), then
+    //          the maximum of the attention scores and the softmax sum relative to that maximum
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_rows_partial(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * kv_rows,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    GGML_API bool ggml_flash_attn_ext_is_partial(
+            const struct ggml_tensor * a);
+
+    // a, b: [n_embd_v + 2, n_head, n_batch, ne3] partial results of the same q over two lists of rows
+    // res:  [n_embd_v,     n_head, n_batch, ne3] what ggml_flash_attn_ext_rows gives over the rows of both lists
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);

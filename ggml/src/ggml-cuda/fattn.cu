@@ -845,5 +845,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    // the partial form (ggml_flash_attn_ext_rows_partial) is not built here yet: the kernels write the finished result
+    if (ggml_flash_attn_ext_is_partial(dst)) {
+        return false;
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

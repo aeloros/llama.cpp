@@ -1080,6 +1080,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FILL",
 
     "FLASH_ATTN_EXT",
+    "FLASH_ATTN_EXT_COMBINE",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1114,7 +1115,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1193,6 +1194,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "fill(x, c)",
 
     "flash_attn_ext(x)",
+    "flash_attn_ext_combine(x,y)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1227,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5412,11 +5414,15 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
         struct ggml_tensor  * v,
         struct ggml_tensor  * mask,
         struct ggml_tensor  * kv_rows,
+        bool                  partial,
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
+
+    // the partial form is for rows that are held in more than one place, which only the row lists can express
+    GGML_ASSERT(!partial || kv_rows);
 
     if (kv_rows) {
         // k and v are shared by all q slices, kv_rows picks the rows of each slice
@@ -5444,11 +5450,13 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     }
 
     // permute(0, 2, 1, 3)
-    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    // a partial result has the maximum and the sum of the softmax behind the values of each head and token
+    int64_t ne[4] = { v->ne[0] + (partial ? 2 : 0), q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 5, partial ? 1 : 0);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5469,7 +5477,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, false, scale, max_bias, logit_softcap);
 }
 
 struct ggml_tensor * ggml_flash_attn_ext_rows(
@@ -5482,7 +5490,46 @@ struct ggml_tensor * ggml_flash_attn_ext_rows(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, false, scale, max_bias, logit_softcap);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_rows_partial(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_rows,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, true, scale, max_bias, logit_softcap);
+}
+
+bool ggml_flash_attn_ext_is_partial(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 5) != 0;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(a->ne[0] > 2);
+
+    int64_t ne[4] = { a->ne[0] - 2, a->ne[1], a->ne[2], a->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_COMBINE;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
 }
 
 
