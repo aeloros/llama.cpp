@@ -1715,6 +1715,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_FIT_HEADROOM").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--kv-overflow-release" }, "SECONDS",
+        string_format(
+            "with --kv-overflow-device and no --kv-overflow-slots: the memory of the second pool is taken from the\n"
+            "device when a task goes there, and it goes back after this many seconds without a task in that pool\n"
+            "(default: %d, 0 = as soon as the last task there ends, -1 = taken at startup and kept).\n"
+            "the prompts that idle slots hold there are saved to the prompt cache first (see --cache-ram)", params.kv_overflow_release),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--kv-overflow-release takes a number of seconds, or -1");
+            }
+            params.kv_overflow_release = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OVERFLOW_RELEASE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         { "--kv-overflow-keep-awake" },
         { "--no-kv-overflow-keep-awake" },
         "keep --kv-overflow-device at full clocks while it is in use (default: enabled).\n"

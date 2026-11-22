@@ -306,3 +306,247 @@ def test_a_conversation_whose_slot_changes_pools_is_not_read_again():
     assert not seen[1]["kv_overflow"]
     assert_not_read_again(results["again"])
     assert results["again"].body["tokens_predicted"] == 300
+
+
+# The second pool has its memory only while it is in use (--kv-overflow-release): it is taken from the device when a
+# task goes there, and it goes back when the pool has been without a task for that many seconds. The server's log
+# says so, and the tests read it there: a request to the server would run a step of its loop, and the memory has to
+# go back without one.
+
+LOG_ON_DEMAND = "the second pool takes its memory from"
+LOG_FROM_THE_START = "the second pool has its memory on"
+LOG_TOOK = "the second pool of KV cells took its memory on"
+LOG_GAVE_BACK = "the second pool of KV cells gave its memory back to"
+LOG_NO_MEMORY = "the second pool of KV cells did not get its memory on"
+
+
+def log_text() -> str:
+    with open(server.log_path) as f:
+        return f.read()
+
+
+def wait_for_log(text: str, n: int, timeout: float = 10.0) -> bool:
+    """Waits until the server's log has the text n times, without a request to the server."""
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        if log_text().count(text) >= n:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def slots():
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    return res.body
+
+
+def test_the_second_pool_takes_no_memory_before_a_task_goes_there(tmp_path):
+    global server
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    log = log_text()
+    assert LOG_ON_DEMAND in log, "the second pool is added without its memory"
+    assert LOG_FROM_THE_START not in log
+
+    # two tasks that both fit at home leave it so
+    older, newer, n_busy_max, seen = run_two(1000, 1000)
+    assert_served(older, 1000)
+    assert_served(newer, 1000)
+    assert not seen[1]["kv_overflow"]
+
+    assert LOG_TOOK not in log_text()
+
+
+def test_the_second_pool_takes_its_memory_when_a_task_goes_there_and_gives_it_back(tmp_path):
+    global server
+    server.kv_overflow_release = 1
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    for n in (1, 2):
+        # the newer task does not fit at home beside the older one: 2 * (prompt + 1800 + 1) > 2560
+        older, newer, n_busy_max, seen = run_two(1800, 1800)
+        assert n_busy_max == 2
+        assert_served(older, 1800)
+        assert_served(newer, 1800)
+        assert seen[1]["kv_overflow"]
+        assert log_text().count(LOG_TOOK) == n
+
+        # nothing is asked of the server from here on: the memory goes back by itself
+        assert wait_for_log(LOG_GAVE_BACK, n), "the second pool kept its memory without a task"
+
+        assert not any(slot["kv_overflow"] for slot in slots()), "a slot is in a pool that is without its memory"
+
+
+def test_the_second_pool_keeps_its_memory_while_a_task_is_at_work_there(tmp_path):
+    # the memory goes back as soon as the last task there ends, and not before
+    global server
+    server.kv_overflow_release = 0
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    for n in (1, 2):
+        older, newer, n_busy_max, seen = run_two(1800, 1800)
+        assert n_busy_max == 2
+        assert_served(older, 1800)
+        assert_served(newer, 1800)
+        assert seen[1]["kv_overflow"]
+
+        assert wait_for_log(LOG_GAVE_BACK, n)
+        assert log_text().count(LOG_TOOK) == n
+        assert log_text().count(LOG_GAVE_BACK) == n, "the memory went back more than once for one use of the pool"
+
+
+def test_a_conversation_in_the_second_pool_comes_back_after_its_memory_went_back(tmp_path):
+    global server
+    server.no_cache_idle_slots = True
+    server.kv_overflow_release = 1
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    # a conversation in slot 0: 500 cells of the home pool, then idle
+    first = turn(PROMPT_OLDER, 480, 0)
+    assert_served(first, 480)
+    held = tokens_of(PROMPT_OLDER) + first.body["tokens"]
+
+    # its next turn, 500 + 300 tokens, does not fit at home beside a task of 1900 that is at work there: it goes to
+    # the second pool, and the slot with it (as in the test above)
+    results = {}
+    seen = {}
+
+    def run_long():
+        results["long"] = complete(PROMPT_NEWER, 1880, 1)
+
+    def run_again():
+        results["again"] = turn(held, 300, 0)
+
+    t_long = threading.Thread(target=run_long)
+    t_long.start()
+    t_end = time.time() + 10
+    while not slots_at_work() and time.time() < t_end:
+        time.sleep(0.002)
+    t_again = threading.Thread(target=run_again)
+    t_again.start()
+    while t_again.is_alive():
+        for slot in slots_at_work():
+            seen[slot["id"]] = slot
+        time.sleep(0.002)
+    t_again.join()
+    t_long.join()
+
+    assert_served(results["long"], 1880)
+    assert seen[0]["kv_overflow"], "the next turn went to the second pool"
+    assert_not_read_again(results["again"])
+    held = held + results["again"].body["tokens"]
+
+    # the conversation is idle in the second pool with its 800 cells. Nothing is asked of the server: its cells are
+    # saved to the prompt cache and the memory of the pool goes back
+    assert wait_for_log(LOG_GAVE_BACK, 1), "the second pool kept its memory for an idle slot"
+    assert not any(slot["kv_overflow"] for slot in slots())
+
+    # the conversation goes on at home, from the prompt cache
+    again = turn(held, 8, 0)
+    assert_not_read_again(again)
+    assert again.body["tokens_predicted"] == 8
+    assert not slots()[0]["kv_overflow"]
+    assert log_text().count(LOG_TOOK) == 1, "the conversation fits at home now"
+
+
+def test_a_task_and_its_child_go_to_the_second_pool_together(tmp_path):
+    # a request for two completions is a task with a child, and the two share the cells of their prompt: they are
+    # fitted as one, 2 * (prompt + 500 + 1) cells, which the first pool does not have beside a task of 1800
+    global server
+    server.kv_overflow_release = 1
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    results = {}
+    seen = {}
+
+    def run_older():
+        results["older"] = complete(PROMPT_OLDER, 1800, 0)
+
+    def run_pair():
+        results["pair"] = server.make_request("POST", "/chat/completions", data={
+            "max_tokens": 500,
+            "n": 2,
+            "messages": [{"role": "user", "content": "What is the best book"}],
+            "id_slot": 1,
+            "ignore_eos": True,
+            "temperature": 0.0,
+            "seed": 42,
+        })
+
+    t_older = threading.Thread(target=run_older)
+    t_older.start()
+    t_end = time.time() + 10
+    while not slots_at_work() and time.time() < t_end:
+        time.sleep(0.002)
+    t_pair = threading.Thread(target=run_pair)
+    t_pair.start()
+    while t_pair.is_alive():
+        for slot in slots_at_work():
+            seen[slot["id"]] = slot
+        time.sleep(0.002)
+    t_pair.join()
+    t_older.join()
+
+    assert_served(results["older"], 1800)
+    pair = results["pair"]
+    assert pair.status_code == 200, f"{pair.status_code} {str(pair.body)[:200]}"
+    assert len(pair.body["choices"]) == 2
+    assert [choice["finish_reason"] for choice in pair.body["choices"]] == ["length", "length"]
+    assert pair.body["usage"]["completion_tokens"] == 1000
+
+    assert not seen[0]["kv_overflow"]
+    assert seen[1]["kv_overflow"] and seen[2]["kv_overflow"], "the task and its child are in the second pool"
+    assert log_text().count(LOG_TOOK) == 1
+
+    assert wait_for_log(LOG_GAVE_BACK, 1), "the second pool kept its memory without a task"
+    assert not any(slot["kv_overflow"] for slot in slots())
+
+
+def test_the_second_pool_keeps_its_memory_from_the_start_with_release_off(tmp_path):
+    # --kv-overflow-release -1: the memory is taken at startup and kept
+    global server
+    server.kv_overflow_release = -1
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    log = log_text()
+    assert LOG_FROM_THE_START in log
+    assert LOG_ON_DEMAND not in log
+
+    older, newer, n_busy_max, seen = run_two(1800, 1800)
+    assert n_busy_max == 2
+    assert_served(older, 1800)
+    assert_served(newer, 1800)
+    assert seen[1]["kv_overflow"]
+
+    time.sleep(2.5)
+    log = log_text()
+    assert LOG_TOOK not in log
+    assert LOG_GAVE_BACK not in log
+
+
+def test_a_task_waits_when_the_device_has_no_memory_for_the_second_pool(tmp_path, monkeypatch):
+    # LLAMA_SERVER_DEBUG_KV_OVERFLOW_NO_MEMORY: the device refuses the memory of the pool, as it does when another
+    # program holds it. The task that would have gone there is fitted without the pool: it waits for the first one
+    global server
+    monkeypatch.setenv("LLAMA_SERVER_DEBUG_KV_OVERFLOW_NO_MEMORY", "1")
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    older, newer, n_busy_max, seen = run_two(1800, 1800)
+
+    assert n_busy_max == 1, "two tasks of 1800 were at work at once in one pool of 2560"
+    assert_served(older, 1800)
+    assert_served(newer, 1800)
+    assert not seen[0]["kv_overflow"]
+    assert not seen[1]["kv_overflow"]
+
+    log = log_text()
+    assert LOG_NO_MEMORY in log
+    assert LOG_TOOK not in log

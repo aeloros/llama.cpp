@@ -1150,6 +1150,19 @@ private:
     int32_t kv_strm_overflow_dft = -1;
     bool    kv_fit               = false;
 
+    // With fitted tasks the second pool has its memory only while it is in use (--kv-overflow-release): it is taken
+    // from the device when a task goes there (kv_overflow_acquire), and it goes back when the pool has been without
+    // a task for that long (kv_overflow_release_idle). No slot is in the second pool while it is without its memory.
+    //   kv_overflow_lazy:   the pool is run that way
+    //   kv_overflow_held:   it has its memory now
+    //   t_kv_overflow_idle: when it was first seen without a task at work, -1 while one is at work there
+    //   kv_overflow_bare:   the device holds nothing of the model, so what the contexts compute with there is for
+    //                       the pool alone and goes back with it
+    bool    kv_overflow_lazy   = false;
+    bool    kv_overflow_held   = false;
+    bool    kv_overflow_bare   = false;
+    int64_t t_kv_overflow_idle = -1;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1608,17 +1621,36 @@ private:
             return false;
         }
 
+        kv_strm_overflow     = -1;
+        kv_strm_overflow_dft = -1;
+        kv_fit               = false;
+        kv_overflow_lazy     = false;
+        kv_overflow_held     = false;
+        kv_overflow_bare     = false;
+        t_kv_overflow_idle   = -1;
+
         if (params_base.kv_overflow_device != nullptr) {
             llama_memory_t mem = llama_get_memory(ctx_tgt);
 
-            const int32_t strm = llama_memory_stream_add(mem, params_base.kv_overflow_device, params_base.kv_overflow_size, true);
+            kv_overflow_bare = true;
+            for (const auto & [buft, data] : llama_get_memory_breakdown(ctx_tgt)) {
+                if (buft == ggml_backend_dev_buffer_type(params_base.kv_overflow_device) && data.model > 0) {
+                    kv_overflow_bare = false;
+                }
+            }
+
+            // with fitted tasks the pool takes its memory when the first task goes there
+            kv_fit           = params_base.kv_overflow_slots.empty();
+            kv_overflow_lazy = kv_fit && params_base.kv_overflow_release >= 0;
+            kv_overflow_held = !kv_overflow_lazy;
+
+            const int32_t strm = llama_memory_stream_add(mem, params_base.kv_overflow_device, params_base.kv_overflow_size, kv_overflow_held);
             if (strm < 0) {
                 SRV_ERR("%s", "--kv-overflow-device: the memory of this model cannot have a second pool of KV cells\n");
                 return false;
             }
 
             kv_strm_overflow = strm;
-            kv_fit           = params_base.kv_overflow_slots.empty();
 
             std::string ids;
             for (const int32_t id : params_base.kv_overflow_slots) {
@@ -1634,6 +1666,13 @@ private:
                 SRV_INF("second pool of %d KV cells on %s: a task goes there when it does not fit in the first pool, "
                         "where its prompt and %d tokens for its output have to be free\n", params_base.kv_overflow_size,
                         ggml_backend_dev_name(params_base.kv_overflow_device), params_base.kv_fit_headroom);
+                if (kv_overflow_lazy) {
+                    SRV_INF("the second pool takes its memory from %s when a task goes there, and gives it back after %d s without a task\n",
+                            ggml_backend_dev_name(params_base.kv_overflow_device), params_base.kv_overflow_release);
+                } else {
+                    SRV_INF("the second pool has its memory on %s from the start and keeps it (--kv-overflow-release -1)\n",
+                            ggml_backend_dev_name(params_base.kv_overflow_device));
+                }
             } else {
                 SRV_INF("second pool of %d KV cells on %s for the slots %s\n", params_base.kv_overflow_size,
                         ggml_backend_dev_name(params_base.kv_overflow_device), ids.c_str());
@@ -1659,7 +1698,7 @@ private:
 
                 // a draft model of its own may have no backend for the device
                 const int32_t strm_dft = llama_get_model(ctx_dft) == model_tgt ?
-                    llama_memory_stream_add(mem_dft, params_base.kv_overflow_device, params_base.kv_overflow_size, true) : -1;
+                    llama_memory_stream_add(mem_dft, params_base.kv_overflow_device, params_base.kv_overflow_size, kv_overflow_held) : -1;
 
                 kv_strm_overflow_dft = strm_dft;
 
@@ -1829,6 +1868,9 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+        });
+        queue_tasks.on_idle([this]() {
+            kv_overflow_release_idle();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -2069,6 +2111,13 @@ private:
         kv_fit_result fit = { true, ret ? ret->kv_overflow : false, 0, 0 };
         if (ret && kv_fit) {
             fit = kv_fit_task(*ret, task);
+
+            // the second pool takes its memory when a task goes there. When the device does not have it now, the
+            // task is fitted without that pool
+            if (fit.ok && fit.overflow && !kv_overflow_acquire()) {
+                fit = kv_fit_task(*ret, task, true, 0);
+            }
+
             if (!fit.ok) {
                 SLT_DBG(*ret, "the task's size (%d) fits in neither pool beside the tasks at work, id_task = %d\n", n_ctx_task_of(*ret, task), task.id);
                 return nullptr;
@@ -2175,7 +2224,9 @@ private:
     // home always, and their whole limit is kept for them there whether they are at work or not.
     // The cached prompts of idle slots do not count: when a task needs their cells, the idle slots give them up, the
     // least recently used first, saved to the prompt cache (kv_fit_make_room).
-    // with_children (kv_fit_task): the children of the task are still to start, and their sizes are counted with its own
+    // with_children (kv_fit_task): the children of the task are still to start, and their sizes are counted with its own.
+    //   Without them the task is being launched: it is in its pool already and gets the room that is there.
+    // pool (kv_fit_task): -1, or the only pool that the task may go to, 0 the first and 1 the second
 
     // the cells of the first pool that no limit of another task or slot covers
     int64_t kv_fit_free_home(const server_slot & slot) const {
@@ -2248,7 +2299,7 @@ private:
         return true;
     }
 
-    kv_fit_result kv_fit_task(const server_slot & slot, const server_task & task, bool with_children = true) const {
+    kv_fit_result kv_fit_task(const server_slot & slot, const server_task & task, bool with_children = true, int pool = -1) const {
         int64_t size = n_ctx_task_of(slot, task);
 
         if (is_batch_priority_slot(slot.id)) {
@@ -2286,19 +2337,127 @@ private:
         const int64_t n_own  = n_ctx_task_of(slot, task);
         const int64_t n_need = std::min<int64_t>(size, (int64_t) task.n_tokens() + params_base.kv_fit_headroom + 1 + (size - n_own));
 
-        if (n_need <= n_free_home) {
+        if (pool != 1 && n_need <= n_free_home) {
             return { true, false, (int32_t) (n_need - (size - n_own)), n_need };
         }
-        if (size <= n_free_over) {
+        if (pool != 0 && size <= n_free_over) {
             return { true, true, (int32_t) n_own, size };
         }
-        if (!any_other) {
-            const bool    overflow = n_free_over > n_free_home;
+        if (!any_other || !with_children) {
+            const bool    overflow = pool >= 0 ? pool == 1 : n_free_over > n_free_home;
             const int64_t n_free   = overflow ? n_free_over : n_free_home;
             return { true, overflow, (int32_t) std::max<int64_t>(1, std::min<int64_t>(n_own, n_free - (size - n_own))), std::min<int64_t>(size, n_free) };
         }
 
         return { false, false, 0, 0 };
+    }
+
+    // The second pool takes its memory from the device, in the target context and in the draft context.
+    // Returns false when the device does not have it now: the pool stays without, and so without tasks.
+    bool kv_overflow_acquire() {
+        if (kv_overflow_held) {
+            t_kv_overflow_idle = -1; // a task is about to start there
+            return true;
+        }
+
+        const int64_t t_start = ggml_time_us();
+
+        llama_memory_t mem     = llama_get_memory(ctx_tgt);
+        llama_memory_t mem_dft = ctx_dft != nullptr ? llama_get_memory(ctx_dft) : nullptr;
+
+        // LLAMA_SERVER_DEBUG_KV_OVERFLOW_NO_MEMORY, for the tests: the device refuses, as when another program holds its memory
+        static const bool debug_no_memory = !common_get_env("LLAMA_SERVER_DEBUG_KV_OVERFLOW_NO_MEMORY").empty();
+
+        bool ok = !debug_no_memory && llama_memory_stream_alloc(mem, kv_strm_overflow);
+        if (ok && mem_dft != nullptr && !llama_memory_stream_alloc(mem_dft, kv_strm_overflow_dft)) {
+            llama_memory_stream_release(mem, kv_strm_overflow);
+            ok = false;
+        }
+        if (!ok) {
+            SRV_WRN("the second pool of KV cells did not get its memory on %s: tasks are fitted without it for now\n",
+                    ggml_backend_dev_name(params_base.kv_overflow_device));
+            return false;
+        }
+
+        kv_overflow_held   = true;
+        t_kv_overflow_idle = -1;
+
+        SRV_INF("the second pool of KV cells took its memory on %s (%.2f ms)\n",
+                ggml_backend_dev_name(params_base.kv_overflow_device), (ggml_time_us() - t_start) / 1000.0);
+
+        return true;
+    }
+
+    // The second pool gives its memory back to the device when it has been without a task at work for
+    // --kv-overflow-release seconds. The idle slots there save their prompts to the prompt cache and move to the
+    // first pool: their conversations come back from the cache when they go on, into the pool that has the room
+    // then. What the contexts computed with on the device goes back as well.
+    // Called at every step, and about once a second while nothing is at work.
+    void kv_overflow_release_idle() {
+        if (!kv_overflow_lazy || !kv_overflow_held || ctx_tgt == nullptr) {
+            return;
+        }
+
+        for (const auto & slot : slots) {
+            if (slot.kv_overflow && slot.is_processing()) {
+                t_kv_overflow_idle = -1;
+                return;
+            }
+        }
+
+        const int64_t t_now = ggml_time_us();
+        if (t_kv_overflow_idle < 0) {
+            t_kv_overflow_idle = t_now;
+        }
+        if (t_now - t_kv_overflow_idle < (int64_t) params_base.kv_overflow_release * 1000000) {
+            return;
+        }
+
+        int32_t n_cells = 0;
+        int32_t n_saved = 0;
+        for (auto & slot : slots) {
+            if (!slot.kv_overflow) {
+                continue;
+            }
+
+            if (slot.prompt.n_tokens() > 0) {
+                const bool saved = prompt_cache && slot.prompt_save(*prompt_cache);
+                if (saved) {
+                    prompt_cache->update();
+                }
+
+                SLT_INF(slot, "the idle slot gives up its %d KV cells of the second pool, whose memory goes back, %s\n", slot.prompt.n_tokens(),
+                        saved ? "saved to the prompt cache" : "not saved: no prompt cache, or it has the prompt already");
+
+                n_cells += slot.prompt.n_tokens();
+                n_saved += saved ? slot.prompt.n_tokens() : 0;
+            }
+
+            kv_set_overflow(slot, false);
+        }
+
+        bool ok = llama_memory_stream_release(llama_get_memory(ctx_tgt), kv_strm_overflow);
+        if (ctx_dft != nullptr) {
+            ok = llama_memory_stream_release(llama_get_memory(ctx_dft), kv_strm_overflow_dft) && ok;
+        }
+        GGML_ASSERT(ok && "the second pool of KV cells is without sequences and gives its memory back");
+
+        // on a device that holds weights too, the compute memory serves the model and stays
+        size_t n_compute = 0;
+        if (kv_overflow_bare) {
+            n_compute += llama_context_release_compute(ctx_tgt, params_base.kv_overflow_device);
+            if (ctx_dft != nullptr) {
+                n_compute += llama_context_release_compute(ctx_dft, params_base.kv_overflow_device);
+            }
+        }
+
+        SRV_INF("the second pool of KV cells gave its memory back to %s after %.1f s without a task: %d KV cells of idle slots given up, "
+                "%d of them saved to the prompt cache, %.2f MiB of compute buffers freed (%.2f ms)\n",
+                ggml_backend_dev_name(params_base.kv_overflow_device), (t_now - t_kv_overflow_idle) / 1e6, n_cells, n_saved,
+                n_compute / 1024.0 / 1024.0, (ggml_time_us() - t_now) / 1000.0);
+
+        kv_overflow_held   = false;
+        t_kv_overflow_idle = -1;
     }
 
     // moves a slot to the other pool. The cells do not move (not built): what the slot holds is given up
@@ -2701,7 +2860,7 @@ private:
 
         // fitted to a pool in get_available_slot(): nothing has started since but the task's own children, which are
         // at work by now and counted as such
-        slot.n_ctx_task = kv_fit ? kv_fit_task(slot, *slot.task, false).limit : n_ctx_task_of(slot, *slot.task);
+        slot.n_ctx_task = kv_fit ? kv_fit_task(slot, *slot.task, false, slot.kv_overflow ? 1 : 0).limit : n_ctx_task_of(slot, *slot.task);
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -4180,6 +4339,9 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // a second pool that has been without a task for long enough gives its memory back
+        kv_overflow_release_idle();
 
         // check if all slots are idle
         // a realtime slot waiting for audio has no work, the next audio control task wakes the loop
