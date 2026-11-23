@@ -69,6 +69,32 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
+    //
+    // Lazy buffers
+    //
+    // A lazy buffer reserves its address range when it is allocated and holds no memory. A commit takes the memory of
+    // a range and a decommit gives it back, in the unit of the buffer type. Tensors can be placed anywhere in the
+    // buffer and keep their addresses, but only memory that is taken may be read or written: anything else is an
+    // error that the backend may not survive.
+
+    // the unit in which a lazy buffer of this type takes its memory, 0 if the type cannot make lazy buffers
+    GGML_API size_t                ggml_backend_buft_lazy_granularity (ggml_backend_buffer_type_t buft);
+    // NULL if the type cannot make lazy buffers or the address range cannot be had; the size is rounded up to the unit
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_lazy(ggml_backend_buffer_type_t buft, size_t size);
+
+    GGML_API bool   ggml_backend_buffer_is_lazy    (ggml_backend_buffer_t buffer);
+    // Take the memory of every unit that [offset, offset + size) touches. What is taken anew is zero. Returns false
+    // if the memory cannot be had or the range is not within the buffer: nothing more is taken then than before.
+    // A buffer that is not lazy has its memory: true.
+    GGML_API bool   ggml_backend_buffer_commit     (ggml_backend_buffer_t buffer, size_t offset, size_t size);
+    // Give back every unit that lies whole within [offset, offset + size). The backend finishes its pending work on
+    // the device first, so nothing that is under way loses its memory.
+    GGML_API void   ggml_backend_buffer_decommit   (ggml_backend_buffer_t buffer, size_t offset, size_t size);
+    // the bytes taken; the size of a buffer that is not lazy
+    GGML_API size_t ggml_backend_buffer_committed  (ggml_backend_buffer_t buffer);
+    // the bytes that a commit of the range would take on top of what is taken
+    GGML_API size_t ggml_backend_buffer_commit_size(ggml_backend_buffer_t buffer, size_t offset, size_t size);
+
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy  (const struct ggml_tensor * src, struct ggml_tensor * dst);
     GGML_API void ggml_backend_tensor_copy_n(const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);

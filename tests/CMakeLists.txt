@@ -437,6 +437,7 @@ endif()
 
 # the partial form of the attention over K/V row lists and its combine, on the CPU backend
 llama_build_and_test(test-flash-attn-partial.cpp  LABEL "behavior backend"  LINK ggml)
+llama_build_and_test(test-lazy-buffer.cpp  LABEL "behavior backend"  LINK ggml)
 
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)

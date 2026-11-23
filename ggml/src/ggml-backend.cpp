@@ -28,6 +28,11 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 
 // backend buffer type
 
@@ -306,6 +311,72 @@ void ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     }
 
     buffer->iface.clear(buffer, value);
+}
+
+// lazy buffers
+
+size_t ggml_backend_buft_lazy_granularity(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft);
+    if (buft->iface.get_lazy_granularity == NULL || buft->iface.alloc_buffer_lazy == NULL) {
+        return 0;
+    }
+    return buft->iface.get_lazy_granularity(buft);
+}
+
+ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_lazy(ggml_backend_buffer_type_t buft, size_t size) {
+    if (size == 0 || ggml_backend_buft_lazy_granularity(buft) == 0) {
+        return NULL;
+    }
+    ggml_backend_buffer_t buffer = buft->iface.alloc_buffer_lazy(buft, size);
+    GGML_ASSERT(buffer == NULL || ggml_backend_buffer_is_lazy(buffer));
+    return buffer;
+}
+
+bool ggml_backend_buffer_is_lazy(ggml_backend_buffer_t buffer) {
+    GGML_ASSERT(buffer);
+    return buffer->iface.commit != NULL;
+}
+
+bool ggml_backend_buffer_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    GGML_ASSERT(buffer);
+    if (!ggml_backend_buffer_is_lazy(buffer)) {
+        return true;
+    }
+    if (size == 0) {
+        return true;
+    }
+    if (offset > buffer->size || size > buffer->size - offset) {
+        return false;
+    }
+    return buffer->iface.commit(buffer, offset, size);
+}
+
+void ggml_backend_buffer_decommit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    GGML_ASSERT(buffer);
+    if (!ggml_backend_buffer_is_lazy(buffer) || offset >= buffer->size) {
+        return;
+    }
+    size = std::min(size, buffer->size - offset);
+    if (size == 0) {
+        return;
+    }
+    buffer->iface.decommit(buffer, offset, size);
+}
+
+size_t ggml_backend_buffer_committed(ggml_backend_buffer_t buffer) {
+    GGML_ASSERT(buffer);
+    if (!ggml_backend_buffer_is_lazy(buffer)) {
+        return buffer->size;
+    }
+    return buffer->iface.get_committed(buffer);
+}
+
+size_t ggml_backend_buffer_commit_size(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    GGML_ASSERT(buffer);
+    if (!ggml_backend_buffer_is_lazy(buffer) || size == 0 || offset > buffer->size || size > buffer->size - offset) {
+        return 0;
+    }
+    return buffer->iface.get_commit_size(buffer, offset, size);
 }
 
 size_t ggml_backend_buffer_get_alignment(ggml_backend_buffer_t buffer) {
@@ -2926,6 +2997,160 @@ static const struct ggml_backend_buffer_i ggml_backend_cpu_buffer_from_ptr_i = {
     /* .cpy_tensor_n    = */ NULL,
 };
 
+// CPU backend - lazy buffer
+//
+// The address range is reserved with the operating system, and its pages are committed and decommitted. A page that
+// is not committed faults when it is touched, which is what makes a stray access of a caller show in its tests.
+
+struct ggml_backend_cpu_lazy_buffer_context {
+    char * base = nullptr; // the reserved range
+    size_t size = 0;       // a multiple of the unit, the page size
+    ggml_lazy_units units;
+};
+
+static size_t ggml_backend_cpu_lazy_unit() {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (size_t) si.dwPageSize;
+#else
+    return (size_t) sysconf(_SC_PAGESIZE);
+#endif
+}
+
+static char * ggml_backend_cpu_lazy_reserve(size_t size) {
+#ifdef _WIN32
+    return (char *) VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
+#else
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+    void * ptr = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    return ptr == MAP_FAILED ? NULL : (char *) ptr;
+#endif
+}
+
+static void ggml_backend_cpu_lazy_release(char * base, size_t size) {
+#ifdef _WIN32
+    VirtualFree(base, 0, MEM_RELEASE);
+    GGML_UNUSED(size);
+#else
+    munmap(base, size);
+#endif
+}
+
+static bool ggml_backend_cpu_lazy_os_commit(char * ptr, size_t size) {
+#ifdef _WIN32
+    return VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
+#else
+    return mprotect(ptr, size, PROT_READ | PROT_WRITE) == 0;
+#endif
+}
+
+static void ggml_backend_cpu_lazy_os_decommit(char * ptr, size_t size) {
+#ifdef _WIN32
+    VirtualFree(ptr, size, MEM_DECOMMIT);
+#else
+    madvise(ptr, size, MADV_DONTNEED);
+    mprotect(ptr, size, PROT_NONE);
+#endif
+}
+
+static void ggml_backend_cpu_lazy_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_cpu_lazy_buffer_context * ctx = (ggml_backend_cpu_lazy_buffer_context *) buffer->context;
+    ggml_backend_cpu_lazy_release(ctx->base, ctx->size);
+    delete ctx;
+}
+
+static void * ggml_backend_cpu_lazy_buffer_get_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_cpu_lazy_buffer_context * ctx = (ggml_backend_cpu_lazy_buffer_context *) buffer->context;
+    return ctx->base;
+}
+
+static void ggml_backend_cpu_lazy_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    ggml_backend_cpu_lazy_buffer_context * ctx = (ggml_backend_cpu_lazy_buffer_context *) buffer->context;
+    const size_t unit = ctx->units.unit;
+    size_t r0 = 0;
+    size_t r1 = 0;
+    while (ctx->units.next_run(r1, ctx->units.taken.size(), true, r0, r1)) {
+        memset(ctx->base + r0*unit, value, (r1 - r0)*unit);
+    }
+}
+
+static bool ggml_backend_cpu_lazy_buffer_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_backend_cpu_lazy_buffer_context * ctx = (ggml_backend_cpu_lazy_buffer_context *) buffer->context;
+    const size_t unit = ctx->units.unit;
+    size_t u0 = 0;
+    size_t u1 = 0;
+    ctx->units.touched(offset, size, u0, u1);
+
+    std::vector<std::pair<size_t, size_t>> runs; // taken by this call
+    size_t r0 = 0;
+    size_t r1 = u0;
+    while (ctx->units.next_run(r1, u1, false, r0, r1)) {
+        if (!ggml_backend_cpu_lazy_os_commit(ctx->base + r0*unit, (r1 - r0)*unit)) {
+            GGML_LOG_ERROR("%s: failed to commit %zu bytes of host memory\n", __func__, (r1 - r0)*unit);
+            for (const auto & run : runs) {
+                ggml_backend_cpu_lazy_os_decommit(ctx->base + run.first*unit, (run.second - run.first)*unit);
+                ctx->units.set(run.first, run.second, false);
+            }
+            return false;
+        }
+        ctx->units.set(r0, r1, true);
+        runs.emplace_back(r0, r1);
+    }
+    return true;
+}
+
+static void ggml_backend_cpu_lazy_buffer_decommit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_backend_cpu_lazy_buffer_context * ctx = (ggml_backend_cpu_lazy_buffer_context *) buffer->context;
+    const size_t unit = ctx->units.unit;
+    size_t u0 = 0;
+    size_t u1 = 0;
+    ctx->units.within(offset, size, u0, u1);
+
+    size_t r0 = 0;
+    size_t r1 = u0;
+    while (ctx->units.next_run(r1, u1, true, r0, r1)) {
+        ggml_backend_cpu_lazy_os_decommit(ctx->base + r0*unit, (r1 - r0)*unit);
+        ctx->units.set(r0, r1, false);
+    }
+}
+
+static size_t ggml_backend_cpu_lazy_buffer_get_committed(ggml_backend_buffer_t buffer) {
+    ggml_backend_cpu_lazy_buffer_context * ctx = (ggml_backend_cpu_lazy_buffer_context *) buffer->context;
+    return ctx->units.n_taken*ctx->units.unit;
+}
+
+static size_t ggml_backend_cpu_lazy_buffer_get_commit_size(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_backend_cpu_lazy_buffer_context * ctx = (ggml_backend_cpu_lazy_buffer_context *) buffer->context;
+    size_t u0 = 0;
+    size_t u1 = 0;
+    ctx->units.touched(offset, size, u0, u1);
+    return ctx->units.count(u0, u1, false)*ctx->units.unit;
+}
+
+static const struct ggml_backend_buffer_i ggml_backend_cpu_lazy_buffer_i = {
+    /* .free_buffer     = */ ggml_backend_cpu_lazy_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cpu_lazy_buffer_get_base,
+    /* .init_tensor     = */ NULL, // no initialization required
+    /* .memset_tensor   = */ ggml_backend_cpu_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cpu_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cpu_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ ggml_backend_cpu_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cpu_lazy_buffer_clear,
+    /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
+    /* .commit          = */ ggml_backend_cpu_lazy_buffer_commit,
+    /* .decommit        = */ ggml_backend_cpu_lazy_buffer_decommit,
+    /* .get_committed   = */ ggml_backend_cpu_lazy_buffer_get_committed,
+    /* .get_commit_size = */ ggml_backend_cpu_lazy_buffer_get_commit_size,
+};
+
 // CPU backend buffer type
 
 // this buffer type is defined here to make it available to all backends
@@ -2959,17 +3184,44 @@ static bool ggml_backend_cpu_buffer_type_is_host(ggml_backend_buffer_type_t buft
     GGML_UNUSED(buft);
 }
 
+static size_t ggml_backend_cpu_buffer_type_get_lazy_granularity(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_cpu_lazy_unit();
+
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer_lazy(ggml_backend_buffer_type_t buft, size_t size) {
+    const size_t unit = ggml_backend_cpu_lazy_unit();
+
+    size = (size + unit - 1)/unit*unit;
+
+    char * base = ggml_backend_cpu_lazy_reserve(size);
+    if (base == NULL) {
+        GGML_LOG_ERROR("%s: failed to reserve an address range of %zu bytes\n", __func__, size);
+        return NULL;
+    }
+
+    ggml_backend_cpu_lazy_buffer_context * ctx = new ggml_backend_cpu_lazy_buffer_context;
+    ctx->base = base;
+    ctx->size = size;
+    ctx->units.init(unit, size);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cpu_lazy_buffer_i, ctx, size);
+}
+
 ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
     static struct ggml_backend_buffer_type ggml_backend_cpu_buffer_type = {
         /* .iface   = */ {
-            /* .get_name            = */ ggml_backend_cpu_buffer_type_get_name,
-            /* .alloc_buffer        = */ ggml_backend_cpu_buffer_type_alloc_buffer,
-            /* .alloc_buffer_n      = */ NULL,
-            /* .get_alignment       = */ ggml_backend_cpu_buffer_type_get_alignment,
-            /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
-            /* .get_alloc_size_n    = */ NULL,
-            /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .get_name             = */ ggml_backend_cpu_buffer_type_get_name,
+            /* .alloc_buffer         = */ ggml_backend_cpu_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n       = */ NULL,
+            /* .get_alignment        = */ ggml_backend_cpu_buffer_type_get_alignment,
+            /* .get_max_size         = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size       = */ NULL, // defaults to ggml_nbytes
+            /* .get_alloc_size_n     = */ NULL,
+            /* .is_host              = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .get_lazy_granularity = */ ggml_backend_cpu_buffer_type_get_lazy_granularity,
+            /* .alloc_buffer_lazy    = */ ggml_backend_cpu_buffer_type_alloc_buffer_lazy,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,

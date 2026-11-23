@@ -30,6 +30,10 @@ extern "C" {
         size_t                (*get_alloc_size_n)(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)         (ggml_backend_buffer_type_t buft);
+        // (optional) lazy buffers (ggml_backend_buft_alloc_buffer_lazy): the unit in which their memory is taken, 0 if
+        // this buffer type cannot make one, and the allocation, which reserves the address range and takes no memory
+        size_t                (*get_lazy_granularity)(ggml_backend_buffer_type_t buft);
+        ggml_backend_buffer_t (*alloc_buffer_lazy)   (ggml_backend_buffer_type_t buft, size_t size);
     };
 
     struct ggml_backend_buffer_type {
@@ -76,6 +80,16 @@ extern "C" {
         void         (*get_tensor_n) (ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors,       void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors);
         // (optional) batched tensor copies: returns true if all copies were performed, false if unsupported and no copies were performed
         bool         (*cpy_tensor_n) (ggml_backend_buffer_t buffer, const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);
+        // (optional) a lazy buffer has all four, and its `clear` covers the memory that is taken:
+        //   commit:          take the memory of every unit that the range touches; false if it cannot be had, and then
+        //                    nothing more is taken than before
+        //   decommit:        give back every unit that lies whole within the range, after the pending work of the backend
+        //   get_committed:   the bytes taken
+        //   get_commit_size: the bytes that a commit of the range would take on top
+        bool         (*commit)         (ggml_backend_buffer_t buffer, size_t offset, size_t size);
+        void         (*decommit)       (ggml_backend_buffer_t buffer, size_t offset, size_t size);
+        size_t       (*get_committed)  (ggml_backend_buffer_t buffer);
+        size_t       (*get_commit_size)(ggml_backend_buffer_t buffer, size_t offset, size_t size);
     };
 
     struct ggml_backend_buffer {
@@ -297,4 +311,77 @@ extern "C" {
 
 #ifdef  __cplusplus
 }
+#endif
+
+#ifdef  __cplusplus
+
+#include <algorithm>
+#include <vector>
+
+// Which units of a lazy buffer are taken (ggml_backend_buft_alloc_buffer_lazy). A backend's lazy buffer keeps one
+// and maps or unmaps the runs of units that it names.
+struct ggml_lazy_units {
+    size_t unit    = 0; // bytes
+    size_t n_taken = 0; // units
+    std::vector<bool> taken;
+
+    void init(size_t unit_bytes, size_t size) {
+        unit    = unit_bytes;
+        n_taken = 0;
+        taken.assign(size/unit_bytes, false);
+    }
+
+    // the units that [offset, offset + size) touches: [u0, u1)
+    void touched(size_t offset, size_t size, size_t & u0, size_t & u1) const {
+        u0 = offset/unit;
+        u1 = std::min(taken.size(), (offset + size + unit - 1)/unit);
+    }
+
+    // the units that lie whole within [offset, offset + size): [u0, u1)
+    void within(size_t offset, size_t size, size_t & u0, size_t & u1) const {
+        u0 = (offset + unit - 1)/unit;
+        u1 = std::min(taken.size(), (offset + size)/unit);
+        if (u1 < u0) {
+            u1 = u0;
+        }
+    }
+
+    // the next run of units in [u, u1) that are taken (value) or not: [r0, r1), false if there is none
+    bool next_run(size_t u, size_t u1, bool value, size_t & r0, size_t & r1) const {
+        while (u < u1 && taken[u] != value) {
+            u++;
+        }
+        if (u >= u1) {
+            return false;
+        }
+        r0 = u;
+        while (u < u1 && taken[u] == value) {
+            u++;
+        }
+        r1 = u;
+        return true;
+    }
+
+    size_t count(size_t u0, size_t u1, bool value) const {
+        size_t n = 0;
+        for (size_t u = u0; u < u1; u++) {
+            n += taken[u] == value;
+        }
+        return n;
+    }
+
+    void set(size_t r0, size_t r1, bool value) {
+        for (size_t u = r0; u < r1; u++) {
+            if (taken[u] != value) {
+                taken[u] = value;
+                if (value) {
+                    n_taken++;
+                } else {
+                    n_taken--;
+                }
+            }
+        }
+    }
+};
+
 #endif

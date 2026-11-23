@@ -948,14 +948,52 @@ struct ggml_backend_cuda_buffer_context {
     void * dev_ptr = nullptr;
     std::string name;
 
+    // A lazy buffer (ggml_backend_buft_alloc_buffer_lazy): dev_ptr is a reserved address range of lazy_size bytes that
+    // holds no memory, and every unit that is taken is a mapping of its own, so that any of them can go back.
+    bool   lazy      = false;
+    size_t lazy_size = 0;
+    ggml_lazy_units units;
+
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_VMM)
+        if (lazy) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unmap(0, units.taken.size());
+            CU_CHECK(cuMemAddressFree((CUdeviceptr) (uintptr_t) dev_ptr, lazy_size));
+            return;
+        }
+#endif // defined(GGML_USE_VMM)
         CUDA_CHECK(cudaFree(dev_ptr));
     }
+
+#if defined(GGML_USE_VMM)
+    CUdeviceptr unit_ptr(size_t u) const {
+        return (CUdeviceptr) (uintptr_t) dev_ptr + u*units.unit;
+    }
+
+    // unmap the units of [u0, u1) that are taken; the caller has synchronized the device
+    void unmap(size_t u0, size_t u1) {
+        size_t r0 = 0;
+        size_t r1 = u0;
+        while (units.next_run(r1, u1, true, r0, r1)) {
+#if defined(GGML_USE_HIP)
+            // one call per mapping, see the workaround in ggml_cuda_pool_vmm
+            for (size_t u = r0; u < r1; u++) {
+                CU_CHECK(cuMemUnmap(unit_ptr(u), units.unit));
+            }
+#else
+            CU_CHECK(cuMemUnmap(unit_ptr(r0), (r1 - r0)*units.unit));
+#endif
+            units.set(r0, r1, false);
+        }
+    }
+#endif // defined(GGML_USE_VMM)
 };
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -977,6 +1015,11 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);
+        return GGML_STATUS_SUCCESS;
+    }
+
+    if (ctx->lazy) {
+        // the tensor has no memory yet, and what is taken later is zero (ggml_backend_cuda_buffer_commit)
         return GGML_STATUS_SUCCESS;
     }
 
@@ -1160,9 +1203,167 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    if (ctx->lazy) {
+        // what is taken, and nothing else
+        size_t r0 = 0;
+        size_t r1 = 0;
+        while (ctx->units.next_run(r1, ctx->units.taken.size(), true, r0, r1)) {
+            CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + r0*ctx->units.unit, value, (r1 - r0)*ctx->units.unit, cudaStreamPerThread));
+        }
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
+
+#if defined(GGML_USE_VMM)
+// lazy buffer: memory of the device is mapped into a reserved address range, one unit at a time
+
+// map one unit of memory of the device at ptr, false if the device does not have it
+static bool ggml_cuda_lazy_map_unit(int device, CUdeviceptr ptr, size_t size) {
+    const int physical_device = ggml_cuda_get_physical_device(device);
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = physical_device;
+
+    CUmemGenericAllocationHandle handle;
+    if (cuMemCreate(&handle, size, &prop, 0) != CUDA_SUCCESS) {
+        return false;
+    }
+
+    const CUresult err = cuMemMap(ptr, size, 0, handle, 0);
+
+    // the handle is not needed once the memory is mapped, and without a mapping its memory goes back
+    CU_CHECK(cuMemRelease(handle));
+
+    if (err != CUDA_SUCCESS) {
+        return false;
+    }
+
+    // as for the pool (ggml_cuda_pool_vmm): the devices that may reach this memory have to be named
+    std::vector<CUmemAccessDesc> access_descs;
+
+    bool use_peer_access = ggml_cuda_p2p_enabled();
+#if defined(GGML_USE_NCCL)
+    use_peer_access = true;
+#endif // defined(GGML_USE_NCCL)
+
+    if (use_peer_access) {
+        bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+        const int device_count = ggml_cuda_info().device_count;
+        for (int id = 0; id < device_count; ++id) {
+            const int id_physical = ggml_cuda_get_physical_device(id);
+            if (id_physical != physical_device) {
+                int can_access_peer = 0;
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
+                if (!can_access_peer) {
+                    continue;
+                }
+            }
+            if (physical_seen[id_physical]) {
+                continue;
+            }
+            physical_seen[id_physical] = true;
+            CUmemAccessDesc access = {};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = id_physical;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            access_descs.push_back(access);
+        }
+    } else {
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = physical_device;
+        access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access_descs.push_back(access);
+    }
+    CU_CHECK(cuMemSetAccess(ptr, size, access_descs.data(), access_descs.size()));
+
+    return true;
+}
+
+static bool ggml_backend_cuda_buffer_commit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+
+    const size_t unit = ctx->units.unit;
+
+    size_t u0 = 0;
+    size_t u1 = 0;
+    ctx->units.touched(offset, size, u0, u1);
+
+    if (ctx->units.count(u0, u1, false) == 0) {
+        return true;
+    }
+
+    ggml_cuda_set_device(ctx->device);
+
+    std::vector<size_t> mapped; // by this call
+    for (size_t u = u0; u < u1; u++) {
+        if (ctx->units.taken[u]) {
+            continue;
+        }
+        if (!ggml_cuda_lazy_map_unit(ctx->device, ctx->unit_ptr(u), unit)) {
+            // the device does not have the memory: what this call took goes back
+            for (const size_t m : mapped) {
+                CU_CHECK(cuMemUnmap(ctx->unit_ptr(m), unit));
+                ctx->units.set(m, m + 1, false);
+            }
+            return false;
+        }
+        ctx->units.set(u, u + 1, true);
+        mapped.push_back(u);
+    }
+
+    // what is taken anew is zero, as a buffer is after it was cleared
+    for (size_t i = 0; i < mapped.size(); ) {
+        size_t j = i + 1;
+        while (j < mapped.size() && mapped[j] == mapped[j - 1] + 1) {
+            j++;
+        }
+        CUDA_CHECK(cudaMemsetAsync((void *) (uintptr_t) ctx->unit_ptr(mapped[i]), 0, (j - i)*unit, cudaStreamPerThread));
+        i = j;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+
+    return true;
+}
+
+static void ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+
+    size_t u0 = 0;
+    size_t u1 = 0;
+    ctx->units.within(offset, size, u0, u1);
+
+    if (ctx->units.count(u0, u1, true) == 0) {
+        return;
+    }
+
+    // Nothing that is under way on the device may lose its memory: an unmap does not wait for it, and work that
+    // touches memory which is gone costs the process its CUDA context.
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    ctx->unmap(u0, u1);
+}
+
+static size_t ggml_backend_cuda_buffer_get_committed(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    return ctx->units.n_taken*ctx->units.unit;
+}
+
+static size_t ggml_backend_cuda_buffer_get_commit_size(ggml_backend_buffer_t buffer, size_t offset, size_t size) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+
+    size_t u0 = 0;
+    size_t u1 = 0;
+    ctx->units.touched(offset, size, u0, u1);
+
+    return ctx->units.count(u0, u1, false)*ctx->units.unit;
+}
+#endif // defined(GGML_USE_VMM)
 
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_cuda_buffer_free_buffer,
@@ -1180,6 +1381,30 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .get_tensor_n    = */ ggml_backend_cuda_buffer_get_tensor_n,
     /* .cpy_tensor_n    = */ ggml_backend_cuda_buffer_cpy_tensor_n,
 };
+
+#if defined(GGML_USE_VMM)
+// the same buffer, with its memory taken by commit (free_buffer is shared: ggml_backend_buffer_is_cuda)
+static const ggml_backend_buffer_i ggml_backend_cuda_lazy_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cuda_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_cuda_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_buffer_get_tensor,
+    /* .set_tensor_2d   = */ ggml_backend_cuda_buffer_set_tensor_2d,
+    /* .get_tensor_2d   = */ ggml_backend_cuda_buffer_get_tensor_2d,
+    /* .cpy_tensor      = */ ggml_backend_cuda_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cuda_buffer_clear,
+    /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ ggml_backend_cuda_buffer_set_tensor_n,
+    /* .get_tensor_n    = */ ggml_backend_cuda_buffer_get_tensor_n,
+    /* .cpy_tensor_n    = */ ggml_backend_cuda_buffer_cpy_tensor_n,
+    /* .commit          = */ ggml_backend_cuda_buffer_commit,
+    /* .decommit        = */ ggml_backend_cuda_buffer_decommit,
+    /* .get_committed   = */ ggml_backend_cuda_buffer_get_committed,
+    /* .get_commit_size = */ ggml_backend_cuda_buffer_get_commit_size,
+};
+#endif // defined(GGML_USE_VMM)
 
 // cuda buffer type
 struct ggml_backend_cuda_buffer_type_context {
@@ -1241,15 +1466,61 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     return size;
 }
 
+#if defined(GGML_USE_VMM)
+// the unit of the device's virtual memory management, 0 for a device without it
+static size_t ggml_backend_cuda_buffer_type_get_lazy_granularity(ggml_backend_buffer_type_t buft) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    const auto & dev = ggml_cuda_info().devices[buft_ctx->device];
+
+    return dev.vmm ? dev.vmm_granularity : 0;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_lazy(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    const size_t unit = ggml_backend_cuda_buffer_type_get_lazy_granularity(buft);
+    if (unit == 0) {
+        return nullptr;
+    }
+
+    size = (size + unit - 1)/unit*unit;
+
+    ggml_cuda_set_device(buft_ctx->device);
+
+    // an address range and no memory
+    CUdeviceptr addr = 0;
+    const CUresult err = cuMemAddressReserve(&addr, size, 0, 0, 0);
+    if (err != CUDA_SUCCESS) {
+        GGML_LOG_ERROR("%s: reserving an address range of %.2f MiB on device %d failed (%d)\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, (int) err);
+        return nullptr;
+    }
+
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, (void *) (uintptr_t) addr);
+    ctx->lazy      = true;
+    ctx->lazy_size = size;
+    ctx->units.init(unit, size);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_lazy_buffer_interface, ctx, size);
+}
+#endif // defined(GGML_USE_VMM)
+
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
-    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
-    /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
-    /* .alloc_buffer_n      = */ NULL,
-    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
-    /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
-    /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
-    /* .get_alloc_size_n    = */ NULL,
-    /* .is_host             = */ NULL,
+    /* .get_name             = */ ggml_backend_cuda_buffer_type_get_name,
+    /* .alloc_buffer         = */ ggml_backend_cuda_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n       = */ NULL,
+    /* .get_alignment        = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size         = */ NULL, // defaults to SIZE_MAX
+    /* .get_alloc_size       = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n     = */ NULL,
+    /* .is_host              = */ NULL,
+#if defined(GGML_USE_VMM)
+    /* .get_lazy_granularity = */ ggml_backend_cuda_buffer_type_get_lazy_granularity,
+    /* .alloc_buffer_lazy    = */ ggml_backend_cuda_buffer_type_alloc_buffer_lazy,
+#else
+    /* .get_lazy_granularity = */ NULL,
+    /* .alloc_buffer_lazy    = */ NULL,
+#endif // defined(GGML_USE_VMM)
 };
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
