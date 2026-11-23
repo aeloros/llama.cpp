@@ -25,7 +25,10 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+        // not null: the rows of the s states take their memory lazily, within this budget (see lazy below). It is
+        // honoured when all the layers are on one buffer type that can make lazy buffers
+            llama_memory_lazy * lazy = nullptr);
 
     ~llama_memory_recurrent() = default;
 
@@ -61,6 +64,11 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+
+    // lazy memory
+    bool   lazy_info (llama_memory_lazy_info & info) const override;
+    size_t lazy_bytes(uint32_t n_cells, uint32_t n_rows) const override;
+    void   lazy_trim () override;
 
     // state write/load
 
@@ -144,6 +152,29 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
 
     void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
+
+    // Lazy memory (llama_memory_lazy), null if the module holds all of its memory. The s tensors, which are nearly
+    // all of a row, are in a lazy buffer of their own, and the rows below lazy_mark have their memory, in every
+    // rollback group. The r states are small and are held whole. A sequence takes the lowest free row. The mark rises
+    // when a batch or a restored state uses a row above it (lazy_take) and falls to the highest row in use when
+    // sequences are removed (lazy_trim_rows). Nothing may read or write a row at or above the mark: a graph reads
+    // the rows that s_copy() names and writes those from head on, which are rows of cells in use.
+    llama_memory_lazy * lazy = nullptr;
+
+    uint32_t lazy_mark = 0;
+
+    // the memory of the rows [r0, r1), in every s tensor and rollback group, and those tensors
+    std::vector<llama_memory_lazy_range> lazy_ranges(uint32_t r0, uint32_t r1) const;
+    std::vector<const ggml_tensor *>     lazy_tensors() const;
+
+    // one more than the highest row that a cell in use has its state in
+    uint32_t lazy_rows_in_use() const;
+
+    // have the memory of the rows [0, n_rows); false if it cannot be had, and the mark stays
+    bool lazy_take(uint32_t n_rows);
+
+    // give back the memory above the highest row in use
+    void lazy_trim_rows();
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

@@ -164,11 +164,62 @@ static size_t llama_memory_lazy_offset(const llama_memory_lazy_range & r) {
     return (size_t) ((const char *) r.tensor->data - (const char *) ggml_backend_buffer_get_base(r.tensor->buffer)) + r.offset;
 }
 
-bool llama_memory_lazy_take(llama_memory_lazy & lazy, const std::vector<llama_memory_lazy_range> & ranges) {
-    // what the ranges would add. A unit that two ranges touch is counted twice here, which errs to the safe side.
-    size_t n_need = 0;
+// the parts of each buffer that the ranges touch, in whole units and each unit once: offset and size in bytes
+struct llama_memory_lazy_part {
+    ggml_backend_buffer_t buf;
+    size_t offset;
+    size_t size;
+};
+
+static std::vector<llama_memory_lazy_part> llama_memory_lazy_parts(const std::vector<llama_memory_lazy_range> & ranges) {
+    // the units of each buffer that the ranges touch: [first, last)
+    std::map<ggml_backend_buffer_t, std::vector<std::pair<size_t, size_t>>> units;
     for (const auto & r : ranges) {
-        n_need += ggml_backend_buffer_commit_size(r.tensor->buffer, llama_memory_lazy_offset(r), r.size);
+        if (r.size == 0) {
+            continue;
+        }
+        ggml_backend_buffer_t buf = r.tensor->buffer;
+
+        const size_t unit = ggml_backend_buft_lazy_granularity(ggml_backend_buffer_get_type(buf));
+        if (unit == 0 || !ggml_backend_buffer_is_lazy(buf)) {
+            continue;
+        }
+        const size_t offset = llama_memory_lazy_offset(r);
+
+        units[buf].emplace_back(offset/unit, (offset + r.size + unit - 1)/unit);
+    }
+
+    std::vector<llama_memory_lazy_part> res;
+    for (auto & [buf, v] : units) {
+        const size_t unit = ggml_backend_buft_lazy_granularity(ggml_backend_buffer_get_type(buf));
+
+        std::sort(v.begin(), v.end());
+
+        // runs of units, merged where they touch or overlap
+        size_t from = v[0].first;
+        size_t to   = v[0].second;
+        for (size_t i = 1; i < v.size(); ++i) {
+            if (v[i].first > to) {
+                res.push_back({ buf, from*unit, (to - from)*unit });
+                from = v[i].first;
+                to   = v[i].second;
+            } else {
+                to = std::max(to, v[i].second);
+            }
+        }
+        res.push_back({ buf, from*unit, (to - from)*unit });
+    }
+
+    return res;
+}
+
+bool llama_memory_lazy_take(llama_memory_lazy & lazy, const std::vector<llama_memory_lazy_range> & ranges) {
+    const auto parts = llama_memory_lazy_parts(ranges);
+
+    // what is still to take
+    size_t n_need = 0;
+    for (const auto & p : parts) {
+        n_need += ggml_backend_buffer_commit_size(p.buf, p.offset, p.size);
     }
 
     if (n_need == 0) {
@@ -179,13 +230,11 @@ bool llama_memory_lazy_take(llama_memory_lazy & lazy, const std::vector<llama_me
         return false;
     }
 
-    for (const auto & r : ranges) {
-        ggml_backend_buffer_t buf = r.tensor->buffer;
+    for (const auto & p : parts) {
+        const size_t n_before = ggml_backend_buffer_committed(p.buf);
+        const bool   ok       = ggml_backend_buffer_commit(p.buf, p.offset, p.size);
 
-        const size_t n_before = ggml_backend_buffer_committed(buf);
-        const bool   ok       = ggml_backend_buffer_commit(buf, llama_memory_lazy_offset(r), r.size);
-
-        lazy.taken += ggml_backend_buffer_committed(buf) - n_before;
+        lazy.taken += ggml_backend_buffer_committed(p.buf) - n_before;
 
         if (!ok) {
             return false;
@@ -265,37 +314,9 @@ void llama_memory_lazy_keep(llama_memory_lazy & lazy, const std::vector<const gg
 }
 
 size_t llama_memory_lazy_size(const std::vector<llama_memory_lazy_range> & ranges) {
-    // the units of each buffer that the ranges touch: [first, last)
-    std::map<ggml_backend_buffer_t, std::vector<std::pair<size_t, size_t>>> units;
-    for (const auto & r : ranges) {
-        if (r.size == 0) {
-            continue;
-        }
-        ggml_backend_buffer_t buf = r.tensor->buffer;
-
-        const size_t unit = ggml_backend_buft_lazy_granularity(ggml_backend_buffer_get_type(buf));
-        if (unit == 0) {
-            continue;
-        }
-        const size_t offset = llama_memory_lazy_offset(r);
-
-        units[buf].emplace_back(offset/unit, (offset + r.size + unit - 1)/unit);
-    }
-
     size_t res = 0;
-    for (auto & [buf, v] : units) {
-        const size_t unit = ggml_backend_buft_lazy_granularity(ggml_backend_buffer_get_type(buf));
-
-        std::sort(v.begin(), v.end());
-
-        size_t last = 0;
-        for (const auto & [u0, u1] : v) {
-            const size_t from = std::max(u0, last);
-            if (u1 > from) {
-                res += (u1 - from)*unit;
-                last = u1;
-            }
-        }
+    for (const auto & p : llama_memory_lazy_parts(ranges)) {
+        res += p.size;
     }
 
     return res;

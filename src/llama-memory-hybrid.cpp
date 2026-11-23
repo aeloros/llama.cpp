@@ -66,7 +66,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
-            : filter_recr
+            : filter_recr,
+        lazy
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -117,6 +118,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         auto heads_attn = mem_attn->prepare(ubatches);
         if (heads_attn.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
+
+            // lazy memory: the rows that the recurrent part took for the batch go back with it
+            mem_recr->lazy_trim();
+
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
@@ -288,15 +293,20 @@ const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() c
 }
 
 bool llama_memory_hybrid::lazy_info(llama_memory_lazy_info & info) const {
-    return mem_attn->lazy_info(info);
+    // the cells of the attention part and the rows of the recurrent part, out of one budget
+    const bool is_lazy_attn = mem_attn->lazy_info(info);
+    const bool is_lazy_recr = mem_recr->lazy_info(info);
+
+    return is_lazy_attn || is_lazy_recr;
 }
 
 size_t llama_memory_hybrid::lazy_bytes(uint32_t n_cells, uint32_t n_rows) const {
-    return mem_attn->lazy_bytes(n_cells, n_rows);
+    return mem_attn->lazy_bytes(n_cells, n_rows) + mem_recr->lazy_bytes(n_cells, n_rows);
 }
 
 void llama_memory_hybrid::lazy_trim() {
     mem_attn->lazy_trim();
+    mem_recr->lazy_trim();
 }
 
 int32_t llama_memory_hybrid::stream_add(ggml_backend_buffer_type_t buft, uint32_t size, bool alloc) {

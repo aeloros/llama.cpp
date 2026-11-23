@@ -621,6 +621,250 @@ struct case_rollback_other_seqs : ctx_test {
     }
 };
 
+// - a context with lazy memory holds no row of the recurrent state before a sequence has one
+// - each sequence takes a row, the lowest that is free, and decodes to the logits of a context with its memory whole
+// - a row goes back when the sequences above it are gone, and a new sequence takes the lowest free row
+// - a sequence restores from its saved state into a row that is taken for it
+// - the rows beyond n_seq_budget take their memory out of what the cells have not taken: a sequence that finds none
+//   is refused, nothing has changed, and the other goes on
+// On the CPU the memory that is not taken faults when it is touched, so a stray read or write ends the test.
+// With n_rs > 0 the rows have rollback snapshots: a row is taken in every rollback group, and a rollback reads a
+// snapshot row.
+struct case_lazy_rows : ctx_test {
+    explicit case_lazy_rows(uint32_t n_rs_) : n_rs(n_rs_) {}
+
+    const uint32_t n_rs;
+
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return n_rs > 0 ? "lazy_rr" : "lazy_r"; }
+
+    const char * description() const override {
+        return n_rs > 0 ? "lazy memory: the rows of the recurrent state with rollback snapshots"
+                        : "lazy memory: the rows of the recurrent state take their memory when sequences need them, within the budget";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        // tokens [p0, p1) of a sequence, and the logits of the last one
+        auto decode_n = [&](llama_context * c, llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<float> & logits) {
+            const llama_pos n_chunk = 64;
+            for (llama_pos p = p0; p < p1 - 1; p += n_chunk) {
+                if (!decode_gen(c, n_vocab, seq_id, p, std::min(p + n_chunk, p1 - 1))) {
+                    return false;
+                }
+            }
+            return decode_one(c, gen_token(n_vocab, seq_id, p1 - 1), p1 - 1, seq_id) && get_current_logits(c, logits);
+        };
+
+        auto same = [&](const std::vector<float> & ref, const std::vector<float> & got) {
+            return ref.size() == got.size() && compare_logits(ref.data(), got.data(), ref.size()).nmse() <= NMSE_THRESHOLD;
+        };
+
+        // what the memory says it holds is what its marks take, and it stays within the budget
+        auto consistent = [&](llama_memory_t mem, uint32_t n_rows_expected, std::string & why) {
+            llama_memory_lazy_info cur;
+            if (!llama_memory_get_lazy_info(mem, &cur)) {
+                why = "the memory no longer says that it is lazy";
+                return false;
+            }
+            if (cur.n_rows_taken != n_rows_expected) {
+                why = "the row mark is at " + std::to_string(cur.n_rows_taken) + ", expected " + std::to_string(n_rows_expected);
+                return false;
+            }
+            if (cur.taken != llama_memory_lazy_bytes(mem, cur.n_cells_taken, cur.n_rows_taken)) {
+                why = "the memory holds " + std::to_string(cur.taken) + " bytes, and its marks take " +
+                      std::to_string(llama_memory_lazy_bytes(mem, cur.n_cells_taken, cur.n_rows_taken));
+                return false;
+            }
+            if (cur.taken > cur.budget) {
+                why = "the memory holds more than its budget";
+                return false;
+            }
+            return true;
+        };
+
+        ctx_opts opts;
+        opts.n_ctx      = 1024;
+        opts.n_seq_max  = 4;
+        opts.kv_unified = 1;
+        opts.n_rs_seq   = n_rs;
+
+        auto ctx_ref = mr.ctx(opts);
+        if (!ctx_ref) {
+            return case_result::fail();
+        }
+
+        if (n_rs > 0 && llama_n_rs_seq(ctx_ref.get()) == 0) {
+            return case_result::skip("the model has no rollback snapshots");
+        }
+
+        const llama_pos n = 24;
+
+        std::string why;
+        std::vector<float> logits;
+        std::vector<float> ref;
+
+        //
+        // the rows, with a budget that holds all of them
+        //
+        {
+            ctx_opts opts_lazy = opts;
+            opts_lazy.n_seq_budget = 4;
+            opts_lazy.quiet        = true;
+
+            auto ctx = mr.ctx(opts_lazy);
+            if (!ctx) {
+                // LLAMA_TEST_LAZY_STRICT: for a run over models whose memory has to support it
+                if (getenv("LLAMA_TEST_LAZY_STRICT")) {
+                    return case_result::fail("a context with lazy memory was refused");
+                }
+                return case_result::skip("the memory of this model cannot be lazy");
+            }
+
+            llama_memory_t mem = llama_get_memory(ctx.get());
+
+            llama_memory_lazy_info info;
+            CTX_REQUIRE(llama_memory_get_lazy_info(mem, &info), "a context that was created with lazy memory says that it is not lazy");
+            if (info.n_rows == 0 && !getenv("LLAMA_TEST_LAZY_STRICT")) {
+                // a recurrent state that is conv state only: its rows are small and are held whole
+                return case_result::skip("the recurrent state of this model has no rows that are lazy");
+            }
+            CTX_REQUIRE(info.n_rows == 4 && info.row_bytes > 0, "the recurrent state of a lazy memory is not lazy");
+            CTX_REQUIRE(info.budget == llama_memory_lazy_bytes(mem, info.n_cells, 4), "the budget is not what all the cells and four rows take");
+            CTX_REQUIRE(consistent(mem, 0, why), "before any sequence: " + why);
+
+            for (llama_seq_id s = 0; s < 3; ++s) {
+                CTX_REQUIRE(decode_n(ctx.get(),     s, 0, n, logits), "failed to decode seq " + std::to_string(s));
+                CTX_REQUIRE(decode_n(ctx_ref.get(), s, 0, n, ref),    "failed to decode seq " + std::to_string(s) + " with its memory whole");
+                CTX_REQUIRE(consistent(mem, s + 1, why), "after seq " + std::to_string(s) + ": " + why);
+                CTX_REQUIRE(same(ref, logits), "seq " + std::to_string(s) + " produced different logits in lazy memory");
+            }
+
+            if (n_rs > 0) {
+                // seq 0 goes on by two tokens in one batch, rolls the last one back and decodes it again: that reads a
+                // snapshot row of its row, and gives the logits of the first time
+                auto two = [&](llama_context * c, std::vector<float> & out) {
+                    common_batch batch(c);
+                    batch.add(gen_token(n_vocab, 0, n),     n,     0, false);
+                    batch.add(gen_token(n_vocab, 0, n + 1), n + 1, 0, true);
+                    return llama_process(c, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0 && get_current_logits(c, out);
+                };
+                auto again = [&](llama_context * c, std::vector<float> & out) {
+                    return llama_memory_seq_rm(llama_get_memory(c), 0, n + 1, -1) &&
+                           decode_one(c, gen_token(n_vocab, 0, n + 1), n + 1, 0) && get_current_logits(c, out);
+                };
+
+                std::vector<float> first;
+                CTX_REQUIRE(two(ctx.get(), first) && two(ctx_ref.get(), ref), "seq 0 failed to go on by two tokens");
+                CTX_REQUIRE(same(ref, first), "seq 0 produced different logits in lazy memory when it went on");
+                CTX_REQUIRE(again(ctx.get(), logits) && again(ctx_ref.get(), ref), "seq 0 failed to roll back a token and decode it again");
+                CTX_REQUIRE(same(first, logits), "seq 0 produced different logits after a rollback in lazy memory");
+                CTX_REQUIRE(same(ref, logits), "seq 0 produced different logits after a rollback than with its memory whole");
+                CTX_REQUIRE(consistent(mem, 3, why), "after the rollback of seq 0: " + why);
+            }
+
+            // seq 2 holds the highest row: the row of seq 1 below it stays taken, and both go back with seq 2
+            CTX_REQUIRE(seq_rm(ctx.get(), 1) && seq_rm(ctx_ref.get(), 1), "failed to remove seq 1");
+            CTX_REQUIRE(consistent(mem, 3, why), "after seq 1 was removed: " + why);
+            CTX_REQUIRE(seq_rm(ctx.get(), 2) && seq_rm(ctx_ref.get(), 2), "failed to remove seq 2");
+            CTX_REQUIRE(consistent(mem, 1, why), "after seq 2 was removed: " + why);
+
+            // a new sequence takes the lowest free row
+            CTX_REQUIRE(decode_n(ctx.get(),     3, 0, n, logits), "failed to decode seq 3");
+            CTX_REQUIRE(decode_n(ctx_ref.get(), 3, 0, n, ref),    "failed to decode seq 3 with its memory whole");
+            CTX_REQUIRE(consistent(mem, 2, why), "after seq 3: " + why);
+            CTX_REQUIRE(same(ref, logits), "seq 3 produced different logits in lazy memory");
+
+            // its state takes the row again
+            std::vector<uint8_t> state;
+            CTX_REQUIRE(get_seq_state(ctx.get(), 3, 0, state), "failed to save seq 3");
+            CTX_REQUIRE(seq_rm(ctx.get(), 3), "failed to remove seq 3");
+            CTX_REQUIRE(consistent(mem, 1, why), "after seq 3 was removed: " + why);
+            CTX_REQUIRE(set_seq_state(ctx.get(), 3, 0, state), "failed to restore seq 3");
+            CTX_REQUIRE(consistent(mem, 2, why), "after seq 3 was restored: " + why);
+
+            CTX_REQUIRE(decode_n(ctx.get(),     3, n, n + 1, logits), "failed to go on with the restored seq 3");
+            CTX_REQUIRE(decode_n(ctx_ref.get(), 3, n, n + 1, ref),    "failed to go on with seq 3 with its memory whole");
+            CTX_REQUIRE(same(ref, logits), "the restored seq 3 produced different logits in lazy memory");
+
+            llama_memory_clear(mem, true);
+            CTX_REQUIRE(consistent(mem, 0, why), "after the memory was cleared: " + why);
+            CTX_REQUIRE(llama_memory_get_lazy_info(mem, &info) && info.taken == 0, "memory is still taken after the memory was cleared");
+        }
+
+        //
+        // a budget of one row: a second sequence takes its row out of what the cells have not taken
+        //
+        {
+            llama_memory_clear(llama_get_memory(ctx_ref.get()), true);
+
+            ctx_opts opts_lazy = opts;
+            opts_lazy.n_seq_budget = 1;
+
+            auto ctx = mr.ctx(opts_lazy);
+            if (!ctx) {
+                return case_result::fail();
+            }
+
+            llama_memory_t mem = llama_get_memory(ctx.get());
+
+            llama_memory_lazy_info info;
+            CTX_REQUIRE(llama_memory_get_lazy_info(mem, &info), "the context with a budget of one row says that it is not lazy");
+            CTX_REQUIRE(info.budget == llama_memory_lazy_bytes(mem, info.n_cells, 1), "the budget is not what all the cells and one row take");
+
+            // seq 0 grows until a second sequence would not find the memory of its row, or the cells are nearly used up
+            const llama_pos n_new = 16;
+
+            llama_pos n0 = n;
+            CTX_REQUIRE(decode_n(ctx.get(),     0, 0, n0, logits), "failed to decode seq 0");
+            CTX_REQUIRE(decode_n(ctx_ref.get(), 0, 0, n0, ref),    "failed to decode seq 0 with its memory whole");
+
+            auto fits = [&]() {
+                return llama_memory_lazy_bytes(mem, info.n_cells == 0 ? 0 : (uint32_t) (n0 + n_new), 2) <= info.budget;
+            };
+
+            while (fits() && (uint32_t) (n0 + 64 + n_new + 256) <= info.n_cells) {
+                CTX_REQUIRE(decode_n(ctx.get(),     0, n0, n0 + 64, logits), "failed to grow seq 0");
+                CTX_REQUIRE(decode_n(ctx_ref.get(), 0, n0, n0 + 64, ref),    "failed to grow seq 0 with its memory whole");
+                n0 += 64;
+            }
+            CTX_REQUIRE(consistent(mem, 1, why), "with seq 0 alone: " + why);
+
+            llama_memory_lazy_info before;
+            CTX_REQUIRE(llama_memory_get_lazy_info(mem, &before), "the memory no longer says that it is lazy");
+
+            common_batch batch(ctx.get());
+            for (llama_pos pos = 0; pos < n_new; ++pos) {
+                batch.add(gen_token(n_vocab, 1, pos), pos, 1, pos + 1 == n_new);
+            }
+            const int32_t res = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
+
+            if (fits()) {
+                // the row of seq 1 costs less than the cells that are left: it takes them
+                CTX_REQUIRE(res == 0, "seq 1 was refused although its row fits beside the cells of seq 0");
+                CTX_REQUIRE(consistent(mem, 2, why), "after seq 1 took its row from the cells: " + why);
+            } else {
+                CTX_REQUIRE(res == 1, "a sequence whose row does not fit in the budget was not refused (result " + std::to_string(res) + ")");
+
+                llama_memory_lazy_info after;
+                CTX_REQUIRE(llama_memory_get_lazy_info(mem, &after), "the memory no longer says that it is lazy");
+                CTX_REQUIRE(after.taken == before.taken && after.n_rows_taken == before.n_rows_taken && after.n_cells_taken == before.n_cells_taken,
+                        "the refused batch left memory taken");
+                CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) < 0, "the refused sequence holds state");
+            }
+
+            // seq 0 goes on either way
+            CTX_REQUIRE(decode_n(ctx.get(),     0, n0, n0 + 1, logits), "seq 0 failed to go on");
+            CTX_REQUIRE(decode_n(ctx_ref.get(), 0, n0, n0 + 1, ref),    "seq 0 failed to go on with its memory whole");
+            CTX_REQUIRE(same(ref, logits), "seq 0 produced different logits after a second sequence asked for a row");
+        }
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -629,6 +873,8 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback_other_seqs>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
+    cases.push_back(std::make_unique<case_lazy_rows>(0));
+    cases.push_back(std::make_unique<case_lazy_rows>(2));
 
     return cases;
 }

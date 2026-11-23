@@ -618,6 +618,9 @@ struct case_lazy_cells : ctx_test {
         llama_memory_lazy_info info;
         CTX_REQUIRE(!llama_memory_get_lazy_info(llama_get_memory(ctx_ref.get()), &info), "a context with its memory whole says that it is lazy");
         CTX_REQUIRE(llama_memory_get_lazy_info(mem, &info), "a context that was created with lazy memory says that it is not lazy");
+        if (info.n_cells == 0) {
+            return case_result::skip("the memory of this model has no KV cells");
+        }
         CTX_REQUIRE(info.n_cells >= 4096 && info.cell_bytes > 0, "the lazy memory does not say what its cells are");
         CTX_REQUIRE(info.budget > 0, "the lazy memory has no budget");
         CTX_REQUIRE(info.n_cells_taken == 0, "cells are taken before a sequence has any");

@@ -1,6 +1,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "ggml-backend.h"
+#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
@@ -26,7 +27,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
+    const layer_filter_cb & filter,
+        llama_memory_lazy * lazy_in) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -45,12 +47,15 @@ llama_memory_recurrent::llama_memory_recurrent(
             return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
         }
     };
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    using ctx_map_t = std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator>;
+
+    ctx_map_t ctx_map;
+    ctx_map_t ctx_map_s; // the s tensors of a lazy memory, for a lazy buffer of their own
 
     // create a context for each buffer type
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
+    auto ctx_for_buft = [&](ctx_map_t & map, ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = map.find(buft);
+        if (it == map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
                 /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
@@ -63,13 +68,34 @@ llama_memory_recurrent::llama_memory_recurrent(
                 return nullptr;
             }
 
-            ctx_map.emplace(buft, ctx);
+            map.emplace(buft, ctx);
 
             return ctx;
         }
 
         return it->second.get();
     };
+
+    // Lazy memory: s states to take, and all the layers on one buffer type that can make lazy buffers. Otherwise the
+    // module holds its memory whole, and lazy_info() says so.
+    bool is_lazy = lazy_in != nullptr && !no_alloc && hparams.n_embd_s() > 0;
+    if (is_lazy) {
+        ggml_backend_buffer_type_t buft_all = nullptr;
+
+        for (int i = 0; i < n_layer; i++) {
+            if (filter && !filter(i)) {
+                continue;
+            }
+
+            ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(model.dev_layer(i)) : ggml_backend_cpu_buffer_type();
+            if (buft_all == nullptr) {
+                buft_all = buft;
+            }
+            is_lazy = is_lazy && buft == buft_all;
+        }
+
+        is_lazy = is_lazy && buft_all != nullptr && ggml_backend_buft_lazy_granularity(buft_all) > 0;
+    }
 
     r_l.resize(n_layer);
     s_l.resize(n_layer);
@@ -94,14 +120,22 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
 
-        ggml_context * ctx = ctx_for_buft(buft);
-        if (!ctx) {
+        // lazy memory: the s tensors in a context of their own, for their lazy buffer. The r and PLE tensors go
+        // beside them when they have no size at all: a buffer that is held whole cannot be empty
+        const bool is_rest_empty = hparams.n_embd_r() == 0 && hparams.ple_conv_state() == 0;
+
+        ggml_context * ctx_s = is_lazy ? ctx_for_buft(ctx_map_s, buft) : nullptr;
+        ggml_context * ctx   = is_lazy && is_rest_empty ? ctx_s : ctx_for_buft(ctx_map, buft);
+        if (!is_lazy) {
+            ctx_s = ctx;
+        }
+        if (!ctx || !ctx_s) {
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx,   type_r, hparams.n_embd_r(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx_s, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
@@ -120,6 +154,17 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "rs cache");
 
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    }
+
+    // lazy memory: the address range of the s tensors, and no memory: what is taken later is zero
+    for (auto & [buft, ctx] : ctx_map_s) {
+        ggml_backend_buffer_t buf = ctxs_bufs.emplace_lazy(std::move(ctx), buft, "rs cache");
+
+        LLAMA_LOG_INFO("%s: %10s RS buffer of %8.2f MiB takes its memory as its rows are used\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    }
+
+    if (is_lazy && !ctx_map_s.empty()) {
+        lazy = lazy_in;
     }
 
     if (is_empty()) {
@@ -161,6 +206,9 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+
+    // no row is in use: a lazy memory gives all of them back
+    lazy_trim_rows();
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -257,6 +305,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         head = new_head;
     }
 
+    // lazy memory: the rows above those that are left go back
+    lazy_trim_rows();
+
     return true;
 }
 
@@ -295,6 +346,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             tail_dst.tail = tail_src.tail;
         }
     }
+
+    // the row that the destination had may be free now
+    lazy_trim_rows();
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
@@ -327,6 +381,8 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     if (new_head != size && new_head < head) {
         head = new_head;
     }
+
+    lazy_trim_rows();
 }
 
 void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -497,10 +553,18 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 
     bool success = true;
 
+    // lazy memory: one more than the highest row that the batch uses
+    uint32_t n_rows = 0;
+
     for (const auto & ubatch : ubatches) {
         if (!find_slot(ubatch)) {
             success = false;
             break;
+        }
+
+        if (lazy) {
+            // the rows from head on are read and written by the graph of the ubatch, also those of no sequence
+            n_rows = std::max(n_rows, std::max(lazy_rows_in_use(), head + n));
         }
     }
 
@@ -508,6 +572,12 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+
+    // Lazy memory: the rows that the batch uses take their memory now, before anything is applied. A batch that
+    // finds none is refused like one that finds no cells.
+    if (success && lazy && !lazy_take(n_rows)) {
+        success = false;
+    }
 
     return success;
 }
@@ -586,7 +656,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 #endif
 
     // find next empty cell
-    uint32_t next_empty_cell = head;
+    // lazy memory: the lowest one, so that the rows in use stay together at the low end and the rest can go back
+    uint32_t next_empty_cell = lazy ? 0 : head;
 
     for (uint32_t i = 0; i < size; ++i) {
         if (next_empty_cell >= size) { next_empty_cell -= size; }
@@ -727,6 +798,128 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
+}
+
+//
+// lazy memory
+//
+
+std::vector<llama_memory_lazy_range> llama_memory_recurrent::lazy_ranges(uint32_t r0, uint32_t r1) const {
+    std::vector<llama_memory_lazy_range> res;
+    if (r1 <= r0) {
+        return res;
+    }
+
+    // a row of the state is a row of each s tensor, in every rollback group
+    for (const ggml_tensor * s : s_l) {
+        if (s == nullptr) {
+            continue;
+        }
+        for (uint32_t g = 0; g <= n_rs_seq; ++g) {
+            res.push_back({ s, (size_t) (g*size + r0)*s->nb[1], (size_t) (r1 - r0)*s->nb[1] });
+        }
+    }
+
+    return res;
+}
+
+std::vector<const ggml_tensor *> llama_memory_recurrent::lazy_tensors() const {
+    std::vector<const ggml_tensor *> res;
+    for (const ggml_tensor * s : s_l) {
+        if (s != nullptr) {
+            res.push_back(s);
+        }
+    }
+
+    return res;
+}
+
+uint32_t llama_memory_recurrent::lazy_rows_in_use() const {
+    uint32_t res = 0;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].is_empty()) {
+            continue;
+        }
+        res = std::max(res, i + 1);
+
+        // where the state of the cell is until a graph has copied it
+        if (cells[i].src >= 0) {
+            res = std::max(res, (uint32_t) cells[i].src + 1);
+        }
+    }
+
+    return res;
+}
+
+bool llama_memory_recurrent::lazy_take(uint32_t n_rows) {
+    n_rows = std::min(n_rows, size);
+    if (n_rows <= lazy_mark) {
+        return true;
+    }
+
+    if (!llama_memory_lazy_take(*lazy, lazy_ranges(lazy_mark, n_rows))) {
+        LLAMA_LOG_WARN("%s: no memory for the rows %u to %u (%.2f of %.2f MiB are taken)\n", __func__,
+                lazy_mark, n_rows, lazy->taken/1024.0/1024.0, lazy->budget/1024.0/1024.0);
+
+        // what the call took above the mark goes back
+        llama_memory_lazy_keep(*lazy, lazy_tensors(), lazy_ranges(0, lazy_mark));
+        return false;
+    }
+
+    LLAMA_LOG_DEBUG("%s: the rows %u to %u have their memory (%.2f MiB are taken)\n", __func__, lazy_mark, n_rows, lazy->taken/1024.0/1024.0);
+
+    lazy_mark = n_rows;
+
+    return true;
+}
+
+void llama_memory_recurrent::lazy_trim_rows() {
+    if (!lazy) {
+        return;
+    }
+
+    const uint32_t mark = lazy_rows_in_use();
+    if (mark >= lazy_mark) {
+        return;
+    }
+
+    llama_memory_lazy_keep(*lazy, lazy_tensors(), lazy_ranges(0, mark));
+
+    LLAMA_LOG_DEBUG("%s: the memory of the rows %u to %u went back (%.2f MiB are taken)\n", __func__, mark, lazy_mark, lazy->taken/1024.0/1024.0);
+
+    lazy_mark = mark;
+}
+
+bool llama_memory_recurrent::lazy_info(llama_memory_lazy_info & info) const {
+    if (!lazy) {
+        return false;
+    }
+
+    info.budget       = lazy->budget;
+    info.taken        = lazy->taken;
+    info.n_rows       = size;
+    info.n_rows_taken = lazy_mark;
+
+    info.row_bytes = 0;
+    for (const auto & r : lazy_ranges(0, 1)) {
+        info.row_bytes += r.size;
+    }
+
+    return true;
+}
+
+size_t llama_memory_recurrent::lazy_bytes(uint32_t n_cells, uint32_t n_rows) const {
+    GGML_UNUSED(n_cells);
+
+    if (!lazy) {
+        return 0;
+    }
+
+    return llama_memory_lazy_size(lazy_ranges(0, std::min(n_rows, size)));
+}
+
+void llama_memory_recurrent::lazy_trim() {
+    lazy_trim_rows();
 }
 
 bool llama_memory_recurrent::is_empty() const {
@@ -875,6 +1068,11 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     const uint32_t cell_head = head;
 
     res = res && meta_read;
+
+    // lazy memory: the rows that the state was placed in take their memory before the data is written
+    if (res && lazy) {
+        res = lazy_take(std::max(lazy_rows_in_use(), cell_head + cell_count));
+    }
 
     try {
         res = res && state_read_data(io, cell_count);
@@ -1269,8 +1467,13 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
         }
 
         if (s_l[il] != nullptr) {
-            const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            llama_clear_tensor_data(s_l[il], cell_head * s_size_row, cell_count * s_size_row);
+            // lazy memory: the rows at or above the mark have no memory to clear, and are zero when they take it
+            const uint32_t s_count = !lazy ? cell_count : cell_head >= lazy_mark ? 0 : std::min(cell_count, lazy_mark - cell_head);
+
+            if (s_count > 0) {
+                const size_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+                llama_clear_tensor_data(s_l[il], cell_head * s_size_row, s_count * s_size_row);
+            }
         }
 
         if (p_l[il] != nullptr) {
