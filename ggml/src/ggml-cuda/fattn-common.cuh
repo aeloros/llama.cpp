@@ -28,6 +28,7 @@ typedef void (* fattn_kernel_t)(
         const int  * __restrict__ KV_rows,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
+        float2     * __restrict__ dst_ms,
         const float scale,
         const float max_bias,
         const float m0,
@@ -820,6 +821,7 @@ __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
         float * dst_ptr,
         const float2 * dst_fixup_ptr,
+        float2 * dst_ms_ptr,
         const int ne01, const int ne02,
         const int ne12, const int nblocks_stream_k,
         const int gqa_ratio,
@@ -893,6 +895,15 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
         max_val = max_val_new;
     }
 
+    // The partial form of the op keeps the result before the division, and the maximum and the sum beside it:
+    if (dst_ms_ptr) {
+        *dst = dst_val;
+        if (tid == 0) {
+            dst_ms_ptr[sequence*ne02*ne01 + jt*ne02*ncols1 + zt_Q + j*ne02 + c] = make_float2(max_val, rowsum);
+        }
+        return;
+    }
+
     // Write back final result:
     *dst = dst_val / rowsum;
 }
@@ -904,6 +915,7 @@ __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_general(
         float * dst_ptr,
         const float2 * dst_fixup_ptr,
+        float2 * dst_ms_ptr,
         const int ne01, const int ne02,
         const int gqa_ratio,
         const int total_work,
@@ -1004,6 +1016,15 @@ static __global__ void flash_attn_stream_k_fixup_general(
         kbc_stop = kbc;
     }
 
+    // The partial form of the op keeps the result before the division, and the maximum and the sum beside it:
+    if (dst_ms_ptr) {
+        *dst = dst_val;
+        if (tid == 0) {
+            dst_ms_ptr[sequence*ne02*ne01 + jt*ne02*ncols1 + zt_Q + j*ne02 + c] = make_float2(max_val, rowsum);
+        }
+        return;
+    }
+
     // Write back final result:
     *dst = dst_val / rowsum;
 }
@@ -1097,6 +1118,25 @@ static inline void ggml_cuda_flash_attn_ext_gather_rows(
     CUDA_CHECK(cudaGetLastError());
 }
 
+// The rows of the partial form of the op (ggml_flash_attn_ext_rows_partial): for each head and token the D values
+// before the division by the softmax sum, then the maximum of the scores and the sum relative to it.
+static __global__ void flash_attn_pack_partial(
+        const float * __restrict__ src, const float2 * __restrict__ ms, float * __restrict__ dst, const int D) {
+    const int64_t row = blockIdx.x;
+
+    const float * s = src + row*D;
+    float       * d = dst + row*(D + 2);
+
+    for (int k = threadIdx.x; k < D; k += blockDim.x) {
+        d[k] = s[k];
+    }
+    if (threadIdx.x == 0) {
+        const float2 m = ms[row];
+        d[D]     = m.x;
+        d[D + 1] = m.y;
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1142,6 +1182,14 @@ void launch_fattn(
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+
+    // The partial form of the op: the kernel leaves the result before the division in a buffer of its own, with the
+    // maximum and the sum of each head and token beside it, and the rows of dst are put together from the two last.
+    const bool   partial    = ggml_flash_attn_ext_is_partial(KQV);
+    const size_t n_rows_dst = size_t(Q->ne[1])*Q->ne[2]*Q->ne[3];
+
+    ggml_cuda_pool_alloc<float>  dst_part(pool);
+    ggml_cuda_pool_alloc<float2> dst_part_ms(pool);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1385,6 +1433,16 @@ void launch_fattn(
         }
     }
 
+    // Taken last: the pool gives memory back in the reverse order of taking it, and these two are declared last.
+    float * dst_data = (float *) KQV->data;
+    if (partial) {
+        // only the kernel that splits its work along K writes the pair, and a sink would count once for each place
+        GGML_ASSERT(stream_k && sinks == nullptr);
+        dst_part.alloc(n_rows_dst*DV);
+        dst_part_ms.alloc(n_rows_dst);
+        dst_data = dst_part.ptr;
+    }
+
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
@@ -1417,7 +1475,7 @@ void launch_fattn(
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         kv_rows && !gather_rows ? (const int *) kv_rows->data : nullptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : dst_data, dst_tmp_meta.ptr, dst_part_ms.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
@@ -1442,7 +1500,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr,
+                dst_data, dst_tmp_meta.ptr, dst_part_ms.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
         } else if (ntiles_dst % blocks_num.x != 0) {
@@ -1459,7 +1517,7 @@ void launch_fattn(
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_general<DV, ncols1, ncols2>, launch_params,
-                (float *) KQV->data, dst_tmp_meta.ptr,
+                dst_data, dst_tmp_meta.ptr, dst_part_ms.ptr,
                  Q->ne[1], Q->ne[2], gqa_ratio, total_work,
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
@@ -1473,4 +1531,14 @@ void launch_fattn(
             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+
+    if (partial) {
+        const dim3 block_dim_pack(std::min<int>(DV, 256), 1, 1);
+        const dim3 blocks_num_pack(n_rows_dst, 1, 1);
+
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_pack, block_dim_pack, 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_pack_partial, launch_params,
+            (const float *) dst_part.ptr, (const float2 *) dst_part_ms.ptr, (float *) KQV->data, (int) DV);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }

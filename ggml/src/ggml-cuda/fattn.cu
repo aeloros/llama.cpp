@@ -845,9 +845,67 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    // the partial form (ggml_flash_attn_ext_rows_partial) is not built here yet: the kernels write the finished result
+    // The partial form (ggml_flash_attn_ext_rows_partial) is written by the MMA kernel, which is the one that reads
+    // rows through a list. A sink would be counted once for each place that holds rows, so it stays with the CPU.
     if (ggml_flash_attn_ext_is_partial(dst)) {
-        return false;
+        return dst->src[4] == nullptr && ggml_cuda_get_best_fattn_kernel(device, dst) == BEST_FATTN_KERNEL_MMA_F16;
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+}
+
+// One head of one token is a row of a, b and dst. As the CPU's ggml_compute_forward_flash_attn_ext_combine: a place
+// that holds nothing for a token has a sum of zero and takes no part, whatever its maximum says.
+static __global__ void flash_attn_ext_combine_kernel(
+        const float * __restrict__ a, const float * __restrict__ b, float * __restrict__ dst, const int DV) {
+    const int64_t row = blockIdx.x;
+
+    const float * pa = a   + row*(DV + 2);
+    const float * pb = b   + row*(DV + 2);
+    float       * pd = dst + row*DV;
+
+    const float Ma = pa[DV];
+    const float Sa = pa[DV + 1];
+    const float Mb = pb[DV];
+    const float Sb = pb[DV + 1];
+
+    const bool has_a = Sa != 0.0f;
+    const bool has_b = Sb != 0.0f;
+
+    const float M  = has_a && has_b ? fmaxf(Ma, Mb) : (has_a ? Ma : Mb);
+    const float wa = has_a ? expf(Ma - M) : 0.0f;
+    const float wb = has_b ? expf(Mb - M) : 0.0f;
+
+    const float S     = Sa*wa + Sb*wb;
+    const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
+
+    for (int d = threadIdx.x; d < DV; d += blockDim.x) {
+        pd[d] = (pa[d]*wa + pb[d]*wb)*S_inv;
+    }
+}
+
+bool ggml_cuda_flash_attn_ext_combine_supported(const ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    return dst->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_are_same_shape(a, b) && a->ne[0] == dst->ne[0] + 2;
+}
+
+void ggml_cuda_flash_attn_ext_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+
+    GGML_ASSERT(ggml_cuda_flash_attn_ext_combine_supported(dst));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int     DV     = dst->ne[0];
+    const int64_t n_rows = dst->ne[1]*dst->ne[2]*dst->ne[3];
+
+    const dim3 block_dim(std::min(DV, 256), 1, 1);
+    const dim3 blocks_num(n_rows, 1, 1);
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, 0, ctx.stream());
+    ggml_cuda_kernel_launch(flash_attn_ext_combine_kernel, launch_params,
+        (const float *) a->data, (const float *) b->data, (float *) dst->data, DV);
+    CUDA_CHECK(cudaGetLastError());
 }
