@@ -100,6 +100,7 @@ struct server_context {
 
 // forward declarations
 struct server_res_generator;
+struct server_model_copy;
 
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
@@ -171,6 +172,8 @@ private:
 
     server_queue & queue_tasks;
     server_response & queue_results;
+    // a second copy of the model on other devices (--model-copy-device), nullptr without one
+    std::shared_ptr<server_model_copy> model_copy;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
 
     // cached responses, to be used during sleep

@@ -25,18 +25,25 @@
 
 using json = common_json;
 
-#define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_WRN(slot, fmt, ...) LOG_WRN("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
-#define SLT_ERR(slot, fmt, ...) LOG_ERR("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
+// What this thread's server log lines start with: "" as a rule, "copy " while the thread works for the second
+// copy of the model (--model-copy-device), whose slots and tasks have numbers of their own.
+inline const char *& server_log_tag() {
+    static thread_local const char * tag = "";
+    return tag;
+}
+
+#define SLT_DBG(slot, fmt, ...) LOG_DBG("%sslot %12.*s: id %2d | task %d | " fmt, server_log_tag(), 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
+#define SLT_TRC(slot, fmt, ...) LOG_TRC("%sslot %12.*s: id %2d | task %d | " fmt, server_log_tag(), 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
+#define SLT_INF(slot, fmt, ...) LOG_INF("%sslot %12.*s: id %2d | task %d | " fmt, server_log_tag(), 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
+#define SLT_WRN(slot, fmt, ...) LOG_WRN("%sslot %12.*s: id %2d | task %d | " fmt, server_log_tag(), 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
+#define SLT_ERR(slot, fmt, ...) LOG_ERR("%sslot %12.*s: id %2d | task %d | " fmt, server_log_tag(), 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_CNT(slot, fmt, ...) LOG_CNT(""                                 fmt,                                                                __VA_ARGS__)
 
-#define SRV_DBG(fmt, ...) LOG_DBG("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
-#define SRV_TRC(fmt, ...) LOG_TRC("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
-#define SRV_INF(fmt, ...) LOG_INF("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
-#define SRV_WRN(fmt, ...) LOG_WRN("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
-#define SRV_ERR(fmt, ...) LOG_ERR("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define SRV_DBG(fmt, ...) LOG_DBG("%ssrv  %12.*s: " fmt, server_log_tag(), 12, __func__, __VA_ARGS__)
+#define SRV_TRC(fmt, ...) LOG_TRC("%ssrv  %12.*s: " fmt, server_log_tag(), 12, __func__, __VA_ARGS__)
+#define SRV_INF(fmt, ...) LOG_INF("%ssrv  %12.*s: " fmt, server_log_tag(), 12, __func__, __VA_ARGS__)
+#define SRV_WRN(fmt, ...) LOG_WRN("%ssrv  %12.*s: " fmt, server_log_tag(), 12, __func__, __VA_ARGS__)
+#define SRV_ERR(fmt, ...) LOG_ERR("%ssrv  %12.*s: " fmt, server_log_tag(), 12, __func__, __VA_ARGS__)
 #define SRV_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
 using raw_buffer = std::vector<uint8_t>;

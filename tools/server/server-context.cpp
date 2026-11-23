@@ -31,6 +31,7 @@
 #include <deque>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <filesystem>
 #include <random>
 #include <utility>
@@ -6371,7 +6372,13 @@ server_context_meta server_context::get_meta() const {
 // generator-like API for HTTP response generation
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_res_spipe {
+    // released after the readers: it counts the task with the model it went to, and the second copy of the model
+    // is not unloaded while a task is counted there
+    std::shared_ptr<void> hold;
     server_response_reader rd;
+    // the reader of a task that went to the second copy of the model, which has queues of its own
+    std::unique_ptr<server_response_reader> rd_other;
+    server_response_reader & reader() { return rd_other ? *rd_other : rd; }
     server_queue * queue_awake = nullptr; // set while this response keeps the server awake
     server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
@@ -6406,6 +6413,465 @@ void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder
 }
 
 //
+// server_model_copy
+//
+
+// the tag of this thread's log lines while it works for the second copy of the model
+struct server_log_tag_scope {
+    const char * prev;
+    explicit server_log_tag_scope(const char * tag) : prev(server_log_tag()) { server_log_tag() = tag; }
+    ~server_log_tag_scope() { server_log_tag() = prev; }
+};
+
+// A second copy of the model on the devices of --model-copy-device.
+//
+// The copy is a server context of its own in this process: its model, its slots, its prompt cache, and its loop on a
+// thread of its own, so that both models compute at the same time. It is loaded when a task is sent to it, and
+// unloaded when it has been without a task for --model-copy-release seconds.
+//
+// route() decides where a completion task goes when its request arrives. It goes to the copy when the first model
+// has --model-copy-after tasks already, at work or waiting, and the copy has a free slot and the KV cells for the
+// task's prompt and output; otherwise it goes to the first model, as it does without a copy. The tasks of the slots
+// that come first (--batch-priority-slots) are not counted and stay with the first model, and so do the tasks with
+// images or audio: the copy has no multimodal context.
+struct server_model_copy {
+    enum state_t { UNLOADED, LOADING, LOADED, UNLOADING };
+
+    explicit server_model_copy(const common_params & params_first)
+            : params_first(params_first),
+              n_ctx(params_first.model_copy_n_ctx),
+              n_parallel(std::max(1, params_first.model_copy_n_parallel)),
+              n_after(std::max(0, params_first.model_copy_after)),
+              n_release(params_first.model_copy_release),
+              n_headroom(params_first.model_copy_headroom),
+              n_fit_headroom(std::max(0, params_first.kv_fit_headroom)) {
+        SRV_INF("model copy: on %s, %d slots and %d KV cells, %s; a task goes there when the first model has %d, "
+                "and the copy is unloaded after %d s without a task\n",
+                device_names().c_str(), n_parallel, n_ctx,
+                params_first.model_copy_draft ? "drafting as the first model does" : "without draft tokens", n_after, n_release);
+        if (n_headroom >= 0) {
+            SRV_INF("model copy: it is loaded only when each of its devices has its size and %d MiB free (--model-copy-headroom)\n",
+                    n_headroom);
+        }
+        thread_timer = std::thread([this]() { run_timer(); });
+    }
+
+    ~server_model_copy() {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            stopping = true;
+            cv.notify_all();
+            cv.wait(lock, [this]() { return state == UNLOADED || state == LOADED; });
+            if (state == LOADED) {
+                unload(lock);
+            }
+        }
+        thread_timer.join();
+    }
+
+    // Counts a completion task with the model it goes to, until the returned handle is released.
+    //   n_prompt, n_predict: the task's prompt and its output limit in tokens, -1 = no limit
+    //   id_slot:             the slot it asks for, -1 = none
+    //   stays:               the task cannot go to the copy
+    //   to_copy:             set when the task goes to the copy, which is loaded then: the task is to be posted to
+    //                        queue_tasks() and its results read from queue_results()
+    std::shared_ptr<void> route(int32_t n_prompt, int32_t n_predict, int id_slot, bool stays, bool & to_copy) {
+        const auto & prio = params_first.batch_priority_slots;
+        const bool counted = std::find(prio.begin(), prio.end(), id_slot) == prio.end();
+
+        // as for a task that is fitted to a pool of KV cells: its prompt, room for its output, and the token it stops at
+        const int32_t n_room  = n_predict >= 0 ? std::min(n_predict, n_fit_headroom) : n_fit_headroom;
+        const int32_t n_cells = n_prompt + n_room + 1;
+
+        std::unique_lock<std::mutex> lock(mutex);
+        to_copy = false;
+        if (!stays && counted && !stopping && n_first >= n_after && n_copy < n_parallel && n_cells_copy + n_cells <= n_ctx) {
+            // counted before the copy is there, so that the tasks that arrive while it loads see its room taken
+            n_copy++;
+            n_cells_copy += n_cells;
+            if (ensure_loaded(lock)) {
+                to_copy = true;
+                n_tasks_total++;
+            } else {
+                n_copy--;
+                n_cells_copy -= n_cells;
+            }
+        }
+        if (!to_copy && counted) {
+            n_first++;
+        }
+        if (to_copy) {
+            SRV_INF("model copy: a task of %d tokens goes to the copy, which has %d now; the first model has %d\n",
+                    n_prompt, n_copy, n_first);
+        }
+
+        const bool was_copy = to_copy;
+        return std::shared_ptr<void>(static_cast<void *>(this), [this, was_copy, counted, n_cells](void *) {
+            done(was_copy, counted, n_cells);
+        });
+    }
+
+    // the queues of the copy: only for a task that route() sent there, while its handle is held
+    server_queue    & queue_tasks()   { return ctx->impl->queue_tasks; }
+    server_response & queue_results() { return ctx->impl->queue_results; }
+
+    json to_json() {
+        static const char * const names[] = { "unloaded", "loading", "loaded", "unloading" };
+        std::unique_lock<std::mutex> lock(mutex);
+        json need_mib = json::object();
+        for (const auto & n : need) {
+            need_mib[ggml_backend_dev_name(n.dev)] = n.bytes / (1024.0 * 1024.0);
+        }
+        return json {
+            { "devices",       device_names() },
+            { "state",         names[state] },
+            { "n_ctx",         n_ctx },
+            { "total_slots",   n_parallel },
+            { "after",         n_after },
+            { "release",       n_release },
+            { "tasks",         n_copy },         // the tasks the copy has now
+            { "tasks_first",   n_first },        // the counted tasks the first model has now
+            { "n_tasks_total", n_tasks_total },  // tasks sent to the copy since the server started
+            { "n_loads",       n_loads },        // times the copy was loaded
+            { "n_refused",     n_refused },      // times it was not loaded for want of memory on a device
+            { "headroom",      n_headroom },     // MiB
+            { "need_mib",      need_mib },       // what the copy takes of each device, once it is measured
+        };
+    }
+
+private:
+    const common_params & params_first;
+
+    const int32_t n_ctx;
+    const int32_t n_parallel;
+    const int32_t n_after;
+    const int32_t n_release;
+    const int32_t n_headroom; // MiB, -1 = the devices are not asked
+    const int32_t n_fit_headroom;
+
+    static constexpr size_t MiB = 1024 * 1024;
+
+    // what the copy takes of one of its devices
+    struct device_need {
+        ggml_backend_dev_t dev;
+        size_t bytes;
+    };
+
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    // guarded by mutex
+    state_t  state         = UNLOADED;
+    bool     stopping      = false;
+    int32_t  n_first       = 0;  // counted tasks that the first model has, at work or waiting
+    int32_t  n_copy        = 0;  // tasks that the copy has, the ones that wait for it to load included
+    int64_t  n_cells_copy  = 0;  // the KV cells that those tasks are counted with
+    int64_t  t_idle        = 0;  // when the copy's last task ended
+    int64_t  t_retry       = 0;  // after a failed load: when the next one may be tried
+    uint64_t n_tasks_total = 0;
+    uint64_t n_loads       = 0;
+    uint64_t n_refused     = 0;  // times the copy was not loaded because a device had not the memory
+    int64_t  t_refused     = 0;  // when that was last said in the log
+    std::vector<device_need> need; // empty until it is measured, before the first load
+
+    // the copy. Set by the thread that loads it (state LOADING) and reset by the one that unloads it (UNLOADING);
+    // while the state is LOADED it does not change
+    std::unique_ptr<server_context> ctx;
+    std::thread thread_loop;
+
+    std::thread thread_timer;
+
+    std::string device_names() const {
+        std::string res;
+        for (const auto dev : params_first.model_copy_devices) {
+            if (dev != nullptr) {
+                res += (res.empty() ? "" : ",") + std::string(ggml_backend_dev_name(dev));
+            }
+        }
+        return res.empty() ? "none" : res;
+    }
+
+    // the parameters of the first model, with what the copy has of its own
+    common_params params_for_copy() const {
+        common_params p = params_first;
+
+        p.devices = params_first.model_copy_devices;
+        std::fill(std::begin(p.tensor_split), std::end(p.tensor_split), 0.0f);
+        p.model_copy_devices.clear();
+
+        p.n_ctx      = n_ctx;
+        p.n_parallel = n_parallel;
+
+        // one pool of KV cells for its slots; it holds the tasks at work only, an idle slot's prompt is in the
+        // prompt cache
+        p.kv_unified          = true;
+        p.kv_unified_per_slot = 0;
+        p.kv_unified_per_slot_list.clear();
+        p.kv_reserve          = false;
+        p.cache_idle_slots    = true;
+
+        p.kv_overflow_device = nullptr;
+        p.kv_overflow_size   = 0;
+        p.kv_overflow_slots.clear();
+        p.batch_priority_slots.clear();
+
+        p.mmproj    = common_params_model();
+        p.no_mmproj = true;
+
+        if (params_first.model_copy_draft) {
+            // a draft model goes where the copy is
+            p.speculative.draft.devices.clear();
+        } else {
+            p.speculative = common_params_speculative();
+        }
+
+        p.sleep_idle_seconds = -1;
+
+        return p;
+    }
+
+    void done(bool was_copy, bool counted, int32_t n_cells) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (was_copy) {
+            n_copy--;
+            n_cells_copy -= n_cells;
+            if (n_copy == 0) {
+                t_idle = ggml_time_ms();
+            }
+        } else if (counted) {
+            n_first--;
+        }
+    }
+
+    // Returns with the copy loaded, or false when it is not to be had now. The mutex is held on entry and on return,
+    // and released while this thread loads the copy or waits for another one to do it.
+    bool ensure_loaded(std::unique_lock<std::mutex> & lock) {
+        while (true) {
+            if (state == LOADED) {
+                return true;
+            }
+            if (state == LOADING || state == UNLOADING) {
+                cv.wait(lock);
+                continue;
+            }
+            if (stopping || ggml_time_ms() < t_retry) {
+                return false;
+            }
+
+            state = LOADING;
+            lock.unlock();
+            const int64_t t_start = ggml_time_ms();
+            std::string why;
+            const load_res res = load(why);
+            lock.lock();
+
+            const int64_t t_now = ggml_time_ms();
+            state = res == LOAD_OK ? LOADED : UNLOADED;
+            cv.notify_all();
+            switch (res) {
+                case LOAD_OK:
+                    t_idle = t_now;
+                    n_loads++;
+                    SRV_INF("model copy: loaded in %.1f s\n", (t_now - t_start) / 1000.0);
+                    break;
+                case LOAD_NO_MEMORY:
+                    // asked again with the next task, and said in the log once in a while
+                    n_refused++;
+                    if (n_refused == 1 || t_now - t_refused >= 30 * 1000) {
+                        t_refused = t_now;
+                        SRV_INF("model copy: not loaded, %s; its tasks go to the first model\n", why.c_str());
+                    }
+                    return false;
+                case LOAD_FAILED:
+                    t_retry = t_now + 30 * 1000;
+                    SRV_ERR("model copy: failed to load (%s); its tasks go to the first model, and the next try is in 30 s\n",
+                            why.c_str());
+                    break;
+            }
+        }
+    }
+
+    enum load_res { LOAD_OK, LOAD_NO_MEMORY, LOAD_FAILED };
+
+    // What the copy takes of each of its devices, found without taking memory: the model and its contexts are set up
+    // with no allocation, as the fitting of the first model does it. Throws when that fails.
+    std::vector<device_need> measure(common_params & p) const {
+        std::vector<device_need> res;
+        for (const auto dev : p.devices) {
+            if (dev != nullptr) {
+                res.push_back({ dev, 0 });
+            }
+        }
+        if (res.empty()) {
+            return res;
+        }
+
+        const ggml_log_level log_level = p.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+        const auto add = [&res](const std::vector<common_memory_breakdown_row> & rows, bool with_model) {
+            for (const auto & row : rows) {
+                if (row.kind != common_memory_breakdown_row::DEVICE) {
+                    continue;
+                }
+                for (auto & n : res) {
+                    if (row.name == ggml_backend_dev_name(n.dev)) {
+                        n.bytes += (with_model ? row.model : 0) + row.context + row.compute;
+                    }
+                }
+            }
+        };
+
+        auto mparams = common_model_params_to_llama(p);
+        auto cparams = common_context_params_to_llama(p);
+        add(common_fit_measure(p.model.get_paths(), &mparams, &cparams, nullptr, nullptr, log_level), true);
+
+        // the draft context, as common_fit_apply() counts it: an MTP context runs on the weights of the model
+        const bool has_draft = p.speculative.has_dft();
+        const bool spec_mtp  = std::find(p.speculative.types.begin(), p.speculative.types.end(),
+                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != p.speculative.types.end();
+        if (has_draft || spec_mtp) {
+            common_params p_dft = common_base_params_to_speculative(p);
+            auto mparams_dft = common_model_params_to_llama(p_dft);
+            auto cparams_dft = common_context_params_to_llama(p_dft);
+            if (spec_mtp) {
+                cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            }
+            cparams_dft.n_rs_seq = 0;
+            add(common_fit_measure(p_dft.model.get_paths(), &mparams_dft, &cparams_dft, nullptr, nullptr, log_level), has_draft);
+        }
+
+        return res;
+    }
+
+    // Called without the mutex, in state LOADING. why: for the log, when the copy is not loaded.
+    load_res load(std::string & why) {
+        common_params p = params_for_copy();
+
+        // each device of the copy has to have the copy's size free, and the headroom on top
+        std::vector<device_need> need_now;
+        std::vector<size_t>      free_before;
+        if (n_headroom >= 0) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                need_now = need;
+            }
+            if (need_now.empty()) {
+                try {
+                    need_now = measure(p);
+                } catch (const std::exception & e) {
+                    why = string_format("its size could not be measured: %s", e.what());
+                    return LOAD_FAILED;
+                }
+                for (const auto & n : need_now) {
+                    SRV_INF("model copy: it takes %zu MiB of %s, measured without loading it\n",
+                            n.bytes / MiB, ggml_backend_dev_name(n.dev));
+                }
+                std::unique_lock<std::mutex> lock(mutex);
+                need = need_now;
+            }
+            for (const auto & n : need_now) {
+                size_t free  = 0;
+                size_t total = 0;
+                ggml_backend_dev_memory(n.dev, &free, &total);
+                free_before.push_back(free);
+                if (free < n.bytes + (size_t) n_headroom * MiB) {
+                    why = string_format("%s has %zu MiB free, and the copy takes %zu MiB with %d MiB to stay free",
+                            ggml_backend_dev_name(n.dev), free / MiB, n.bytes / MiB, n_headroom);
+                    return LOAD_NO_MEMORY;
+                }
+            }
+        }
+
+        SRV_INF("model copy: loading on %s\n", device_names().c_str());
+        auto ctx_new = std::make_unique<server_context>();
+        {
+            server_log_tag_scope tag("copy ");
+            try {
+                if (!ctx_new->load_model(p)) {
+                    why = "the model or its context could not be set up";
+                    return LOAD_FAILED;
+                }
+            } catch (const std::exception & e) {
+                why = e.what();
+                return LOAD_FAILED;
+            }
+        }
+
+        // What it took, as its devices see it. A copy that left less than the headroom gives the memory back, and
+        // the measure is raised to what was seen, so that the next load is asked for with the right size.
+        bool is_short = false;
+        for (size_t i = 0; i < need_now.size(); i++) {
+            auto & n = need_now[i];
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(n.dev, &free, &total);
+            const size_t taken = free_before[i] > free ? free_before[i] - free : 0;
+            SRV_INF("model copy: %s has %zu MiB free with the copy, %zu MiB less than before (measured: %zu MiB)\n",
+                    ggml_backend_dev_name(n.dev), free / MiB, taken / MiB, n.bytes / MiB);
+            if (free < (size_t) n_headroom * MiB) {
+                is_short = true;
+                n.bytes  = std::max(n.bytes, taken);
+            }
+        }
+        if (is_short) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                need = need_now;
+            }
+            {
+                server_log_tag_scope tag("copy ");
+                ctx_new.reset();
+            }
+            why = string_format("it left less than %d MiB free on its device and was unloaded again", n_headroom);
+            return LOAD_NO_MEMORY;
+        }
+
+        ctx = std::move(ctx_new);
+        thread_loop = std::thread([this]() {
+            server_log_tag_scope tag("copy ");
+            try {
+                ctx->start_loop();
+            } catch (const std::exception & e) {
+                SRV_ERR("the loop ended with an error: %s\n", e.what());
+            }
+        });
+        return LOAD_OK;
+    }
+
+    // The mutex is held on entry and on return, and released while the copy is unloaded. The state is LOADED on
+    // entry and the copy has no task.
+    void unload(std::unique_lock<std::mutex> & lock) {
+        state = UNLOADING;
+        lock.unlock();
+        {
+            server_log_tag_scope tag("copy ");
+            ctx->terminate();
+            if (thread_loop.joinable()) {
+                thread_loop.join();
+            }
+            ctx.reset();
+        }
+        lock.lock();
+        state = UNLOADED;
+        cv.notify_all();
+    }
+
+    void run_timer() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!stopping) {
+            cv.wait_for(lock, std::chrono::milliseconds(250));
+            if (stopping) {
+                break;
+            }
+            if (state == LOADED && n_copy == 0 && n_release >= 0 && ggml_time_ms() - t_idle >= (int64_t) n_release * 1000) {
+                SRV_INF("model copy: %d s without a task, unloading\n", n_release);
+                unload(lock);
+                SRV_INF("%s", "model copy: unloaded\n");
+            }
+        }
+    }
+};
+
+//
 // server_routes
 //
 
@@ -6420,8 +6886,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
     auto res = create_response();
     auto completion_id = gen_chatcmplid();
-    auto & rd = res->rd;
     auto & params = this->params;
+    // with a second copy of the model the task may go to the copy, whose queues res->reader() reads then
+    bool to_copy = false;
 
     res->set_req(&req); // will also set spipe if needed
 
@@ -6462,21 +6929,52 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
+        // a second copy of the model: where the task goes is decided here, and it is counted there until res is gone
+        std::optional<task_params> tparams_first;
+        if (model_copy != nullptr) {
+            bool stays = type != SERVER_TASK_TYPE_COMPLETION || inputs.size() != 1;
+            int32_t n_prompt  = 0;
+            int32_t n_predict = -1;
+            if (!stays) {
+                tparams_first = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, data);
+                n_prompt  = (int32_t) inputs[0].size();
+                n_predict = tparams_first->n_predict;
+                // the copy gives a task one slot, and it has no multimodal context
+                const auto & tokens = inputs[0].get_tokens();
+                stays = tparams_first->n_cmpl > 1 || std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end();
+            }
+            res->hold = model_copy->route(n_prompt, n_predict, json_value(data, "id_slot", -1), stays, to_copy);
+            if (to_copy) {
+                res->rd_other = std::make_unique<server_response_reader>(
+                        model_copy->queue_tasks(), model_copy->queue_results(), HTTP_POLLING_SECONDS);
+                if (inputs[0].has_mtmd) {
+                    // text tokens only, see above
+                    inputs[0] = server_tokens(llama_tokens(inputs[0].get_tokens()), false);
+                }
+            }
+        }
+        auto & rd = res->reader();
+
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
 
             task.id = rd.get_new_id();
 
             task.tokens = std::move(inputs[i]);
-            task.params = server_schema::eval_llama_cmpl_schema(
-                    ctx_server.vocab,
-                    params,
-                    meta->logit_bias_eog,
-                    data);
+            if (i == 0 && tparams_first) {
+                task.params = std::move(*tparams_first);
+            } else {
+                task.params = server_schema::eval_llama_cmpl_schema(
+                        ctx_server.vocab,
+                        params,
+                        meta->logit_bias_eog,
+                        data);
+            }
 
             task.apply_chat_session(chat_session);
 
-            task.id_slot = json_value(data, "id_slot", -1);
+            // a slot id names a slot of the first model
+            task.id_slot = to_copy ? -1 : json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -6502,6 +7000,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     }
 
     bool stream = json_value(data, "stream", false);
+    auto & rd = res->reader();
 
     if (!stream) {
         // non-stream, wait for the results
@@ -6606,7 +7105,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     return true;
                 }
 
-                server_response_reader & rd = res_this->rd;
+                server_response_reader & rd = res_this->reader();
 
                 // check if there is more data
                 if (!rd.has_next()) {
@@ -6697,6 +7196,9 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           ctx_server(*ctx_server.impl),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
+    if (!params.model_copy_devices.empty()) {
+        model_copy = std::make_shared<server_model_copy>(params);
+    }
     init_routes();
 
     // note: this must be registered before load_model()
@@ -7005,7 +7507,11 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            json props = get_res_props(*meta, params, false);
+            if (model_copy != nullptr) {
+                props["model_copy"] = model_copy->to_json();
+            }
+            res->ok(props);
         }
         return res;
     };

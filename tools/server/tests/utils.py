@@ -97,6 +97,13 @@ class ServerProcess:
     kv_fit_headroom: int | None = None
     kv_overflow_release: int | None = None
     kv_overflow_headroom: int | None = None
+    model_copy_device: str | None = None
+    model_copy_ctx_size: int | None = None
+    model_copy_parallel: int | None = None
+    model_copy_after: int | None = None
+    model_copy_release: int | None = None
+    model_copy_headroom: int | None = None
+    model_copy_draft: bool | None = None
     swa_full: bool | None = False
     server_slots: bool | None = False
     pooling: str | None = None
@@ -240,6 +247,20 @@ class ServerProcess:
             server_args.extend(["--kv-overflow-release", self.kv_overflow_release])
         if self.kv_overflow_headroom is not None:
             server_args.extend(["--kv-overflow-headroom", self.kv_overflow_headroom])
+        if self.model_copy_device:
+            server_args.extend(["--model-copy-device", self.model_copy_device])
+            if self.model_copy_ctx_size is not None:
+                server_args.extend(["--model-copy-ctx-size", self.model_copy_ctx_size])
+            if self.model_copy_parallel is not None:
+                server_args.extend(["--model-copy-parallel", self.model_copy_parallel])
+            if self.model_copy_after is not None:
+                server_args.extend(["--model-copy-after", self.model_copy_after])
+            if self.model_copy_release is not None:
+                server_args.extend(["--model-copy-release", self.model_copy_release])
+            if self.model_copy_headroom is not None:
+                server_args.extend(["--model-copy-headroom", self.model_copy_headroom])
+            if self.model_copy_draft is False:
+                server_args.append("--no-model-copy-draft")
         if self.swa_full:
             server_args.append("--swa-full")
         if self.server_slots:

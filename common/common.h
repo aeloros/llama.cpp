@@ -672,6 +672,15 @@ struct common_params {
     int32_t              kv_overflow_release = 60;     // fitting: seconds without a task in the added stream after which its memory goes back to the device; -1 = taken at startup and kept
     int32_t              kv_overflow_headroom = 1536;  // fitting: MiB that the device of the added stream has to have free, beyond the stream's own memory, for a task to go there; -1 = the device is not asked
     bool                 kv_overflow_keep_awake = true; // keep kv_overflow_device at full clocks while it is in use
+
+    // a second copy of the model, loaded on other devices while it has tasks
+    std::vector<ggml_backend_dev_t> model_copy_devices;    // devices of the copy, a list as devices; empty = no copy
+    int32_t              model_copy_n_ctx      = 0;        // KV cells of the copy, shared by its slots
+    int32_t              model_copy_n_parallel = 1;        // slots of the copy
+    int32_t              model_copy_after      = 1;        // tasks that the first model has before the next task goes to the copy
+    int32_t              model_copy_release    = 60;       // seconds without a task after which the copy is unloaded; -1 = it stays loaded
+    int32_t              model_copy_headroom   = 1024;     // MiB that the copy's devices have to have free beyond what the copy takes, for it to be loaded; -1 = the devices are not asked
+    bool                 model_copy_draft      = true;     // the copy drafts tokens as the first model does
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise

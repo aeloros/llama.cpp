@@ -1752,6 +1752,84 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OVERFLOW_KEEP_AWAKE").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--model-copy-device" }, "<dev1,dev2,..>",
+        "devices for a second copy of the model (default: no copy; 'none' = a copy that is not offloaded).\n"
+        "the copy is loaded when a task is sent to it and unloaded when it has been without a task for\n"
+        "--model-copy-release seconds. it has slots and KV cells of its own and computes at the same time as\n"
+        "the first model. a completion task goes to it when the first model has --model-copy-after tasks\n"
+        "already and the copy has a free slot and the KV cells for the task's prompt and output; every other\n"
+        "task goes to the first model.\n"
+        "needs --model-copy-ctx-size",
+        [](common_params & params, const std::string & value) {
+            params.model_copy_devices = parse_device_list(value);
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_DEVICE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--model-copy-ctx-size" }, "N",
+        "number of KV cells of the model copy, shared by its slots",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--model-copy-ctx-size must be positive");
+            }
+            params.model_copy_n_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_CTX_SIZE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--model-copy-parallel" }, "N",
+        string_format("number of slots of the model copy (default: %d)", params.model_copy_n_parallel),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("--model-copy-parallel must be positive");
+            }
+            params.model_copy_n_parallel = value;
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_PARALLEL").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--model-copy-after" }, "N",
+        string_format(
+            "a task goes to the model copy when the first model has N tasks already, at work or waiting\n"
+            "(default: %d). the tasks of the slots of --batch-priority-slots are not counted", params.model_copy_after),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--model-copy-after must not be negative");
+            }
+            params.model_copy_after = value;
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_AFTER").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--model-copy-release" }, "SECONDS",
+        string_format(
+            "the model copy is unloaded when it has been without a task for this long\n"
+            "(default: %d, -1 = it stays loaded)", params.model_copy_release),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--model-copy-release takes a number of seconds, or -1");
+            }
+            params.model_copy_release = value;
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_RELEASE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--model-copy-headroom" }, "MiB",
+        string_format(
+            "the model copy is loaded only when each of its devices has this much memory free on top of what\n"
+            "the copy takes there (default: %d, -1 = the devices are not asked)", params.model_copy_headroom),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--model-copy-headroom takes a number of MiB, or -1");
+            }
+            params.model_copy_headroom = value;
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_HEADROOM").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        { "--model-copy-draft" },
+        { "--no-model-copy-draft" },
+        "whether the model copy drafts tokens as the first model does (default: enabled).\n"
+        "without it the copy has no draft model and no draft context, which leaves its devices' memory to KV cells",
+        [](common_params & params, bool value) {
+            params.model_copy_draft = value;
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_DRAFT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

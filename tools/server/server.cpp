@@ -152,6 +152,12 @@ static bool server_prepare_params(common_params & params, server_role_type role_
             }
         }
 
+        // a second copy of the model on other devices
+        if (!params.model_copy_devices.empty() && params.model_copy_n_ctx <= 0) {
+            SRV_ERR("%s", "--model-copy-device needs --model-copy-ctx-size, the number of KV cells of the copy\n");
+            return false;
+        }
+
         // a second pool of KV cells on another device, for some of the slots
         if (params.kv_overflow_device != nullptr || params.kv_overflow_size > 0 || !params.kv_overflow_slots.empty()) {
             if (params.kv_overflow_device == nullptr || params.kv_overflow_size <= 0) {
