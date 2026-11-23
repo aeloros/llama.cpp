@@ -962,8 +962,10 @@ struct ggml_backend_cuda_buffer_context {
     ~ggml_backend_cuda_buffer_context() {
 #if defined(GGML_USE_VMM)
         if (lazy) {
+            // the owner has synchronized the backends that computed on the buffer; what this thread itself queued
+            // for it (set_tensor, clear) is waited for here
             ggml_cuda_set_device(device);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
             unmap(0, units.taken.size());
             CU_CHECK(cuMemAddressFree((CUdeviceptr) (uintptr_t) dev_ptr, lazy_size));
             return;
@@ -977,7 +979,7 @@ struct ggml_backend_cuda_buffer_context {
         return (CUdeviceptr) (uintptr_t) dev_ptr + u*units.unit;
     }
 
-    // unmap the units of [u0, u1) that are taken; the caller has synchronized the device
+    // unmap the units of [u0, u1) that are taken; no work that uses them is under way
     void unmap(size_t u0, size_t u1) {
         size_t r0 = 0;
         size_t r1 = u0;
@@ -1341,10 +1343,12 @@ static void ggml_backend_cuda_buffer_decommit(ggml_backend_buffer_t buffer, size
         return;
     }
 
-    // Nothing that is under way on the device may lose its memory: an unmap does not wait for it, and work that
-    // touches memory which is gone costs the process its CUDA context.
+    // Nothing that is under way may lose its memory: an unmap does not wait for it, and work that touches memory
+    // which is gone costs the process its CUDA context. The caller has synchronized the backends that compute on
+    // the buffer (their streams are theirs); what this thread itself queued for it is waited for here. Not the whole
+    // device: cudaDeviceSynchronize is refused while another thread captures a CUDA graph, and breaks that capture.
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 
     ctx->unmap(u0, u1);
 }

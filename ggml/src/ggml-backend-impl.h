@@ -83,7 +83,8 @@ extern "C" {
         // (optional) a lazy buffer has all four, and its `clear` covers the memory that is taken:
         //   commit:          take the memory of every unit that the range touches; false if it cannot be had, and then
         //                    nothing more is taken than before
-        //   decommit:        give back every unit that lies whole within the range, after the pending work of the backend
+        //   decommit:        give back every unit that lies whole within the range; the caller has synchronized the
+        //                    backends that compute on it
         //   get_committed:   the bytes taken
         //   get_commit_size: the bytes that a commit of the range would take on top
         bool         (*commit)         (ggml_backend_buffer_t buffer, size_t offset, size_t size);

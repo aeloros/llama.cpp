@@ -87,8 +87,10 @@ extern "C" {
     // if the memory cannot be had or the range is not within the buffer: nothing more is taken then than before.
     // A buffer that is not lazy has its memory: true.
     GGML_API bool   ggml_backend_buffer_commit     (ggml_backend_buffer_t buffer, size_t offset, size_t size);
-    // Give back every unit that lies whole within [offset, offset + size). The backend finishes its pending work on
-    // the device first, so nothing that is under way loses its memory.
+    // Give back every unit that lies whole within [offset, offset + size). No work that uses the range may be under
+    // way: the caller first synchronizes the backends that compute on tensors in the buffer
+    // (ggml_backend_synchronize). A backend may not wait for such work by itself, and work that touches memory which
+    // is gone can cost the process the device.
     GGML_API void   ggml_backend_buffer_decommit   (ggml_backend_buffer_t buffer, size_t offset, size_t size);
     // the bytes taken; the size of a buffer that is not lazy
     GGML_API size_t ggml_backend_buffer_committed  (ggml_backend_buffer_t buffer);

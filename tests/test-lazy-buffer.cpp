@@ -1,5 +1,6 @@
 // Lazy backend buffers: the address range is reserved when the buffer is allocated, and its memory is taken and given
-// back in ranges while tensors live in it (ggml_backend_buft_alloc_buffer_lazy).
+// back in ranges while tensors live in it (ggml_backend_buft_alloc_buffer_lazy). Before memory goes back, the backend
+// that computed on it is synchronized: that is the caller's part.
 //
 // usage: test-lazy-buffer [<device name> ...]
 // Every device is tried, and the CPU buffer type. A device that cannot make lazy buffers is skipped, unless it is
@@ -10,10 +11,12 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -232,6 +235,79 @@ static void test_buft(ggml_backend_buffer_type_t buft, ggml_backend_t backend, c
     }
 }
 
+// several threads, each with a lazy buffer of its own, take and give back memory at the same time: what one does
+// to its buffer must not reach the others (contexts on one device do this from their own threads)
+static void test_threads(ggml_backend_buffer_type_t buft, const char * name) {
+    const size_t unit = ggml_backend_buft_lazy_granularity(buft);
+    if (unit == 0) {
+        return;
+    }
+
+    const int    n_threads = 8;
+    const int    n_rounds  = 60;
+    const size_t n_units   = 32;
+
+    std::atomic<int> n_bad{0};
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < n_threads; t++) {
+        threads.emplace_back([&, t]() {
+            ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer_lazy(buft, n_units*unit));
+            if (!buf) {
+                n_bad++;
+                return;
+            }
+
+            ggml_init_params ip = { ggml_tensor_overhead()*4, nullptr, true };
+            ggml_context_ptr ctx(ggml_init(ip));
+
+            ggml_tensor * a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) (n_units*unit));
+            if (ggml_backend_tensor_alloc(buf.get(), a, ggml_backend_buffer_get_base(buf.get())) != GGML_STATUS_SUCCESS) {
+                n_bad++;
+                return;
+            }
+
+            const size_t n_data = std::min<size_t>(unit, 64*1024);
+
+            std::vector<uint8_t> data(n_data, (uint8_t) (t + 1));
+            std::vector<uint8_t> back(n_data);
+
+            for (int round = 0; round < n_rounds; round++) {
+                const size_t u = (size_t) ((round*7 + t*3) % (n_units - 2));
+
+                if (!ggml_backend_buffer_commit(buf.get(), u*unit, 2*unit)) {
+                    n_bad++;
+                    return;
+                }
+
+                ggml_backend_tensor_set(a, data.data(), u*unit + unit - n_data/2, n_data); // across two units
+                ggml_backend_tensor_get(a, back.data(), u*unit + unit - n_data/2, n_data);
+                if (memcmp(data.data(), back.data(), n_data) != 0) {
+                    n_bad++;
+                }
+
+                if (round % 3 == 0) {
+                    ggml_backend_buffer_clear(buf.get(), 0);
+                }
+                if (round % 2 == 0) {
+                    ggml_backend_buffer_decommit(buf.get(), u*unit, 2*unit);
+                }
+            }
+
+            ggml_backend_buffer_decommit(buf.get(), 0, n_units*unit);
+            if (ggml_backend_buffer_committed(buf.get()) != 0) {
+                n_bad++;
+            }
+        });
+    }
+    for (auto & th : threads) {
+        th.join();
+    }
+
+    printf("%s: %d threads with a lazy buffer each\n", name, n_threads);
+    CHECK(n_bad == 0);
+}
+
 int main(int argc, char ** argv) {
     std::vector<std::string> must;
     for (int i = 1; i < argc; i++) {
@@ -255,6 +331,7 @@ int main(int argc, char ** argv) {
         }
 
         test_buft(ggml_backend_dev_buffer_type(dev), backend.get(), name, is_must);
+        test_threads(ggml_backend_dev_buffer_type(dev), name);
     }
 
     for (const auto & m : must) {
