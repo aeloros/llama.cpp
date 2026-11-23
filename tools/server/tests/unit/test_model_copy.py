@@ -298,3 +298,185 @@ def test_the_copy_does_not_draft_with_no_model_copy_draft():
     assert res.status_code == 200
     assert the_copy()["n_tasks_total"] == 1
     assert res.body["timings"].get("draft_n", 0) == 0
+
+
+# A server with a multimodal projector: its prompts are lists of text tokens and media, and the copy has no projector.
+
+IMG_URL = "https://huggingface.co/ggml-org-dev/tinygemma3-GGUF/resolve/main/test/11_truck.png"
+
+
+def start_with_a_projector():
+    global server
+    server = ServerPreset.tinygemma3()
+    server.kv_unified = True
+    server.model_copy_device = DEVICE or "none"
+    server.model_copy_ctx_size = 1024
+    server.model_copy_parallel = 1
+    server.model_copy_after = 0
+    server.model_copy_release = 60
+    server.start()
+
+
+def test_a_text_task_of_a_server_with_a_projector_goes_to_the_copy():
+    start_with_a_projector()
+    for i in range(2):
+        res = server.make_request("POST", "/chat/completions", data={
+            "temperature": 0.0,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "What is the color of the sky?"}],
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["choices"][0]["message"]["content"] is not None
+        assert the_copy()["n_tasks_total"] == i + 1
+
+
+def test_a_task_with_an_image_stays_with_the_first_model():
+    import base64
+    import requests
+
+    try:
+        response = requests.get(IMG_URL, timeout=20)
+        response.raise_for_status()
+    except Exception as e:
+        pytest.skip("the test image could not be fetched: %s" % e)
+    image = "data:image/png;base64," + base64.b64encode(response.content).decode("utf-8")
+
+    start_with_a_projector()
+    res = server.make_request("POST", "/chat/completions", data={
+        "temperature": 0.0,
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "What is this:"},
+            {"type": "image_url", "image_url": {"url": image}},
+        ]}],
+    })
+    assert res.status_code == 200, res.body
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 0
+    assert copy["state"] == "unloaded"
+
+
+# The options of a server that keeps its model on a device, with a slot that comes first, quantized KV cells and a copy
+# of the model, and the requests that such a server gets, at once: streamed and not, with a slot id, text and images.
+
+def start_like_a_house_server(preset, more_args, cells="q4_0"):
+    global server
+    server = preset
+    server.n_slots = 4
+    server.n_ctx = 2048
+    server.n_batch = 512
+    server.n_gpu_layer = 999
+    server.kv_unified = True
+    server.no_cache_idle_slots = True
+    server.server_metrics = True
+    server.cache_ram = 512
+    server.ctk = cells
+    server.ctv = cells
+    server.fa = "on"
+    server.model_copy_device = DEVICE
+    server.model_copy_ctx_size = 2048
+    server.model_copy_parallel = 2
+    server.model_copy_after = 1
+    server.model_copy_release = 60
+    server.model_copy_headroom = 256
+    server.model_copy_draft = False
+    server.extra_args = [
+        "--device", DEVICE,
+        "--kv-unified-per-slot", "512,2048,2048,2048",
+        "--batch-priority-slots", "0",
+        "--batch-size-busy", "64",
+    ] + more_args
+    server.start()
+
+
+def requests_at_once(n_rounds, house_request):
+    """Six requests of coding clients and two of the house, n_rounds times; returns the ones that failed."""
+    text = "Tell me a long story about a cat and a dog who look for a red ball in the garden. " * 6
+    results = []
+    lock = threading.Lock()
+
+    def messages(i):
+        # the Anthropic endpoint, as a coding client uses it; every second one streamed
+        data = {
+            "model": "x",
+            "max_tokens": 96,
+            "messages": [{"role": "user", "content": text + " Part %d." % i}],
+            "id_slot": 1 + i % 3,
+        }
+        if i % 2 == 0:
+            res = server.make_request("POST", "/v1/messages", data=data)
+            ok = res.status_code == 200
+        else:
+            data["stream"] = True
+            ok = len(list(server.make_stream_request("POST", "/v1/messages", data=data))) > 0
+        with lock:
+            results.append(("messages %d" % i, ok))
+
+    def house(i):
+        res = server.make_request("POST", "/chat/completions", data=house_request)
+        with lock:
+            results.append(("house %d" % i, res.status_code == 200))
+
+    for _ in range(n_rounds):
+        threads = [threading.Thread(target=messages, args=(i,)) for i in range(6)]
+        threads += [threading.Thread(target=house, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    assert len(results) == 8 * n_rounds
+    return [r for r in results if not r[1]]
+
+
+@needs_device
+def test_a_server_with_a_projector_a_slot_that_comes_first_and_a_copy():
+    import base64
+    import requests
+
+    start_like_a_house_server(ServerPreset.tinygemma3(), ["--no-mmproj-offload"])
+
+    content = [{"type": "text", "text": "What is this:"}]
+    try:
+        response = requests.get(IMG_URL, timeout=20)
+        response.raise_for_status()
+        content.append({"type": "image_url", "image_url": {
+            "url": "data:image/png;base64," + base64.b64encode(response.content).decode("utf-8")}})
+    except Exception:
+        pass  # without the image the house's requests are text
+
+    failed = requests_at_once(3, {
+        "temperature": 0.0,
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": content}],
+        "id_slot": 0,
+    })
+    assert failed == []
+    assert server.make_request("GET", "/health").status_code == 200
+    copy = the_copy()
+    assert copy["n_tasks_total"] >= 1
+    assert copy["tasks"] == 0
+    assert copy["tasks_first"] == 0
+
+
+@needs_device
+def test_a_server_with_a_second_pool_a_slot_that_comes_first_and_a_copy():
+    start_like_a_house_server(ServerPreset.tinyllama2(), [
+        "--kv-overflow-device", DEVICE,
+        "--kv-overflow-size", "4096",
+        "--kv-overflow-release", "60",
+        "--kv-overflow-headroom", "256",
+    ], cells=None)  # the heads of this model are too small for quantized cells
+
+    failed = requests_at_once(3, {
+        "temperature": 0.0,
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "What is the color of the sky?"}],
+        "id_slot": 0,
+    })
+    assert failed == []
+    assert server.make_request("GET", "/health").status_code == 200
+    copy = the_copy()
+    assert copy["n_tasks_total"] >= 1
+    assert copy["tasks"] == 0
+    assert copy["tasks_first"] == 0

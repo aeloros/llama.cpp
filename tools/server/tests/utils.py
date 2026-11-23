@@ -104,6 +104,7 @@ class ServerProcess:
     model_copy_release: int | None = None
     model_copy_headroom: int | None = None
     model_copy_draft: bool | None = None
+    extra_args: list | None = None # more server arguments, as they are
     swa_full: bool | None = False
     server_slots: bool | None = False
     pooling: str | None = None
@@ -347,6 +348,8 @@ class ServerProcess:
             server_args.extend(["--override-kv", self.override_kv])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
+        if self.extra_args:
+            server_args.extend(self.extra_args)
         if self.ui_mcp_proxy:
             server_args.append("--ui-mcp-proxy")
         if self.media_allow_private_urls:

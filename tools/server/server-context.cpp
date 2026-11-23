@@ -6935,21 +6935,23 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             bool stays = type != SERVER_TASK_TYPE_COMPLETION || inputs.size() != 1;
             int32_t n_prompt  = 0;
             int32_t n_predict = -1;
+            llama_tokens tokens_text; // the prompt without its media: get_tokens() is not for a server with a projector
             if (!stays) {
                 tparams_first = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, data);
                 n_prompt  = (int32_t) inputs[0].size();
                 n_predict = tparams_first->n_predict;
-                // the copy gives a task one slot, and it has no multimodal context
-                const auto & tokens = inputs[0].get_tokens();
-                stays = tparams_first->n_cmpl > 1 || std::find(tokens.begin(), tokens.end(), LLAMA_TOKEN_NULL) != tokens.end();
+                // the copy gives a task one slot, and it has no multimodal context: a prompt with an image or audio
+                // stays here
+                tokens_text = inputs[0].get_text_tokens();
+                stays = tparams_first->n_cmpl > 1 || tokens_text.size() != inputs[0].size();
             }
             res->hold = model_copy->route(n_prompt, n_predict, json_value(data, "id_slot", -1), stays, to_copy);
             if (to_copy) {
                 res->rd_other = std::make_unique<server_response_reader>(
                         model_copy->queue_tasks(), model_copy->queue_results(), HTTP_POLLING_SECONDS);
                 if (inputs[0].has_mtmd) {
-                    // text tokens only, see above
-                    inputs[0] = server_tokens(llama_tokens(inputs[0].get_tokens()), false);
+                    // the copy takes the prompt as the list of text tokens that it is
+                    inputs[0] = server_tokens(tokens_text, false);
                 }
             }
         }
