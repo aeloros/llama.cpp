@@ -139,13 +139,18 @@ LLAMA_API bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_
 // Lazy sequence memory (llama_context_params::n_seq_budget)
 //
 // The cells of stream 0 and the rows of the recurrent state take their memory when sequences need it, and what they
-// hold together stays within a budget: what n_ctx cells and n_seq_budget rows take. The memory below the marks is
-// taken: a mark rises when a batch or a restored state needs cells or rows above it, and a batch that finds no
-// memory for them is refused like one that finds no cells. A mark falls when the sequences above it are removed.
+// hold together stays within a budget. The budget is what the same memory holds whole with n_seq_budget sequences,
+// less what the sequences beyond that number hold from the start (the small states of their rows): a context with
+// lazy memory holds no more of its device than one of n_seq_budget sequences without it. What is taken is counted in
+// the device's units, so a memory that is nearly full holds a little less than the whole one: up to one unit less
+// for each tensor. The memory below the marks is taken: a mark rises when a batch or a restored state needs cells
+// or rows above it, and a batch that finds no memory for them is refused like one that finds no cells. A mark falls
+// when the sequences above it are removed.
 
 struct llama_memory_lazy_info {
     size_t   budget        = 0; // bytes that cells and rows may take together
     size_t   taken         = 0; // bytes taken now
+    size_t   held          = 0; // bytes that the memory holds from the start beside them: the small states of every row
     uint32_t n_cells       = 0; // the cells of stream 0
     uint32_t n_cells_taken = 0; // the cell mark: the cells below it have their memory
     uint32_t n_cells_used  = 0; // those of them that sequences hold; the free ones below the mark are filled first

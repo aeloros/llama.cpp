@@ -161,8 +161,9 @@ public:
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
 
     // lazy memory
-    bool   lazy_info (llama_memory_lazy_info & info) const override;
-    size_t lazy_bytes(uint32_t n_cells, uint32_t n_rows) const override;
+    bool    lazy_info  (llama_memory_lazy_info & info) const override;
+    size_t  lazy_bytes (uint32_t n_cells, uint32_t n_rows) const override;
+    int64_t lazy_budget(uint32_t n_rows) const override;
     void   lazy_trim () override;
 
     // state write/load

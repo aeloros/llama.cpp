@@ -1634,6 +1634,22 @@ size_t llama_kv_cache::lazy_bytes(uint32_t n_cells, uint32_t n_rows) const {
     return llama_memory_lazy_size(lazy_ranges(0, std::min(get_size(0), (uint32_t) GGML_PAD(n_cells, LAZY_PAD))));
 }
 
+int64_t llama_kv_cache::lazy_budget(uint32_t n_rows) const {
+    GGML_UNUSED(n_rows);
+
+    if (!lazy) {
+        return 0;
+    }
+
+    // all the cells, as the tensors hold them
+    int64_t res = 0;
+    for (const auto & r : lazy_ranges(0, get_size(0))) {
+        res += (int64_t) r.size;
+    }
+
+    return res;
+}
+
 void llama_kv_cache::lazy_trim() {
     lazy_trim_cells(true);
 }

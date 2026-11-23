@@ -702,6 +702,12 @@ struct case_lazy_rows : ctx_test {
 
         const llama_pos n = 24;
 
+        // of the memory with a budget of four rows, for the one with a budget of one
+        size_t n_whole_4     = 0;
+        size_t n_row_lazy    = 0;
+        size_t n_row_held    = 0;
+        bool   is_least_of_4 = false;
+
         std::string why;
         std::vector<float> logits;
         std::vector<float> ref;
@@ -732,8 +738,14 @@ struct case_lazy_rows : ctx_test {
                 return case_result::skip("the recurrent state of this model has no rows that are lazy");
             }
             CTX_REQUIRE(info.n_rows == 4 && info.row_bytes > 0, "the recurrent state of a lazy memory is not lazy");
-            CTX_REQUIRE(info.budget == llama_memory_lazy_bytes(mem, info.n_cells, 4), "the budget is not what all the cells and four rows take");
+            CTX_REQUIRE(info.budget > 0 && info.budget <= llama_memory_lazy_bytes(mem, info.n_cells, 4), "the budget is more than all the cells and four rows take");
             CTX_REQUIRE(consistent(mem, 0, why), "before any sequence: " + why);
+
+            // what a memory of four sequences holds in all: its budget and what it holds from the start
+            n_whole_4     = info.budget + info.held;
+            n_row_lazy    = info.row_bytes;
+            n_row_held    = info.held / 4;
+            is_least_of_4 = info.budget == llama_memory_lazy_bytes(mem, info.n_cells > 0 ? 1 : 0, 1);
 
             for (llama_seq_id s = 0; s < 3; ++s) {
                 CTX_REQUIRE(decode_n(ctx.get(),     s, 0, n, logits), "failed to decode seq " + std::to_string(s));
@@ -892,7 +904,17 @@ struct case_lazy_rows : ctx_test {
 
             llama_memory_lazy_info info;
             CTX_REQUIRE(llama_memory_get_lazy_info(mem, &info), "the context with a budget of one row says that it is not lazy");
-            CTX_REQUIRE(info.budget == llama_memory_lazy_bytes(mem, info.n_cells, 1), "the budget is not what all the cells and one row take");
+            CTX_REQUIRE(info.budget > 0 && info.budget <= llama_memory_lazy_bytes(mem, info.n_cells, 1), "the budget is more than all the cells and one row take");
+
+            // The memory holds no more than a whole one of one sequence would: three rows less than the whole one of
+            // four, their lazy parts and what they hold from the start. (Unless one of the two budgets is the least
+            // that the device's units allow, as with a small model on a GPU.)
+            const bool is_least = info.budget == llama_memory_lazy_bytes(mem, info.n_cells > 0 ? 1 : 0, 1);
+            if (!is_least && !is_least_of_4) {
+                CTX_REQUIRE(info.budget + info.held == n_whole_4 - 3*(n_row_lazy + n_row_held),
+                        "with three slots beyond its budget the memory may hold " + std::to_string(info.budget + info.held) +
+                        " bytes, and a whole memory of one sequence holds " + std::to_string(n_whole_4 - 3*(n_row_lazy + n_row_held)));
+            }
 
             // seq 0 grows until a second sequence would not find the memory of its row, or the cells are nearly used up
             const llama_pos n_new = 16;

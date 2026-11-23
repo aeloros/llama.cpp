@@ -557,7 +557,14 @@ llama_context::llama_context(
                         "(kv_unified), a memory type with plain or recurrent state, and one device that can reserve memory)");
             }
 
-            memory_lazy.budget = memory->lazy_bytes(info.n_cells, std::min(cparams.n_seq_budget, info.n_rows));
+            // What the memory may take: what it would hold whole with n_seq_budget sequences, less what the rows
+            // beyond them hold from the start, so that the context holds no more of its device than without lazy
+            // memory. Where the device's units are coarser than that (a small model on a GPU), at least the units of
+            // one step of cells and one row.
+            const int64_t n_whole = memory->lazy_budget(std::min(cparams.n_seq_budget, info.n_rows));
+            const size_t  n_least = memory->lazy_bytes(info.n_cells > 0 ? 1 : 0, info.n_rows > 0 ? 1 : 0);
+
+            memory_lazy.budget = (size_t) std::max<int64_t>(n_whole, (int64_t) n_least);
 
             LLAMA_LOG_INFO("%s: lazy memory: %u cells of %zu bytes and %u rows of %.2f MiB take their memory when sequences need it, %.2f MiB at most\n",
                     __func__, info.n_cells, info.cell_bytes, info.n_rows, info.row_bytes/1024.0/1024.0, memory_lazy.budget/1024.0/1024.0);

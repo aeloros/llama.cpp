@@ -196,46 +196,64 @@ def test_the_answers_of_a_model_with_state_are_those_of_a_server_with_all_its_me
     assert answers[1][0] == answers[1][2]
 
 
-@needs_hybrid
-def test_the_row_of_a_slot_beyond_parallel_takes_its_memory_from_the_cells():
-    # 4096 cells and the memory of one row. A task of 3601 cells is at work. A second one of 389 cells would fit
-    # beside it by its cells, 3990 in all, but its row takes what 128 cells take: it waits for the first to end.
-    start_hybrid(1, 3)
+# What the memory of the dummy model may take, in cells (a cell is 1024 bytes): the cells of -c and a row of 128 for
+# each slot that is set aside, less what the small states of the slots beyond those hold from the start, 10 a slot.
+# The cells that can have memory beside n_rows rows: what is left, in the steps of 256 that the cell mark moves in.
+def cells_beside(n_ctx, n_set_aside, n_slots, n_rows):
+    budget = n_ctx + ROW_CELLS * n_set_aside - 10 * (n_slots - n_set_aside)
+    return min(n_ctx, (budget - ROW_CELLS * n_rows) // 256 * 256)
 
-    t_long, out_long = in_background({"prompt": ids(100, 1), "n_predict": 3500, "ignore_eos": True, "cache_prompt": False})
-    wait_fast("the long task is at work", lambda: n_at_work() == 1)
 
-    t_short, out_short = in_background({"prompt": ids(380, 2), "n_predict": 8, "ignore_eos": True, "cache_prompt": False})
+def run_two_long_and_third(n_predict_a, n_predict_b, n_predict_c, n_prompt_c=292):
+    """Two long tasks, and a third as soon as both are at work. Returns the three results, the most slots seen at
+    work at once, and whether a slot was seen at work in the second pool."""
+    t_a, out_a = in_background({"prompt": ids(100, 1), "n_predict": n_predict_a, "ignore_eos": True, "cache_prompt": False})
+    t_b, out_b = in_background({"prompt": ids(100, 2), "n_predict": n_predict_b, "ignore_eos": True, "cache_prompt": False})
+    wait_fast("the two long tasks are at work", lambda: n_at_work() == 2)
+
+    t_c, out_c = in_background({"prompt": ids(n_prompt_c, 3), "n_predict": n_predict_c, "ignore_eos": True, "cache_prompt": False})
 
     seen = 0
-    while t_long.is_alive():
-        seen = max(seen, n_at_work())
-    t_long.join()
-    t_short.join()
+    seen_second_pool = False
+    while t_a.is_alive() or t_b.is_alive() or t_c.is_alive():
+        at_work = [s for s in slots() if s["is_processing"]]
+        seen = max(seen, len(at_work))
+        seen_second_pool = seen_second_pool or any(s["kv_overflow"] for s in at_work)
+    for t in (t_a, t_b, t_c):
+        t.join()
 
-    assert out_long["res"].status_code == 200, out_long["res"].body
-    assert out_short["res"].status_code == 200, out_short["res"].body
-    assert out_long["res"].body["tokens_predicted"] == 3500
-    assert out_short["res"].body["tokens_predicted"] == 8
-    assert seen == 1
-    assert out_short["t_end"] >= out_long["t_end"]
+    for out, n_predict in ((out_a, n_predict_a), (out_b, n_predict_b), (out_c, n_predict_c)):
+        assert out["res"].status_code == 200, out["res"].body
+        assert out["res"].body["tokens_predicted"] == n_predict
+        assert not out["res"].body["truncated"]
+
+    return out_a, out_b, out_c, seen, seen_second_pool
+
+
+@needs_hybrid
+def test_the_row_of_a_slot_beyond_parallel_takes_its_memory_from_the_cells():
+    # 4096 cells and the memory of one row. Two tasks of 2001 and 1501 cells are at work. A third of 301 cells fits
+    # beside them by its cells, 3803 in all, where two rows leave 3840. Its row is the third: beside three rows 3584
+    # cells can have their memory, so it waits for one of the two to end.
+    assert cells_beside(4096, 1, 3, 2) == 3840 and cells_beside(4096, 1, 3, 3) == 3584
+    start_hybrid(1, 3)
+
+    out_a, out_b, out_c, seen, _ = run_two_long_and_third(1900, 1400, 8)
+
+    assert seen == 2
+    assert out_c["t_end"] >= min(out_a["t_end"], out_b["t_end"])
 
 
 @needs_hybrid
 def test_two_rows_that_are_set_aside_leave_the_cells_to_the_tasks():
-    # the same two tasks with the memory of two rows set aside: both rows are there, and 3990 cells fit in 4096
+    # the same three tasks with the memory of two rows set aside: beside three rows 3840 cells can have their
+    # memory, and the third task is at work with the two others
+    assert cells_beside(4096, 2, 3, 3) == 3840
     start_hybrid(2, 3)
 
-    t_long, out_long = in_background({"prompt": ids(100, 1), "n_predict": 3500, "ignore_eos": True, "cache_prompt": False})
-    wait_fast("the long task is at work", lambda: n_at_work() == 1)
+    out_a, out_b, out_c, _, _ = run_two_long_and_third(1900, 1400, 8)
 
-    t_short, out_short = in_background({"prompt": ids(380, 2), "n_predict": 8, "ignore_eos": True, "cache_prompt": False})
-    t_short.join()
-    assert out_short["res"].status_code == 200, out_short["res"].body
-    assert t_long.is_alive(), "the long task ended before the short one: nothing was shown"
-
-    t_long.join()
-    assert out_long["res"].status_code == 200, out_long["res"].body
+    assert out_c["t_end"] < min(out_a["t_end"], out_b["t_end"]), "the third task waited for one of the long ones to end"
 
 
 @needs_hybrid
@@ -273,10 +291,11 @@ def test_an_idle_slot_gives_up_its_row_and_its_cells_for_a_task():
 
 @needs_hybrid
 def test_the_rows_of_idle_slots_are_room_for_a_task():
-    # 1024 cells and the memory of one row. Two small conversations stay in their slots, with a row each, the second
-    # of them out of the cells. A task of 959 cells fits when both give up what they hold: one row is left, its own,
-    # and all the cells. It is not told that 896 cells are all there is.
-    start_hybrid(1, 3, n_ctx=1024)
+    # 2048 cells and the memory of one row. Two small conversations stay in their slots, with a row each, the second
+    # of them out of the cells. A task of 1659 cells fits when both give up what they hold: one row is left, its
+    # own, and 1792 cells beside it. With the rows of the two it would be the third, and 1536 cells would be all.
+    assert cells_beside(2048, 1, 3, 1) == 1792 and cells_beside(2048, 1, 3, 3) == 1536
+    start_hybrid(1, 3, n_ctx=2048)
 
     for i in (1, 2):
         res = server.make_request("POST", "/completion", data={
@@ -285,11 +304,11 @@ def test_the_rows_of_idle_slots_are_room_for_a_task():
     assert len([s for s in slots() if s.get("n_prompt_tokens", 0) > 0]) == 2
 
     res = server.make_request("POST", "/completion", data={
-        "prompt": ids(950, 3), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True})
+        "prompt": ids(1650, 3), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True})
     assert res.status_code == 200, res.body
     assert res.body["tokens_predicted"] == 8
     assert not res.body["truncated"]
-    assert res.body["timings"]["prompt_n"] == 950
+    assert res.body["timings"]["prompt_n"] == 1650
 
 
 @needs_hybrid
@@ -299,6 +318,7 @@ def test_a_task_starts_beside_another_when_the_rows_of_idle_slots_are_its_room()
     # moves in steps of 256). A task of 409 cells does not fit beside that. It does when idle slots give up their
     # rows: with the two rows of the tasks 3840 cells can have their memory, 539 beside the long task. So it starts
     # at once; it does not wait for the long task to end.
+    assert cells_beside(4096, 1, 5, 4) == 3584 and cells_beside(4096, 1, 5, 2) == 3840
     start_hybrid(1, 5, n_ctx=4096)
 
     for i in (1, 2, 3):
@@ -327,15 +347,16 @@ def test_a_task_starts_beside_another_when_the_rows_of_idle_slots_are_its_room()
 
 @needs_hybrid
 def test_a_conversation_in_a_high_row_does_not_keep_the_memory_of_the_rows_below_it():
-    # 1024 cells and the memory of two rows. Slot 0 comes first, has 256 cells kept, and is never asked to give up
-    # what it holds. Its conversation of 248 cells is the third to start, so its state is in the third row. Then the
-    # two before it give up their rows for a task of 709 cells. With the state of slot 0 moved down, two rows hold
-    # memory, its own and the task's, which is what is set aside: all the cells can have theirs, 256 for slot 0 and
-    # 768 for the task. If the two rows below slot 0's kept their memory, three rows would hold it and 896 cells
-    # could: 640 for the task, which would not fit.
-    start_hybrid(2, 4, n_ctx=1024, more_args=["--kv-unified-per-slot", "256,1024", "--batch-priority-slots", "0"])
+    # 2048 cells and the memory of two rows. Slot 0 comes first, has 256 cells kept, and is never asked to give up
+    # what it holds. Its conversation of 248 cells is the fourth to start, so its state is in the fourth row. Then
+    # the first two give up their rows for a task of 1409 cells; the third keeps its own. With the states moved down,
+    # three rows hold memory, and 1792 cells can have theirs: 256 for slot 0, 68 for the third conversation, and
+    # 1468 for the task. If the rows below slot 0's kept their memory, four rows would hold it and 1536 cells
+    # could: 1212 for the task, which would not fit.
+    assert cells_beside(2048, 2, 5, 3) == 1792 and cells_beside(2048, 2, 5, 4) == 1536
+    start_hybrid(2, 5, n_ctx=2048, more_args=["--kv-unified-per-slot", "256,2048", "--batch-priority-slots", "0"])
 
-    for i in (1, 2):
+    for i in (1, 2, 3):
         res = server.make_request("POST", "/completion", data={
             "prompt": ids(60, i), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True, "id_slot": i})
         assert res.status_code == 200, res.body
@@ -345,10 +366,10 @@ def test_a_conversation_in_a_high_row_does_not_keep_the_memory_of_the_rows_below
     assert res.status_code == 200, res.body
     assert res.body["id_slot"] == 0
     house_answer = res.body["content"]
-    assert len([s for s in slots() if s.get("n_prompt_tokens", 0) > 0]) == 3
+    assert len([s for s in slots() if s.get("n_prompt_tokens", 0) > 0]) == 4
 
     res = server.make_request("POST", "/completion", data={
-        "prompt": ids(700, 3), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True, "id_slot": 3})
+        "prompt": ids(1400, 5), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True, "id_slot": 4})
     assert res.status_code == 200, res.body
     assert res.body["tokens_predicted"] == 8
     assert not res.body["truncated"]
@@ -426,30 +447,6 @@ def test_a_slot_that_comes_first_has_its_row_and_its_cells_kept():
 # With a second pool of KV cells (--kv-overflow-device) a task that does not fit in the first pool goes whole to the
 # second. Its row stays in the first pool, where the state of every slot is.
 
-def run_long_and_second(n_predict_long, n_predict_second):
-    """A long task, and a second one as soon as the long one is at work. Returns both results, the most slots seen
-    at work at once, and whether a slot was seen at work in the second pool."""
-    t_long, out_long = in_background({"prompt": ids(100, 1), "n_predict": n_predict_long, "ignore_eos": True, "cache_prompt": False})
-    wait_fast("the long task is at work", lambda: n_at_work() == 1)
-
-    t_second, out_second = in_background({"prompt": ids(380, 2), "n_predict": n_predict_second, "ignore_eos": True, "cache_prompt": False})
-
-    seen = 0
-    seen_second_pool = False
-    while t_long.is_alive() or t_second.is_alive():
-        at_work = [s for s in slots() if s["is_processing"]]
-        seen = max(seen, len(at_work))
-        seen_second_pool = seen_second_pool or any(s["kv_overflow"] for s in at_work)
-    t_long.join()
-    t_second.join()
-
-    for out, n_predict in ((out_long, n_predict_long), (out_second, n_predict_second)):
-        assert out["res"].status_code == 200, out["res"].body
-        assert out["res"].body["tokens_predicted"] == n_predict
-
-    return out_long, out_second, seen, seen_second_pool
-
-
 @needs_second_pool
 def test_a_task_that_does_not_fit_in_the_first_pool_goes_to_the_second():
     # 2560 cells in each pool, the first on a GPU where the server has one. Two tasks of more than 1800 cells do not
@@ -478,28 +475,31 @@ def test_a_task_that_does_not_fit_in_the_first_pool_goes_to_the_second():
 @needs_hybrid
 @needs_second_pool
 def test_a_task_in_the_second_pool_has_its_row_in_the_first():
-    # 4096 cells in each pool and the memory of one row. A task of 3601 cells is at work in the first pool. A second
-    # one of 1381 cells goes to the second pool, and its row takes what 128 cells take in the first, where 495 are
-    # left: both are at work at once.
+    # 4096 cells in each pool and the memory of one row. Two tasks of 2001 and 1501 cells are at work in the first
+    # pool. A third of 1381 cells goes to the second pool. Its row is in the first, the third there: beside three
+    # rows 3584 cells can have their memory, and the two tasks have 3502. All three are at work at once.
+    assert cells_beside(4096, 1, 3, 3) == 3584
     start_hybrid(1, 3, second_pool=4096)
 
-    _, _, seen, seen_second_pool = run_long_and_second(3500, 1000)
+    _, _, _, seen, seen_second_pool = run_two_long_and_third(1900, 1400, 1000, n_prompt_c=380)
 
-    assert seen == 2
+    assert seen == 3
     assert seen_second_pool
 
 
 @needs_hybrid
 @needs_second_pool
 def test_a_task_waits_for_its_row_although_the_second_pool_has_the_cells():
-    # the same with a first task of 4000 cells: 96 are left in the first pool, less than a row takes. The second
-    # task waits for the first to end, with all of the second pool free.
+    # the same with tasks of 2201 and 1501 cells in the first pool, 3702 of the 3840 that two rows leave. Beside a
+    # third row 3584 can have their memory: there is none for the row of a third task. It waits for one of the two
+    # to end, with all of the second pool free.
+    assert cells_beside(4096, 1, 3, 2) == 3840 and cells_beside(4096, 1, 3, 3) == 3584
     start_hybrid(1, 3, second_pool=4096)
 
-    out_long, out_second, seen, _ = run_long_and_second(3899, 1000)
+    out_a, out_b, out_c, seen, _ = run_two_long_and_third(2100, 1400, 1000, n_prompt_c=380)
 
-    assert seen == 1
-    assert out_second["t_end"] >= out_long["t_end"]
+    assert seen == 2
+    assert out_c["t_end"] >= min(out_a["t_end"], out_b["t_end"])
 
 
 @needs_hybrid

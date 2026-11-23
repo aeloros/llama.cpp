@@ -1012,7 +1012,36 @@ bool llama_memory_recurrent::lazy_info(llama_memory_lazy_info & info) const {
         info.row_bytes += r.size;
     }
 
+    // the small states of every row are held from the start
+    info.held += size_r_bytes() + size_p_bytes();
+
     return true;
+}
+
+int64_t llama_memory_recurrent::lazy_budget(uint32_t n_rows) const {
+    if (!lazy) {
+        return 0;
+    }
+
+    n_rows = std::min(n_rows, size);
+
+    // the lazy part of n_rows rows, as the tensors hold it
+    int64_t res = 0;
+    for (const auto & r : lazy_ranges(0, n_rows)) {
+        res += (int64_t) r.size;
+    }
+
+    // less what the rows beyond them hold from the start, in every rollback group: a memory that is whole with
+    // n_rows sequences does not have those
+    for (const auto * tensors : { &r_l, &p_l }) {
+        for (const ggml_tensor * t : *tensors) {
+            if (t != nullptr) {
+                res -= (int64_t) ((size_t) (1 + n_rs_seq)*(size - n_rows)*t->nb[1]);
+            }
+        }
+    }
+
+    return res;
 }
 
 size_t llama_memory_recurrent::lazy_bytes(uint32_t n_cells, uint32_t n_rows) const {

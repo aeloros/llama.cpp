@@ -246,6 +246,15 @@ struct llama_memory_i {
         return 0;
     }
 
+    // What the lazy part may take so that the memory holds no more than it would hold whole with n_rows sequences:
+    // the bytes of all the cells and of n_rows rows, as tensors and not in the device's units, less what the rows
+    // beyond n_rows hold from the start (the parts of a row that are not lazy). Can be negative for a part of a
+    // memory; the context adds the parts up.
+    virtual int64_t lazy_budget(uint32_t n_rows) const {
+        GGML_UNUSED(n_rows);
+        return 0;
+    }
+
     // give back the memory above the cells and rows that are in use
     virtual void lazy_trim() {
     }

@@ -304,6 +304,10 @@ size_t llama_memory_hybrid::lazy_bytes(uint32_t n_cells, uint32_t n_rows) const 
     return mem_attn->lazy_bytes(n_cells, n_rows) + mem_recr->lazy_bytes(n_cells, n_rows);
 }
 
+int64_t llama_memory_hybrid::lazy_budget(uint32_t n_rows) const {
+    return mem_attn->lazy_budget(n_rows) + mem_recr->lazy_budget(n_rows);
+}
+
 void llama_memory_hybrid::lazy_trim() {
     mem_attn->lazy_trim();
     mem_recr->lazy_trim();
