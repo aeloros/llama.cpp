@@ -2466,10 +2466,13 @@ private:
             return true;
         }
 
-        SRV_WRN("the second pool of KV cells gets no task for now: %s has %zu MiB free, %zu MiB of them claimed by a model copy "
-                "that is being loaded, and a task there needs %zu MiB free (%zu MiB for the pool's cells, %d MiB of headroom)\n",
-                ggml_backend_dev_name(params_base.kv_overflow_device), free / 1024 / 1024,
-                server_device_claims::claimed(params_base.kv_overflow_device) / 1024 / 1024, n_need / 1024 / 1024,
+        const size_t n_others = server_device_claims::claimed(params_base.kv_overflow_device);
+        const std::string others = n_others == 0 ? "" :
+            string_format(", %zu MiB of them claimed by a model copy that is being loaded", n_others / 1024 / 1024);
+
+        SRV_WRN("the second pool of KV cells gets no task for now: %s has %zu MiB free%s, and a task there needs %zu MiB free "
+                "(%zu MiB for the pool's cells, %d MiB of headroom)\n",
+                ggml_backend_dev_name(params_base.kv_overflow_device), free / 1024 / 1024, others.c_str(), n_need / 1024 / 1024,
                 n_pool / 1024 / 1024, params_base.kv_overflow_headroom);
 
         return false;
@@ -7035,10 +7038,11 @@ private:
                 const size_t free = device_free(n.dev);
                 free_before.push_back(free);
                 if (!server_device_claims::claim(n.dev, free, n.bytes + (size_t) n_headroom * MiB, n.bytes)) {
-                    why = string_format("%s has %zu MiB free, %zu MiB of them claimed by a second pool of KV cells that is "
-                            "taking its memory, and the copy takes %zu MiB with %d MiB to stay free",
-                            ggml_backend_dev_name(n.dev), free == SIZE_MAX ? 0 : free / MiB,
-                            server_device_claims::claimed(n.dev) / MiB, n.bytes / MiB, n_headroom);
+                    const size_t n_others = server_device_claims::claimed(n.dev);
+                    const std::string others = n_others == 0 ? "" :
+                        string_format(", %zu MiB of them claimed by a second pool of KV cells that is taking its memory", n_others / MiB);
+                    why = string_format("%s has %zu MiB free%s, and the copy takes %zu MiB with %d MiB to stay free",
+                            ggml_backend_dev_name(n.dev), free == SIZE_MAX ? 0 : free / MiB, others.c_str(), n.bytes / MiB, n_headroom);
                     return LOAD_NO_MEMORY;
                 }
                 claims.held.push_back(n);
