@@ -5,16 +5,25 @@
 // usage: test-lazy-buffer [<device name> ...]
 // Every device is tried, and the CPU buffer type. A device that cannot make lazy buffers is skipped, unless it is
 // named on the command line: then it has to.
+//
+// usage: test-lazy-buffer --reads <device of A> <device of B> [key=value ...]
+// Two threads read the tensors of a state each, at the same time (run_reads). Not part of the run without arguments.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,6 +34,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 static int n_fail = 0;
@@ -365,7 +375,395 @@ static void test_copy_after(ggml_backend_dev_t dev, ggml_backend_dev_t other) {
     printf("%s: a copy inside a buffer after the thread used %s\n", ggml_backend_dev_name(dev), ggml_backend_dev_name(other));
 }
 
+// Two threads read many tensors each to host memory with one call each, at the same time: two contexts of one process
+// do that when each saves the state of a sequence (a server with a copy of its model on a second GPU). The tensors of
+// a side are those of such a state: a few large ranges (the cells of a sequence in every layer), many of a few MiB and
+// many small ones (the states of a recurrent memory).
+//   lazy=a|b|ab|none     whose buffer is lazy, every unit of it a mapping of its own (a)
+//   rounds=N             (40)
+//   span=MS step=MS      B starts up to span ms after A, step ms more each round; every fourth round A after B (450, 37)
+//   free-a=MIB free-b=   fill the device until this much of it is free beside the buffer of the side (no fill)
+//   big-a=NxMIB mid-a=NxMIB small-a=NxBYTES, and the same with -b: the tensors of a side
+//   solo=1               only A reads
+//   margin=MIB           for the time of a read the process may commit this much more than it has (Windows; no limit)
+// Each round prints what the process had committed before A's read, and how much more at most during it.
+
+// what the process has committed, 0 where the system cannot be asked
+static size_t reads_committed() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc = {};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pmc, sizeof(pmc))) {
+        return 0;
+    }
+    return pmc.PrivateUsage;
+#else
+    return 0;
+#endif
+}
+
+// The process may commit this many bytes at most, 0 for no limit: a job object of its own, so that the limit is this
+// process's and the rest of the system keeps what it has. False where that cannot be done.
+static bool reads_commit_limit(size_t bytes) {
+#ifdef _WIN32
+    static std::mutex mutex;
+    static HANDLE     job = nullptr;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (!job) {
+        job = CreateJobObjectW(nullptr, nullptr);
+        if (!job || !AssignProcessToJobObject(job, GetCurrentProcess())) {
+            return false;
+        }
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = {};
+    if (bytes > 0) {
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        info.ProcessMemoryLimit               = bytes;
+    }
+    return SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, sizeof(info)) != 0;
+#else
+    (void) bytes;
+    return false;
+#endif
+}
+
+static std::atomic<size_t> reads_commit_max{0};
+static std::atomic<bool>   reads_sampling{false};
+static size_t              reads_margin_mib = 0;
+
+// the most that the process has committed since reads_commit_max was set
+static void reads_sampler() {
+    while (reads_sampling) {
+        const size_t c = reads_committed();
+        size_t m = reads_commit_max.load();
+        while (c > m && !reads_commit_max.compare_exchange_weak(m, c)) {
+        }
+        std::this_thread::yield();
+    }
+}
+
+struct reads_side {
+    const char *       tag      = "";
+    ggml_backend_dev_t dev      = nullptr;
+    bool               lazy     = false;
+    bool               active   = true;
+    size_t             free_mib = 0;
+    size_t             n[3]     = { 32, 144, 144 };
+    size_t             size[3]  = { 40*MiB, 3*MiB, 120*1000 };
+};
+
+struct reads_shared {
+    std::mutex              mutex;
+    std::condition_variable cv;
+    int                     round   = -1; // the round that may start
+    int                     n_ready = 0;  // sides that are set up
+    int                     n_done  = 0;  // reads that have ended
+    std::atomic<int>        n_bad{0};
+};
+
+static uint8_t reads_value(size_t i) {
+    return (uint8_t) (i*37 + 11);
+}
+
+static long long reads_ms(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// the delay of a side in a round
+static int reads_delay(int r, int span_ms, int step_ms, bool is_b) {
+    const int  d      = span_ms > 0 ? (r*step_ms) % (span_ms + 1) : 0;
+    const bool b_late = r % 4 != 3;
+    return is_b == b_late ? d : 0;
+}
+
+static void reads_worker(const reads_side & side, bool is_b, reads_shared & sh, int n_rounds, int span_ms, int step_ms,
+                         std::vector<std::array<long long, 4>> & times) {
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(side.dev);
+
+    std::vector<size_t> full; // the size of every tensor
+    for (int k = 0; k < 3; k++) {
+        for (size_t i = 0; i < side.n[k]; i++) {
+            full.push_back(side.size[k]);
+        }
+    }
+
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+
+    std::vector<size_t> at; // where every tensor starts in the buffer
+    size_t size_buf = 0;
+    for (const size_t s : full) {
+        at.push_back(size_buf);
+        size_buf += GGML_PAD(s, align);
+    }
+
+    ggml_backend_buffer_ptr fill;
+    if (side.free_mib > 0) {
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(side.dev, &free, &total);
+        const size_t keep = side.free_mib*MiB + size_buf;
+        if (free > keep + 64*MiB) {
+            fill.reset(ggml_backend_buft_alloc_buffer(buft, free - keep));
+        }
+        printf("%s: %s had %zu MiB free, %zu MiB of it are filled\n", side.tag, ggml_backend_dev_name(side.dev),
+               free/MiB, fill ? (free - keep)/MiB : (size_t) 0);
+    }
+
+    ggml_backend_buffer_ptr buf(side.lazy ? ggml_backend_buft_alloc_buffer_lazy(buft, size_buf)
+                                          : ggml_backend_buft_alloc_buffer(buft, size_buf));
+    if (!buf || (side.lazy && !ggml_backend_buffer_commit(buf.get(), 0, size_buf))) {
+        printf("%s: FAILED: no buffer of %zu MiB on %s\n", side.tag, size_buf/MiB, ggml_backend_dev_name(side.dev));
+        fflush(stdout);
+        exit(1);
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead()*(full.size() + 1), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+
+    char * base = (char *) ggml_backend_buffer_get_base(buf.get());
+
+    // every tensor is read without its first and last 64 bytes, so that no range starts where a unit does
+    std::vector<const ggml_tensor *> tensors;
+    std::vector<size_t> offsets;
+    std::vector<size_t> sizes;
+    std::vector<size_t> data_offsets;
+    size_t size_host = 0;
+    {
+        std::vector<uint8_t> pattern(*std::max_element(full.begin(), full.end()));
+        for (size_t i = 0; i < full.size(); i++) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) full[i]);
+            if (ggml_backend_tensor_alloc(buf.get(), t, base + at[i]) != GGML_STATUS_SUCCESS) {
+                printf("%s: FAILED: tensor %zu has no place\n", side.tag, i);
+                fflush(stdout);
+                exit(1);
+            }
+            memset(pattern.data(), reads_value(i), full[i]);
+            ggml_backend_tensor_set(t, pattern.data(), 0, full[i]);
+
+            tensors.push_back(t);
+            offsets.push_back(64);
+            sizes.push_back(full[i] - 128);
+            data_offsets.push_back(size_host);
+            size_host += full[i] - 128;
+        }
+    }
+
+    {
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(side.dev, &free, &total);
+        printf("%s: %zu tensors, %zu MiB in a %s buffer on %s, which has %zu MiB free now\n", side.tag, tensors.size(),
+               size_host/MiB, side.lazy ? "lazy" : "whole", ggml_backend_dev_name(side.dev), free/MiB);
+        fflush(stdout);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(sh.mutex);
+        sh.n_ready++;
+    }
+    sh.cv.notify_all();
+
+    for (int r = 0; r < n_rounds; r++) {
+        {
+            std::unique_lock<std::mutex> lock(sh.mutex);
+            sh.cv.wait(lock, [&]() { return sh.round >= r; });
+        }
+
+        const int d = reads_delay(r, span_ms, step_ms, is_b);
+        if (d > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(d));
+        }
+
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<uint8_t> host(size_host); // new memory, zeroed, as a server takes it for a state
+        const long long ms_host = reads_ms(t0);
+
+        const size_t committed = reads_committed();
+        if (!is_b) {
+            reads_commit_max = committed;
+        }
+        if (reads_margin_mib > 0 && !reads_commit_limit(committed + reads_margin_mib*MiB)) {
+            printf("%s: FAILED: the process cannot be limited\n", side.tag);
+            fflush(stdout);
+            exit(1);
+        }
+
+        const auto t1 = std::chrono::steady_clock::now();
+        ggml_backend_tensor_get_n(tensors.data(), host.data(), offsets.data(), sizes.data(), data_offsets.data(), tensors.size());
+        const long long ms_read = reads_ms(t1);
+
+        if (reads_margin_mib > 0) {
+            reads_commit_limit(0);
+        }
+        const size_t committed_max = std::max(reads_commit_max.load(), reads_committed());
+
+        for (size_t i = 0; i < tensors.size(); i++) {
+            const uint8_t * p = host.data() + data_offsets[i];
+            const uint8_t   v = reads_value(i);
+            if (p[0] != v || p[sizes[i]/2] != v || p[sizes[i] - 1] != v) {
+                sh.n_bad++;
+            }
+        }
+
+        times[r] = { ms_host, ms_read, (long long) (committed/MiB), (long long) ((committed_max - committed)/MiB) };
+
+        {
+            std::lock_guard<std::mutex> lock(sh.mutex);
+            sh.n_done++;
+        }
+        sh.cv.notify_all();
+    }
+}
+
+static bool reads_pair(const std::string & val, size_t mult, size_t & n, size_t & size) {
+    const size_t x = val.find('x');
+    if (x == std::string::npos) {
+        return false;
+    }
+    n    = (size_t) atoll(val.substr(0, x).c_str());
+    size = (size_t) atoll(val.substr(x + 1).c_str())*mult;
+    return size > 128 || n == 0;
+}
+
+static int run_reads(int argc, char ** argv) {
+    if (argc < 4) {
+        printf("usage: test-lazy-buffer --reads <device of A> <device of B> [key=value ...]\n");
+        return 1;
+    }
+
+    reads_side a;
+    reads_side b;
+    a.tag  = "A";
+    b.tag  = "B";
+    a.lazy = true;
+    a.dev  = ggml_backend_dev_by_name(argv[2]);
+    b.dev  = ggml_backend_dev_by_name(argv[3]);
+    b.size[0] = 45*MiB;
+    b.n[1]    = 48;
+    b.n[2]    = 48;
+
+    if (!a.dev || !b.dev) {
+        printf("FAILED: there is no device %s\n", a.dev ? argv[3] : argv[2]);
+        return 1;
+    }
+
+    int n_rounds = 40;
+    int span_ms  = 450;
+    int step_ms  = 37;
+
+    for (int i = 4; i < argc; i++) {
+        const std::string arg = argv[i];
+        const size_t eq = arg.find('=');
+        const std::string key = arg.substr(0, eq);
+        const std::string val = eq == std::string::npos ? "" : arg.substr(eq + 1);
+
+        bool ok = eq != std::string::npos;
+        if (key == "lazy") {
+            a.lazy = val == "a" || val == "ab";
+            b.lazy = val == "b" || val == "ab";
+        } else if (key == "rounds") {
+            n_rounds = atoi(val.c_str());
+        } else if (key == "span") {
+            span_ms = atoi(val.c_str());
+        } else if (key == "step") {
+            step_ms = atoi(val.c_str());
+        } else if (key == "solo") {
+            b.active = atoi(val.c_str()) == 0;
+        } else if (key == "margin") {
+            reads_margin_mib = (size_t) atoll(val.c_str());
+        } else if (key == "free-a") {
+            a.free_mib = (size_t) atoll(val.c_str());
+        } else if (key == "free-b") {
+            b.free_mib = (size_t) atoll(val.c_str());
+        } else if (key == "big-a") {
+            ok = ok && reads_pair(val, MiB, a.n[0], a.size[0]);
+        } else if (key == "mid-a") {
+            ok = ok && reads_pair(val, MiB, a.n[1], a.size[1]);
+        } else if (key == "small-a") {
+            ok = ok && reads_pair(val, 1, a.n[2], a.size[2]);
+        } else if (key == "big-b") {
+            ok = ok && reads_pair(val, MiB, b.n[0], b.size[0]);
+        } else if (key == "mid-b") {
+            ok = ok && reads_pair(val, MiB, b.n[1], b.size[1]);
+        } else if (key == "small-b") {
+            ok = ok && reads_pair(val, 1, b.n[2], b.size[2]);
+        } else {
+            ok = false;
+        }
+        if (!ok || n_rounds < 1) {
+            printf("FAILED: argument %s\n", arg.c_str());
+            return 1;
+        }
+    }
+
+    reads_shared sh;
+    std::vector<std::array<long long, 4>> times_a(n_rounds);
+    std::vector<std::array<long long, 4>> times_b(n_rounds);
+
+    reads_sampling = true;
+    std::thread sampler(reads_sampler);
+
+    // one side is set up after the other, so that each sees what the other took of a device they share
+    std::thread ta(reads_worker, std::cref(a), false, std::ref(sh), n_rounds, span_ms, step_ms, std::ref(times_a));
+    {
+        std::unique_lock<std::mutex> lock(sh.mutex);
+        sh.cv.wait(lock, [&]() { return sh.n_ready >= 1; });
+    }
+    std::thread tb;
+    if (b.active) {
+        tb = std::thread(reads_worker, std::cref(b), true, std::ref(sh), n_rounds, span_ms, step_ms, std::ref(times_b));
+        std::unique_lock<std::mutex> lock(sh.mutex);
+        sh.cv.wait(lock, [&]() { return sh.n_ready >= 2; });
+    }
+
+    const int n_active = b.active ? 2 : 1;
+
+    for (int r = 0; r < n_rounds; r++) {
+        const int d_a = reads_delay(r, span_ms, step_ms, false);
+        const int d_b = reads_delay(r, span_ms, step_ms, true);
+
+        // before the round: a refusal of the driver ends the program inside it
+        printf("round %3d, %s %3d ms after the other: ", r, d_a > 0 ? "A" : "B", b.active ? std::max(d_a, d_b) : 0);
+        fflush(stdout);
+
+        {
+            std::lock_guard<std::mutex> lock(sh.mutex);
+            sh.round = r;
+        }
+        sh.cv.notify_all();
+        {
+            std::unique_lock<std::mutex> lock(sh.mutex);
+            sh.cv.wait(lock, [&]() { return sh.n_done >= n_active*(r + 1); });
+        }
+
+        printf("A %4lld ms for its memory and %4lld for the read", times_a[r][0], times_a[r][1]);
+        if (b.active) {
+            printf(", B %4lld and %4lld", times_b[r][0], times_b[r][1]);
+        }
+        printf("; %lld MiB committed before A's read, at most %lld more during it\n", times_a[r][2], times_a[r][3]);
+        fflush(stdout);
+    }
+
+    ta.join();
+    if (tb.joinable()) {
+        tb.join();
+    }
+
+    reads_sampling = false;
+    sampler.join();
+
+    printf("%d rounds, %d values that are wrong\n", n_rounds, sh.n_bad.load());
+    return sh.n_bad == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--reads") == 0) {
+        return run_reads(argc, argv);
+    }
+
     std::vector<std::string> must;
     for (int i = 1; i < argc; i++) {
         must.push_back(argv[i]);
