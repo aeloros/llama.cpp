@@ -80,6 +80,27 @@ struct ggml_cuda_batch_get_mapping {
         }
     }
 };
+
+// The batched read is a faster way to the same bytes, and it asks more of the driver: its destination is registered,
+// and the device writes into it. When the driver refuses a step of it the read declines, and the caller reads the
+// ranges one by one, as it does when the memory cannot be registered. Before, a refusal ended the program: a server
+// on Windows whose system was at its commit limit (ggml_cuda_host_commit_free) got "out of memory" for a copy into
+// the registered memory with 2 GB of the device free, and with plain copies alone it ran on at the same limit.
+// What was queued before the refusal writes into the registered memory, so it is waited for before the registration
+// ends.
+static bool ggml_cuda_batch_get_decline(int device, cudaError_t err, const char * what, size_t n_reads, size_t n_bytes) {
+    (void) cudaGetLastError();
+    (void) cudaStreamSynchronize(cudaStreamPerThread);
+    (void) cudaGetLastError();
+
+    char note[256];
+    ggml_cuda_memory_note(note, sizeof(note));
+
+    GGML_LOG_WARN("%s: the driver refused the batched read of %zu ranges, %.2f MiB, on device %d (%s: %s); %s. "
+                  "The ranges are read one by one\n",
+                  __func__, n_reads, n_bytes / 1024.0 / 1024.0, device, what, cudaGetErrorString(err), note);
+    return false;
+}
 #endif
 
 bool ggml_cuda_get_tensor_n(int device,
@@ -157,6 +178,7 @@ bool ggml_cuda_get_tensor_n(int device,
     if (!host_descriptors || ggml_backend_buffer_get_type(host_descriptors.get()) != host_type) {
         n_reads_gather = 0;
     }
+    cudaError_t err = cudaSuccess;
     if (n_reads_gather) {
         auto * copies = static_cast<ggml_cuda_batch_get_descriptor *>(ggml_backend_buffer_get_base(host_descriptors.get()));
         auto * device_copies = static_cast<ggml_cuda_batch_get_descriptor *>(ggml_backend_buffer_get_base(descriptors.get()));
@@ -176,23 +198,41 @@ bool ggml_cuda_get_tensor_n(int device,
             const size_t blocks_per_copy = std::min<size_t>(UINT16_MAX, std::max<size_t>(1, (nsm + n_batch - 1) / n_batch));
             const dim3 blocks((unsigned int) n_batch, (unsigned int) blocks_per_copy);
             // Stream ordering keeps each kernel ahead of the next descriptor overwrite.
-            CUDA_CHECK(cudaMemcpyAsync(device_copies, copies, n_batch * sizeof(copies[0]), cudaMemcpyHostToDevice, cudaStreamPerThread));
+            err = cudaMemcpyAsync(device_copies, copies, n_batch * sizeof(copies[0]), cudaMemcpyHostToDevice, cudaStreamPerThread);
+            if (err != cudaSuccess) {
+                return ggml_cuda_batch_get_decline(device, err, "the copy of the list of small ranges", n_reads, payload_bytes);
+            }
             ggml_cuda_batch_get_kernel<<<blocks, threads, 0, cudaStreamPerThread>>>(device_copies, n_batch);
-            CUDA_CHECK(cudaGetLastError());
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                return ggml_cuda_batch_get_decline(device, err, "the kernel that gathers the small ranges", n_reads, payload_bytes);
+            }
             if (first + n_batch < n_reads_gather) {
                 // Wait before refilling the pinned host descriptor buffer.
-                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+                err = cudaStreamSynchronize(cudaStreamPerThread);
+                if (err != cudaSuccess) {
+                    return ggml_cuda_batch_get_decline(device, err, "the wait for the small ranges", n_reads, payload_bytes);
+                }
             }
         }
     }
     // Keep the destination pinned for DMA too; overlapping destinations already declined above.
+    size_t n_dma = 0;
     for (size_t i = 0; i < n_tensors; ++i) {
         if (sizes[i] && (!n_reads_gather || sizes[i] > max_gather_read_bytes)) {
-            CUDA_CHECK(cudaMemcpyAsync(data[i], (const char *) tensors[i]->data + offsets[i], sizes[i], cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            err = n_dma > 0 && ggml_cuda_debug_refuse("batch-get") ? cudaErrorMemoryAllocation :
+                cudaMemcpyAsync(data[i], (const char *) tensors[i]->data + offsets[i], sizes[i], cudaMemcpyDeviceToHost, cudaStreamPerThread);
+            if (err != cudaSuccess) {
+                return ggml_cuda_batch_get_decline(device, err, "a copy into the registered memory", n_reads, payload_bytes);
+            }
+            n_dma++;
         }
     }
     // Wait for GPU writes before releasing the CPU mapping and descriptor buffers.
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    err = cudaStreamSynchronize(cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        return ggml_cuda_batch_get_decline(device, err, "the wait for the copies", n_reads, payload_bytes);
+    }
     return true;
 #endif
 }

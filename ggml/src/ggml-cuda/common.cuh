@@ -200,6 +200,15 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
+// What the current device has free and what the system can still commit, as a part of a sentence: the two figures that
+// tell which memory an "out of memory" of the driver is about.
+void ggml_cuda_memory_note(char * buf, size_t size);
+
+// For tests of what follows when the driver refuses a step for want of memory: while the environment variable
+// GGML_CUDA_DEBUG_REFUSE names a step, that step counts as refused. Steps: batch-get (a copy of a batched read into
+// registered memory, after the first copy of the call), lazy-access (a unit of a lazy buffer is made reachable).
+bool ggml_cuda_debug_refuse(const char * step);
+
 #define CUDA_CHECK_GEN(err, success, error_fn)                                      \
      do {                                                                           \
         auto err_ = (err);                                                          \

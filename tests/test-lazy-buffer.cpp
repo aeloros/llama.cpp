@@ -41,6 +41,31 @@ static int n_fail = 0;
 
 #define CHECK(cond) do { if (!(cond)) { printf("  FAILED: %s (line %d)\n", #cond, __LINE__); n_fail++; } } while (0)
 
+// what the backends log goes where it went, and the batched reads that the driver refused are counted
+static std::atomic<int> n_refused_reads{0};
+
+static void log_counting(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    (void) user_data;
+    if (strstr(text, "refused the batched read") != nullptr) {
+        n_refused_reads++;
+    }
+    fputs(text, stderr);
+}
+
+// while GGML_CUDA_DEBUG_REFUSE names a step, the CUDA backend takes that step as refused by the driver
+static void set_refuse(const char * step) {
+#ifdef _WIN32
+    _putenv_s("GGML_CUDA_DEBUG_REFUSE", step ? step : "");
+#else
+    if (step) {
+        setenv("GGML_CUDA_DEBUG_REFUSE", step, 1);
+    } else {
+        unsetenv("GGML_CUDA_DEBUG_REFUSE");
+    }
+#endif
+}
+
 static const size_t MiB = 1024*1024;
 
 // whether a page of host memory is taken: 1, 0, or -1 where the system cannot be asked
@@ -759,7 +784,142 @@ static int run_reads(int argc, char ** argv) {
     return sh.n_bad == 0 ? 0 : 1;
 }
 
+// The driver may refuse a step for want of memory of the system while the device has memory free: on Windows what
+// programs hold of the GPUs counts against the system's commit limit as well. A refusal is an answer and not the end
+// of the program: a read of many tensors falls back to plain copies, and a lazy buffer says no and keeps what it
+// had. A server stopped at such a refusal, in the read of a state.
+static void test_refusals(ggml_backend_dev_t dev) {
+    const char * name = ggml_backend_dev_name(dev);
+    if (strncmp(name, "CUDA", 4) != 0) {
+        return; // the steps are the CUDA backend's
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    // many tensors are read with one call: a few of 3 MiB, which the device copies into registered memory, and many
+    // small ones, which it gathers
+    {
+        const size_t n_big   = 8;
+        const size_t n_small = 200;
+
+        std::vector<size_t> full;
+        for (size_t i = 0; i < n_big + n_small; i++) {
+            full.push_back(i % 26 == 0 ? 3*MiB : 4096 + 64);
+        }
+        const size_t align = ggml_backend_buft_get_alignment(buft);
+
+        std::vector<size_t> at;
+        size_t size_buf = 0;
+        for (const size_t s : full) {
+            at.push_back(size_buf);
+            size_buf += GGML_PAD(s, align);
+        }
+
+        ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, size_buf));
+        CHECK(buf != nullptr);
+        if (!buf) {
+            return;
+        }
+
+        ggml_init_params ip = { ggml_tensor_overhead()*(full.size() + 1), nullptr, true };
+        ggml_context_ptr ctx(ggml_init(ip));
+
+        char * base = (char *) ggml_backend_buffer_get_base(buf.get());
+
+        std::vector<const ggml_tensor *> tensors;
+        std::vector<size_t> offsets;
+        std::vector<size_t> sizes;
+        std::vector<size_t> data_offsets;
+        std::vector<uint8_t> expected;
+        for (size_t i = 0; i < full.size(); i++) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) full[i]);
+            CHECK(ggml_backend_tensor_alloc(buf.get(), t, base + at[i]) == GGML_STATUS_SUCCESS);
+
+            std::vector<uint8_t> data(full[i]);
+            for (size_t j = 0; j < data.size(); j++) {
+                data[j] = (uint8_t) (i*37 + j*3 + 11);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size());
+
+            tensors.push_back(t);
+            offsets.push_back(32);
+            sizes.push_back(full[i] - 64);
+            data_offsets.push_back(expected.size());
+            expected.insert(expected.end(), data.begin() + 32, data.end() - 32);
+        }
+
+        const auto read_is_right = [&]() {
+            std::vector<uint8_t> back(expected.size(), 0xee);
+            ggml_backend_tensor_get_n(tensors.data(), back.data(), offsets.data(), sizes.data(), data_offsets.data(), tensors.size());
+            return back == expected;
+        };
+
+        n_refused_reads = 0;
+        CHECK(read_is_right());
+        CHECK(n_refused_reads == 0);
+
+        // the second copy into the registered memory is refused, with the first one and the gathered ranges under way
+        set_refuse("batch-get");
+        CHECK(read_is_right());
+        set_refuse(nullptr);
+        CHECK(n_refused_reads == 1);
+
+        CHECK(read_is_right());
+        CHECK(n_refused_reads == 1);
+    }
+
+    // a unit of a lazy buffer that the driver does not make reachable
+    const size_t unit = ggml_backend_buft_lazy_granularity(buft);
+    if (unit > 0) {
+        const size_t n_units = 4;
+
+        ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer_lazy(buft, n_units*unit));
+        CHECK(buf != nullptr);
+        if (!buf) {
+            return;
+        }
+
+        ggml_init_params ip = { ggml_tensor_overhead()*4, nullptr, true };
+        ggml_context_ptr ctx(ggml_init(ip));
+
+        ggml_tensor * a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) (n_units*unit));
+        CHECK(ggml_backend_tensor_alloc(buf.get(), a, ggml_backend_buffer_get_base(buf.get())) == GGML_STATUS_SUCCESS);
+
+        CHECK(ggml_backend_buffer_commit(buf.get(), 0, 2*unit));
+        CHECK(ggml_backend_buffer_committed(buf.get()) == 2*unit);
+
+        std::vector<uint8_t> data(1024, 0x5a);
+        ggml_backend_tensor_set(a, data.data(), unit - 512, data.size()); // across the two units that are taken
+
+        // the answer is no, the buffer keeps what it had, and what it had keeps its data
+        set_refuse("lazy-access");
+        CHECK(!ggml_backend_buffer_commit(buf.get(), 0, n_units*unit));
+        set_refuse(nullptr);
+        CHECK(ggml_backend_buffer_committed(buf.get()) == 2*unit);
+        CHECK(ggml_backend_buffer_commit_size(buf.get(), 0, n_units*unit) == 2*unit);
+
+        std::vector<uint8_t> back(data.size());
+        ggml_backend_tensor_get(a, back.data(), unit - 512, back.size());
+        CHECK(back == data);
+
+        // and it can be taken when the driver gives it
+        CHECK(ggml_backend_buffer_commit(buf.get(), 0, n_units*unit));
+        CHECK(ggml_backend_buffer_committed(buf.get()) == n_units*unit);
+
+        ggml_backend_tensor_set(a, data.data(), 3*unit - 512, data.size()); // across the two units that are new
+        ggml_backend_tensor_get(a, back.data(), 3*unit - 512, back.size());
+        CHECK(back == data);
+
+        ggml_backend_buffer_decommit(buf.get(), 0, n_units*unit);
+        CHECK(ggml_backend_buffer_committed(buf.get()) == 0);
+    }
+
+    printf("%s: steps that the driver refuses\n", name);
+}
+
 int main(int argc, char ** argv) {
+    ggml_log_set(log_counting, nullptr);
+
     if (argc > 1 && strcmp(argv[1], "--reads") == 0) {
         return run_reads(argc, argv);
     }
@@ -787,6 +947,7 @@ int main(int argc, char ** argv) {
 
         test_buft(ggml_backend_dev_buffer_type(dev), backend.get(), name, is_must);
         test_threads(ggml_backend_dev_buffer_type(dev), name);
+        test_refusals(dev);
     }
 
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {

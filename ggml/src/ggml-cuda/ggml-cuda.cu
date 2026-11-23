@@ -94,6 +94,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -103,6 +104,25 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
+void ggml_cuda_memory_note(char * buf, size_t size) {
+    size_t free  = 0;
+    size_t total = 0;
+    if (cudaMemGetInfo(&free, &total) != cudaSuccess) {
+        (void) cudaGetLastError();
+        free  = 0;
+        total = 0;
+    }
+
+    size_t commit_free = 0;
+    if (ggml_cuda_host_commit_free(&commit_free)) {
+        snprintf(buf, size, "the device has %zu MiB free of %zu by " GGML_CUDA_NAME "'s count, and the system can still commit %zu MiB",
+                 free/(1024*1024), total/(1024*1024), commit_free/(1024*1024));
+    } else {
+        snprintf(buf, size, "the device has %zu MiB free of %zu by " GGML_CUDA_NAME "'s count",
+                 free/(1024*1024), total/(1024*1024));
+    }
+}
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -111,6 +131,11 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
+
+    // which memory an "out of memory" is about: the device's, or the system's (card-memory.cuh)
+    char note[256];
+    ggml_cuda_memory_note(note, sizeof(note));
+    GGML_LOG_ERROR("  %s\n", note);
     // abort with GGML_ABORT to get a stack trace
     GGML_ABORT(GGML_CUDA_NAME " error");
 }
@@ -156,6 +181,12 @@ static int ggml_cuda_env_int(const char * name, int default_value) {
 
 static bool ggml_cuda_env_set(const char * name) {
     return getenv(name) != nullptr;
+}
+
+// read at every use: a test sets and clears it while it runs
+bool ggml_cuda_debug_refuse(const char * step) {
+    const char * env = getenv("GGML_CUDA_DEBUG_REFUSE");
+    return env != nullptr && strcmp(env, step) == 0;
 }
 
 static bool ggml_cuda_unified_memory_enabled() {
@@ -1226,7 +1257,9 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
 #if defined(GGML_USE_VMM)
 // lazy buffer: memory of the device is mapped into a reserved address range, one unit at a time
 
-// map one unit of memory of the device at ptr, false if the device does not have it
+// Map one unit of memory of the device at ptr, false if the driver does not give it: the device is full, or the system
+// has no memory for the driver's own part of a step (on Windows what a device holds counts against the system's commit
+// limit as well, ggml_cuda_host_commit_free). After a no nothing of the unit is left.
 static bool ggml_cuda_lazy_map_unit(int device, CUdeviceptr ptr, size_t size) {
     const int physical_device = ggml_cuda_get_physical_device(device);
 
@@ -1286,7 +1319,12 @@ static bool ggml_cuda_lazy_map_unit(int device, CUdeviceptr ptr, size_t size) {
         access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         access_descs.push_back(access);
     }
-    CU_CHECK(cuMemSetAccess(ptr, size, access_descs.data(), access_descs.size()));
+    if (ggml_cuda_debug_refuse("lazy-access") ||
+            cuMemSetAccess(ptr, size, access_descs.data(), access_descs.size()) != CUDA_SUCCESS) {
+        // without its mapping the memory goes back
+        CU_CHECK(cuMemUnmap(ptr, size));
+        return false;
+    }
 
     return true;
 }

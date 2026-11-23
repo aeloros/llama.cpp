@@ -60,9 +60,24 @@ bool ggml_cuda_card_memory_free(const char * pci_bus_id, size_t * free) {
     return true;
 }
 
+bool ggml_cuda_host_commit_free(size_t * free) {
+    MEMORYSTATUSEX status = {};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) {
+        return false;
+    }
+
+    *free = (size_t) status.ullAvailPageFile;
+    return true;
+}
+
 #else
 
 bool ggml_cuda_card_memory_free(const char *, size_t *) {
+    return false;
+}
+
+bool ggml_cuda_host_commit_free(size_t *) {
     return false;
 }
 
