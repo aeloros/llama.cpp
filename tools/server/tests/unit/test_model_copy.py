@@ -480,3 +480,189 @@ def test_a_server_with_a_second_pool_a_slot_that_comes_first_and_a_copy():
     assert copy["n_tasks_total"] >= 1
     assert copy["tasks"] == 0
     assert copy["tasks_first"] == 0
+
+
+# A conversation goes on in the model that read it: the copy has cells and a prompt cache of its own.
+
+STORY = (
+    "Once upon a time there was a little cat who lived in a big house. The cat had a friend, a small brown dog, and "
+    "every morning they went into the garden to look for the red ball. One day the ball was gone. The cat looked "
+    "under the bench and the dog looked behind the tree, and then they asked the old bird who sat on the fence. "
+    "The bird said that the wind had taken the ball over the wall, into the garden of the house next door. "
+)
+LONG_TASK = {"prompt": PROMPT, "n_predict": 1900, "ignore_eos": True, "cache_prompt": False}
+
+
+def n_tokens(text):
+    res = server.make_request("POST", "/tokenize", data={"content": text, "add_special": True})
+    return len(res.body["tokens"])
+
+
+def in_background(data):
+    """Starts a request; returns its thread and the dict that gets its response."""
+    out = {}
+
+    def run():
+        out["res"] = server.make_request("POST", "/completion", data=data)
+
+    t = threading.Thread(target=run)
+    t.start()
+    return t, out
+
+
+def wait_fast(what, cond, seconds=10.0):
+    t_end = time.time() + seconds
+    while time.time() < t_end:
+        if cond():
+            return
+        time.sleep(0.002)
+    raise TimeoutError(what)
+
+
+def test_a_conversation_goes_on_in_the_copy_that_read_it():
+    global server
+    server.model_copy_after = 1
+    server.model_copy_ctx_size = 2048
+    server.model_copy_release = 60
+    server.start()
+
+    n_story = n_tokens(STORY)
+    assert n_story > 80
+
+    # the first request of the conversation arrives while the first model works on a task, so it goes to the copy
+    out, first = while_a_task_runs(LONG_TASK, lambda: complete(n_predict=16, prompt=STORY, cache_prompt=True))
+    assert out["res"].status_code == 200
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 1
+    assert copy["n_tasks_back"] == 0
+    assert copy["tasks_first"] == 0
+
+    # the first model is free now. The conversation goes on in the copy all the same, which has its prompt
+    second = complete(n_predict=16, prompt=STORY + first["content"] + " And then the cat", cache_prompt=True)
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 2
+    assert copy["n_tasks_back"] == 1
+    assert second["timings"]["cache_n"] >= n_story - 1
+
+    # another conversation stays with the first model, which is free
+    complete(n_predict=16, prompt="The sun was hot and the sea was blue, and the two children ran down to the water. " * 4)
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 2
+    assert copy["n_tasks_back"] == 1
+
+
+def test_a_conversation_that_the_first_model_read_last_stays_there():
+    global server
+    server.model_copy_after = 1
+    server.model_copy_ctx_size = 2048
+    server.model_copy_release = 60
+    server.start()
+
+    n_story = n_tokens(STORY)
+
+    # the conversation starts in the copy
+    out, first = while_a_task_runs(LONG_TASK, lambda: complete(n_predict=16, prompt=STORY, cache_prompt=True))
+    assert the_copy()["n_tasks_total"] == 1
+
+    # its next request finds the copy's one slot at work on another task, so the first model reads it
+    t_a, out_a = in_background(LONG_TASK)
+    try:
+        wait_fast("the first model got no task", lambda: the_copy()["tasks_first"] == 1)
+        t_b, out_b = in_background({"prompt": "The sun was hot and the sea was blue. " * 3, "n_predict": 1900,
+                                    "ignore_eos": True, "cache_prompt": False})
+        try:
+            wait_fast("the other task did not reach the copy", lambda: the_copy()["tasks"] == 1)
+            second = complete(n_predict=16, prompt=STORY + first["content"] + " And then the cat", cache_prompt=True)
+            seen = the_copy()
+        finally:
+            t_b.join()
+    finally:
+        t_a.join()
+    assert out_a["res"].status_code == 200
+    assert out_b["res"].status_code == 200
+    # the copy still had the other task when the request was answered, so the request was not there
+    assert seen["tasks"] == 1
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 2
+    assert copy["n_tasks_back"] == 0
+
+    # the first model has the conversation now, and both models are free: the next request stays with the first one
+    third = complete(n_predict=16, cache_prompt=True,
+                     prompt=STORY + first["content"] + " And then the cat" + second["content"] + " said")
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 2
+    assert copy["n_tasks_back"] == 0
+    assert third["timings"]["cache_n"] >= n_story - 1
+
+
+# The copy takes the tasks that the first pool of KV cells has no room for, and it gives way to a task that is too
+# large for that pool and for the copy: such a task needs the second pool of the first model, on the copy's device.
+
+def test_a_task_that_would_spill_out_of_the_first_pool_goes_to_the_copy():
+    global server
+    server.n_ctx = 1024            # the first pool
+    server.model_copy_after = 5    # far away: here only the room in the first pool sends a task to the copy
+    server.model_copy_ctx_size = 1024
+    server.model_copy_release = 60
+    server.start()
+
+    # alone, a task stays with the first model
+    assert complete(n_predict=200)["tokens_predicted"] == 200
+    assert the_copy()["n_tasks_total"] == 0
+
+    # the first model works on a task that takes most of its pool: the next one does not fit beside it
+    t, out = in_background({"prompt": PROMPT, "n_predict": 900, "ignore_eos": True, "cache_prompt": False})
+    try:
+        wait_fast("the first model got no task", lambda: the_copy()["tasks_first"] == 1)
+        body = complete(n_predict=200)
+    finally:
+        t.join()
+    assert body["tokens_predicted"] == 200
+    assert out["res"].status_code == 200
+    assert out["res"].body["tokens_predicted"] == 900
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 1
+    assert copy["n_tasks_spill"] == 1
+    assert copy["n_home"] == 1024
+
+
+@needs_device
+def test_the_copy_gives_way_to_a_task_that_only_the_second_pool_can_hold():
+    global server
+    server.n_ctx = 1024
+    server.n_slots = 3
+    server.kv_overflow_device = DEVICE
+    server.kv_overflow_size = 4096
+    server.kv_overflow_release = 60
+    server.kv_overflow_headroom = 64
+    server.model_copy_ctx_size = 1024
+    server.model_copy_after = 0
+    server.model_copy_release = 60
+    server.model_copy_headroom = 64
+    server.extra_args = ["--kv-unified-per-slot", "256,2048,2048", "--batch-priority-slots", "0"]
+    server.start()
+
+    # a task loads the copy, which may stay for 60 s
+    assert complete(n_predict=16)["tokens_predicted"] == 16
+    assert the_copy()["state"] == "loaded"
+
+    # the copy works on a long task. Behind it comes a task that neither the first pool can hold (768 cells for it)
+    # nor the copy (1024): it waits until the copy has ended its task and is unloaded, and runs in the second pool
+    t_long, out_long = in_background({"prompt": PROMPT, "n_predict": 990, "ignore_eos": True, "cache_prompt": False})
+    try:
+        wait_fast("the long task did not reach the copy", lambda: the_copy()["tasks"] == 1)
+        # (it names a coding slot: slot 0 comes first, and its limit is 256)
+        large = complete(n_predict=1500, ignore_eos=True, id_slot=1)
+        seen = the_copy()
+    finally:
+        t_long.join()
+    assert large["tokens_predicted"] == 1500
+    assert out_long["res"].status_code == 200
+    assert out_long["res"].body["tokens_predicted"] == 990
+    assert seen["state"] == "unloaded"
+    assert seen["tasks"] == 0
+    copy = the_copy()
+    assert copy["n_home"] == 768
+    assert copy["n_loads"] == 1
+    assert copy["n_tasks_total"] == 2
+    assert copy["tasks_pool"] == 0

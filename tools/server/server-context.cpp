@@ -6444,7 +6444,9 @@ struct server_model_copy {
               n_after(std::max(0, params_first.model_copy_after)),
               n_release(params_first.model_copy_release),
               n_headroom(params_first.model_copy_headroom),
-              n_fit_headroom(std::max(0, params_first.kv_fit_headroom)) {
+              n_fit_headroom(std::max(0, params_first.kv_fit_headroom)),
+              n_home(cells_home(params_first)),
+              has_pool(params_first.kv_overflow_device != nullptr) {
         SRV_INF("model copy: on %s, %d slots and %d KV cells, %s; a task goes there when the first model has %d, "
                 "and the copy is unloaded after %d s without a task\n",
                 device_names().c_str(), n_parallel, n_ctx,
@@ -6470,12 +6472,13 @@ struct server_model_copy {
     }
 
     // Counts a completion task with the model it goes to, until the returned handle is released.
+    //   tokens:              the task's prompt, nullptr for a task that has to stay
     //   n_prompt, n_predict: the task's prompt and its output limit in tokens, -1 = no limit
     //   id_slot:             the slot it asks for, -1 = none
     //   stays:               the task cannot go to the copy
     //   to_copy:             set when the task goes to the copy, which is loaded then: the task is to be posted to
     //                        queue_tasks() and its results read from queue_results()
-    std::shared_ptr<void> route(int32_t n_prompt, int32_t n_predict, int id_slot, bool stays, bool & to_copy) {
+    std::shared_ptr<void> route(const llama_tokens * tokens, int32_t n_prompt, int32_t n_predict, int id_slot, bool stays, bool & to_copy) {
         const auto & prio = params_first.batch_priority_slots;
         const bool counted = std::find(prio.begin(), prio.end(), id_slot) == prio.end();
 
@@ -6485,20 +6488,77 @@ struct server_model_copy {
 
         std::unique_lock<std::mutex> lock(mutex);
         to_copy = false;
-        if (!stays && counted && !stopping && n_first >= n_after && n_copy < n_parallel && n_cells_copy + n_cells <= n_ctx) {
+
+        // which model has this conversation
+        const int32_t n_prefix    = tokens != nullptr && counted ? (int32_t) tokens->size() - N_PREFIX_TAIL : 0;
+        uint64_t      hash_prefix = 0;
+        prefix_rec    rec_old     = { 0, 0, false, 0 };
+        if (n_prefix > 0) {
+            const int i_prefix = prefix_find(*tokens, n_prefix, hash_prefix);
+            if (i_prefix >= 0) {
+                rec_old = prefixes[i_prefix];
+            }
+        }
+
+        // it does not fit in the first pool beside the tasks that the first model has: it would spill
+        const bool spills   = n_home > 0 && n_cells_first + n_cells > n_home;
+        // the first pool cannot hold it at all
+        const bool is_large = n_home > 0 && n_cells > n_home;
+
+        // a conversation that the copy has goes on there while the copy is loaded, also when the first model is free
+        const bool is_back = rec_old.n > 0 && rec_old.in_copy && state == LOADED;
+        if (!stays && counted && !stopping && n_pool == 0 && (is_back || n_first >= n_after || spills) &&
+                n_copy < n_parallel && n_cells_copy + n_cells <= n_ctx) {
             // counted before the copy is there, so that the tasks that arrive while it loads see its room taken
             n_copy++;
             n_cells_copy += n_cells;
             if (ensure_loaded(lock)) {
                 to_copy = true;
                 n_tasks_total++;
+                if (is_back && n_first < n_after) {
+                    n_tasks_back++;
+                } else if (spills && n_first < n_after) {
+                    n_tasks_spill++;
+                }
             } else {
                 n_copy--;
                 n_cells_copy -= n_cells;
             }
         }
+        // A task that neither the first pool nor the copy takes needs the second pool of the first model, whose device
+        // the copy fills. The copy gives way: it gets no task while such a task is there, the timer unloads it as soon
+        // as its own tasks have ended, and the task goes to the first model then, which finds the device free
+        const bool for_pool = !to_copy && counted && is_large && has_pool;
+        if (for_pool) {
+            n_pool++;
+            if (state != UNLOADED) {
+                SRV_INF("model copy: a task of %d tokens needs the second pool of KV cells of the first model; the copy gets no "
+                        "task until that one has ended, and is unloaded when its %d tasks have\n", n_prompt, n_copy);
+            }
+            cv.notify_all();
+            cv.wait(lock, [this]() { return state == UNLOADED || stopping; });
+        }
         if (!to_copy && counted) {
             n_first++;
+            n_cells_first += n_cells;
+        }
+
+        // where the conversation is from now on, in place of where it was. The mutex may have been released above
+        if (n_prefix > 0) {
+            const prefix_rec rec = { n_prefix, hash_prefix, to_copy, ++n_prefix_use };
+            auto it = std::find_if(prefixes.begin(), prefixes.end(), [&rec_old](const prefix_rec & r) {
+                return rec_old.n > 0 && r.n == rec_old.n && r.hash == rec_old.hash;
+            });
+            if (it == prefixes.end() && prefixes.size() >= N_PREFIX_MAX) {
+                it = std::min_element(prefixes.begin(), prefixes.end(), [](const prefix_rec & a, const prefix_rec & b) {
+                    return a.t_used < b.t_used;
+                });
+            }
+            if (it != prefixes.end()) {
+                *it = rec;
+            } else {
+                prefixes.push_back(rec);
+            }
         }
         if (to_copy) {
             SRV_INF("model copy: a task of %d tokens goes to the copy, which has %d now; the first model has %d\n",
@@ -6506,8 +6566,8 @@ struct server_model_copy {
         }
 
         const bool was_copy = to_copy;
-        return std::shared_ptr<void>(static_cast<void *>(this), [this, was_copy, counted, n_cells](void *) {
-            done(was_copy, counted, n_cells);
+        return std::shared_ptr<void>(static_cast<void *>(this), [this, was_copy, counted, n_cells, for_pool](void *) {
+            done(was_copy, counted, n_cells, for_pool);
         });
     }
 
@@ -6532,6 +6592,10 @@ struct server_model_copy {
             { "tasks",         n_copy },         // the tasks the copy has now
             { "tasks_first",   n_first },        // the counted tasks the first model has now
             { "n_tasks_total", n_tasks_total },  // tasks sent to the copy since the server started
+            { "n_tasks_back",  n_tasks_back },   // of them: sent there because the copy had their conversation
+            { "n_tasks_spill", n_tasks_spill },  // of them: sent there because the first pool had not the cells for them
+            { "tasks_pool",    n_pool },         // tasks now that only the second pool of the first model can hold
+            { "n_home",        n_home },         // KV cells of the first pool that a counted task can have, 0 = not known
             { "n_loads",       n_loads },        // times the copy was loaded
             { "n_refused",     n_refused },      // times it was not loaded for want of memory on a device
             { "headroom",      n_headroom },     // MiB
@@ -6548,8 +6612,82 @@ private:
     const int32_t n_release;
     const int32_t n_headroom; // MiB, -1 = the devices are not asked
     const int32_t n_fit_headroom;
+    const int32_t n_home;     // KV cells of the first model's first pool that a counted task can have, 0 = not known
+    const bool    has_pool;   // the first model has a second pool of KV cells
+
+    // The first pool less the limits of the slots that come first, whose share is kept for them. 0 when the slots
+    // of the first model do not share a pool.
+    static int32_t cells_home(const common_params & p) {
+        if (!p.kv_unified) {
+            return 0;
+        }
+        int64_t n = p.n_ctx;
+        for (const int32_t id : p.batch_priority_slots) {
+            if (id >= 0 && id < (int32_t) p.kv_unified_per_slot_list.size()) {
+                n -= p.kv_unified_per_slot_list[id];
+            }
+        }
+        return (int32_t) std::max<int64_t>(n, 0);
+    }
 
     static constexpr size_t MiB = 1024 * 1024;
+
+    // Where a conversation was last read. A request's prompt starts with the prompt of the request before it in the
+    // same conversation, so a prefix of each prompt that is routed is kept by its length and hash: the longest one
+    // that a new prompt starts with tells which model has the conversation's state, in its cells or its prompt cache.
+    struct prefix_rec {
+        int32_t  n;       // tokens of the prefix
+        uint64_t hash;    // of them
+        bool     in_copy;
+        uint64_t t_used;  // order of use, the oldest goes first
+    };
+
+    // the last tokens of a prompt are left out of its prefix: a chat template may end a prompt in another way than it
+    // goes on from there in the next one
+    static constexpr int32_t N_PREFIX_TAIL = 32;
+    static constexpr size_t  N_PREFIX_MAX  = 256;
+
+    // FNV-1a
+    static uint64_t hash_token(uint64_t h, llama_token token) {
+        for (int i = 0; i < 4; i++) {
+            h ^= (uint8_t) ((uint32_t) token >> (8 * i));
+            h *= 0x100000001b3ULL;
+        }
+        return h;
+    }
+
+    // The longest kept prefix that the tokens start with, -1 if there is none. hash_new: the hash of the first n_new
+    // of the tokens. The mutex is held.
+    int prefix_find(const llama_tokens & tokens, int32_t n_new, uint64_t & hash_new) const {
+        const int32_t n_tokens = (int32_t) tokens.size();
+
+        std::vector<std::pair<int32_t, int>> at; // length and index of the kept prefixes that are short enough, by length
+        for (int i = 0; i < (int) prefixes.size(); i++) {
+            if (prefixes[i].n <= n_tokens) {
+                at.push_back({ prefixes[i].n, i });
+            }
+        }
+        std::sort(at.begin(), at.end());
+
+        int      best = -1;
+        size_t   k    = 0;
+        uint64_t h    = 0xcbf29ce484222325ULL;
+        for (int32_t i = 0; i <= n_tokens; i++) {
+            // h is the hash of the tokens [0, i)
+            for (; k < at.size() && at[k].first == i; k++) {
+                if (prefixes[at[k].second].hash == h) {
+                    best = at[k].second;
+                }
+            }
+            if (i == n_new) {
+                hash_new = h;
+            }
+            if (i < n_tokens) {
+                h = hash_token(h, tokens[i]);
+            }
+        }
+        return best;
+    }
 
     // what the copy takes of one of its devices
     struct device_need {
@@ -6564,6 +6702,10 @@ private:
     state_t  state         = UNLOADED;
     bool     stopping      = false;
     int32_t  n_first       = 0;  // counted tasks that the first model has, at work or waiting
+    int64_t  n_cells_first = 0;  // the KV cells that those tasks are counted with
+    int32_t  n_pool        = 0;  // of those tasks: the ones that only the second pool of the first model can hold. While
+                                 // there is one the copy gets no task, and it is unloaded when it has none
+    uint64_t n_tasks_spill = 0;  // tasks that went to the copy because the first pool had not the cells for them
     int32_t  n_copy        = 0;  // tasks that the copy has, the ones that wait for it to load included
     int64_t  n_cells_copy  = 0;  // the KV cells that those tasks are counted with
     int64_t  t_idle        = 0;  // when the copy's last task ended
@@ -6573,6 +6715,9 @@ private:
     uint64_t n_refused     = 0;  // times the copy was not loaded because a device had not the memory
     int64_t  t_refused     = 0;  // when that was last said in the log
     std::vector<device_need> need; // empty until it is measured, before the first load
+    std::vector<prefix_rec> prefixes;
+    uint64_t n_prefix_use  = 0;
+    uint64_t n_tasks_back  = 0;  // tasks that went to the copy because it had their conversation
 
     // the copy. Set by the thread that loads it (state LOADING) and reset by the one that unloads it (UNLOADING);
     // while the state is LOADED it does not change
@@ -6630,7 +6775,7 @@ private:
         return p;
     }
 
-    void done(bool was_copy, bool counted, int32_t n_cells) {
+    void done(bool was_copy, bool counted, int32_t n_cells, bool for_pool) {
         std::unique_lock<std::mutex> lock(mutex);
         if (was_copy) {
             n_copy--;
@@ -6640,6 +6785,10 @@ private:
             }
         } else if (counted) {
             n_first--;
+            n_cells_first -= n_cells;
+            if (for_pool) {
+                n_pool--;
+            }
         }
     }
 
@@ -6852,6 +7001,8 @@ private:
         }
         lock.lock();
         state = UNLOADED;
+        // its conversations went with it
+        prefixes.erase(std::remove_if(prefixes.begin(), prefixes.end(), [](const prefix_rec & r) { return r.in_copy; }), prefixes.end());
         cv.notify_all();
     }
 
@@ -6862,8 +7013,13 @@ private:
             if (stopping) {
                 break;
             }
-            if (state == LOADED && n_copy == 0 && n_release >= 0 && ggml_time_ms() - t_idle >= (int64_t) n_release * 1000) {
-                SRV_INF("model copy: %d s without a task, unloading\n", n_release);
+            const bool is_idle = n_release >= 0 && ggml_time_ms() - t_idle >= (int64_t) n_release * 1000;
+            if (state == LOADED && n_copy == 0 && (is_idle || n_pool > 0)) {
+                if (n_pool > 0) {
+                    SRV_INF("%s", "model copy: unloading, a task needs the device for the second pool of KV cells\n");
+                } else {
+                    SRV_INF("model copy: %d s without a task, unloading\n", n_release);
+                }
                 unload(lock);
                 SRV_INF("%s", "model copy: unloaded\n");
             }
@@ -6945,7 +7101,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 tokens_text = inputs[0].get_text_tokens();
                 stays = tparams_first->n_cmpl > 1 || tokens_text.size() != inputs[0].size();
             }
-            res->hold = model_copy->route(n_prompt, n_predict, json_value(data, "id_slot", -1), stays, to_copy);
+            res->hold = model_copy->route(stays ? nullptr : &tokens_text, n_prompt, n_predict,
+                    json_value(data, "id_slot", -1), stays, to_copy);
             if (to_copy) {
                 res->rd_other = std::make_unique<server_response_reader>(
                         model_copy->queue_tasks(), model_copy->queue_results(), HTTP_POLLING_SECONDS);
