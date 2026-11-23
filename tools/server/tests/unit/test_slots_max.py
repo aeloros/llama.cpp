@@ -272,6 +272,127 @@ def test_an_idle_slot_gives_up_its_row_and_its_cells_for_a_task():
 
 
 @needs_hybrid
+def test_the_rows_of_idle_slots_are_room_for_a_task():
+    # 1024 cells and the memory of one row. Two small conversations stay in their slots, with a row each, the second
+    # of them out of the cells. A task of 959 cells fits when both give up what they hold: one row is left, its own,
+    # and all the cells. It is not told that 896 cells are all there is.
+    start_hybrid(1, 3, n_ctx=1024)
+
+    for i in (1, 2):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": ids(100, i), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True})
+        assert res.status_code == 200, res.body
+    assert len([s for s in slots() if s.get("n_prompt_tokens", 0) > 0]) == 2
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": ids(950, 3), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True})
+    assert res.status_code == 200, res.body
+    assert res.body["tokens_predicted"] == 8
+    assert not res.body["truncated"]
+    assert res.body["timings"]["prompt_n"] == 950
+
+
+@needs_hybrid
+def test_a_task_starts_beside_another_when_the_rows_of_idle_slots_are_its_room():
+    # 4096 cells and the memory of one row. Three small conversations stay in their slots, and a long task of 3301
+    # cells is at work: four rows, three of them out of the cells, which leaves 3584 cells (a mark of the cells
+    # moves in steps of 256). A task of 409 cells does not fit beside that. It does when idle slots give up their
+    # rows: with the two rows of the tasks 3840 cells can have their memory, 539 beside the long task. So it starts
+    # at once; it does not wait for the long task to end.
+    start_hybrid(1, 5, n_ctx=4096)
+
+    for i in (1, 2, 3):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": ids(60, i), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True})
+        assert res.status_code == 200, res.body
+    assert len([s for s in slots() if s.get("n_prompt_tokens", 0) > 0]) == 3
+
+    t_long, out_long = in_background({"prompt": ids(100, 4), "n_predict": 3200, "ignore_eos": True, "cache_prompt": False})
+    wait_fast("the long task is at work", lambda: n_at_work() == 1)
+    assert len([s for s in slots() if s.get("n_prompt_tokens", 0) > 0 and not s["is_processing"]]) == 3, \
+        "an idle slot gave up its conversation for the long task: nothing is shown"
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": ids(400, 5), "n_predict": 8, "ignore_eos": True, "cache_prompt": False})
+    assert res.status_code == 200, res.body
+    assert res.body["tokens_predicted"] == 8
+    assert not res.body["truncated"]
+    assert t_long.is_alive(), "the task waited for the long one to end"
+
+    t_long.join()
+    assert out_long["res"].status_code == 200, out_long["res"].body
+    assert out_long["res"].body["tokens_predicted"] == 3200
+    assert not out_long["res"].body["truncated"]
+
+
+@needs_hybrid
+def test_a_conversation_in_a_high_row_does_not_keep_the_memory_of_the_rows_below_it():
+    # 1024 cells and the memory of two rows. Slot 0 comes first, has 256 cells kept, and is never asked to give up
+    # what it holds. Its conversation of 248 cells is the third to start, so its state is in the third row. Then the
+    # two before it give up their rows for a task of 709 cells. With the state of slot 0 moved down, two rows hold
+    # memory, its own and the task's, which is what is set aside: all the cells can have theirs, 256 for slot 0 and
+    # 768 for the task. If the two rows below slot 0's kept their memory, three rows would hold it and 896 cells
+    # could: 640 for the task, which would not fit.
+    start_hybrid(2, 4, n_ctx=1024, more_args=["--kv-unified-per-slot", "256,1024", "--batch-priority-slots", "0"])
+
+    for i in (1, 2):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": ids(60, i), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True, "id_slot": i})
+        assert res.status_code == 200, res.body
+
+    house = {"prompt": ids(240, 7), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True, "id_slot": 0}
+    res = server.make_request("POST", "/completion", data=house)
+    assert res.status_code == 200, res.body
+    assert res.body["id_slot"] == 0
+    house_answer = res.body["content"]
+    assert len([s for s in slots() if s.get("n_prompt_tokens", 0) > 0]) == 3
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": ids(700, 3), "n_predict": 8, "seed": 42, "ignore_eos": True, "cache_prompt": True, "id_slot": 3})
+    assert res.status_code == 200, res.body
+    assert res.body["tokens_predicted"] == 8
+    assert not res.body["truncated"]
+
+    # slot 0 still holds its conversation: the same request reads no prompt again, and has the same answer
+    assert [s for s in slots() if s["id"] == 0][0]["n_prompt_tokens"] > 0
+    res = server.make_request("POST", "/completion", data=house)
+    assert res.status_code == 200, res.body
+    assert res.body["timings"]["prompt_n"] < 20
+    assert res.body["content"] == house_answer
+
+
+def test_a_prompt_that_does_not_fit_in_the_room_of_its_task_is_refused_at_once():
+    # 2560 cells. Slot 0 comes first and has 1024 of them kept, so 1536 are left for a task in another slot, whose
+    # own limit is 2048. A prompt of 1700 tokens fits in the slot and not in that room. It is refused with the
+    # context-size error, which names the room; it is not read into the cells that are kept for slot 0.
+    start_tiny(2, 3, n_ctx=2560, more_args=["--kv-unified-per-slot", "1024,2048", "--batch-priority-slots", "0"])
+
+    res = server.make_request("POST", "/tokenize", data={"content": (PROMPT + " ") * 200, "add_special": True})
+    assert res.status_code == 200
+    tokens = res.body["tokens"]
+    assert len(tokens) > 1700
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": tokens[:1700], "n_predict": 8, "ignore_eos": True, "cache_prompt": False, "id_slot": 1})
+    assert res.status_code == 400, res.body
+    assert res.body["error"]["type"] == "exceed_context_size_error"
+    assert res.body["error"]["n_prompt_tokens"] == 1700
+    assert res.body["error"]["n_ctx"] == 1536
+
+    # a prompt that fits in the room is read, and slot 0 has all of its cells for a task of its own
+    res = server.make_request("POST", "/completion", data={
+        "prompt": tokens[:1500], "n_predict": 8, "ignore_eos": True, "cache_prompt": False, "id_slot": 1})
+    assert res.status_code == 200, res.body
+    assert res.body["tokens_predicted"] == 8
+    res = server.make_request("POST", "/completion", data={
+        "prompt": tokens[:1000], "n_predict": 8, "ignore_eos": True, "cache_prompt": False, "id_slot": 0})
+    assert res.status_code == 200, res.body
+    assert res.body["id_slot"] == 0
+    assert res.body["tokens_predicted"] == 8
+    assert not res.body["truncated"]
+
+
+@needs_hybrid
 def test_a_slot_that_comes_first_has_its_row_and_its_cells_kept():
     # slot 0 comes first and has 512 cells; the memory of its row and of one more is set aside. Beside those 512
     # cells and the row of a second task, 3328 cells are left for the others: two long tasks of 1700 cells would

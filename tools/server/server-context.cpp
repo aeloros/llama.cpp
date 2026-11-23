@@ -2275,7 +2275,7 @@ private:
 
             // by the limits of the tasks at work the pool has the task's cells: the idle slots give theirs up for it
             if (kv_fit && fit.n_room > 0) {
-                kv_fit_make_room(*ret, fit.overflow, fit.n_room);
+                kv_fit_make_room(*ret, fit.overflow, fit.n_room, (ret->prompt.n_tokens() > 0 ? 0 : 1) + (int32_t) task.child_tasks.size());
             }
 
             if (update_cache) {
@@ -2683,9 +2683,10 @@ private:
     }
 
     // Lazy sequence memory: the cells of the first pool that can still be promised to a task. What the memory has
-    // taken follows its marks, the highest cell and the highest row in use. New cells and rows fill what is free
-    // below the marks first, so a mark rises only by what does not fit there, and the cell mark may rise as far as
-    // the budget lets it beside the rows.
+    // taken follows its marks: the highest cell in use, and the number of rows in use (the memory keeps those
+    // together, so a row that is given up frees its memory wherever it was). New cells fill what is free below the
+    // cell mark first, so that mark rises only by what does not fit there, as far as the budget lets it beside
+    // the rows.
     // Promised already: to the tasks at work in the first pool their limits, and to the slots that come first
     // (--batch-priority-slots) their whole limits and a row each.
     //   slot:       its own task is the one that asks: it is left out of the promises, and what it holds is its to use
@@ -2699,37 +2700,47 @@ private:
         }
 
         int64_t n_cells_free = (int64_t) info.n_cells_taken - (int64_t) info.n_cells_used; // below the cell mark
-        int64_t n_rows_free  = (int64_t) info.n_rows_taken  - (int64_t) info.n_rows_used;  // below the row mark
         int64_t n_promised   = 0;
-        int64_t n_rows       = n_rows_new;
+        int64_t n_rows       = n_rows_new; // the rows that hold memory after this: those that stay and those to come
+        bool    gives_up     = false;      // an idle slot gives up its row
 
         for (const auto & other : slots) {
-            const int64_t n_held = other.kv_overflow ? 0 : other.prompt.n_tokens(); // its cells of the first pool
+            const int64_t n_held  = other.kv_overflow ? 0 : other.prompt.n_tokens(); // its cells of the first pool
+            const bool    has_row = other.prompt.n_tokens() > 0;                     // its state is in a row
 
             if (is_batch_priority_slot(other.id)) {
                 // its whole limit and its row are kept for it, in use or not
                 n_promised += std::max<int64_t>(0, other.n_ctx - n_held);
-                n_rows     += other.prompt.n_tokens() > 0 ? 0 : 1;
+                n_rows     += 1;
             } else if (&other == slot) {
                 n_cells_free += n_held;
+                n_rows       += has_row ? 1 : 0;
             } else if (other.is_processing()) {
                 n_promised += other.kv_overflow ? 0 : std::max<int64_t>(0, other.n_ctx_task - n_held);
-                n_rows     += other.prompt.n_tokens() > 0 ? 0 : 1; // a task that has not taken its row yet
-            } else if (with_idle && other.prompt.n_tokens() > 0) {
-                n_cells_free += n_held;
-                n_rows_free  += 1;
+                n_rows     += 1; // its row, taken or still to be
+            } else if (has_row) {
+                if (with_idle) {
+                    n_cells_free += n_held;
+                    gives_up      = true;
+                } else {
+                    n_rows += 1;
+                }
             }
         }
 
-        uint32_t n_rows_mark = info.n_rows_taken;
         if (info.n_rows > 0) {
-            n_rows_mark += (uint32_t) std::max<int64_t>(0, n_rows - n_rows_free);
-            if (n_rows_mark > info.n_rows) {
+            // while no row is given up, those that hold memory now go on holding it
+            if (!gives_up) {
+                n_rows = std::max<int64_t>(n_rows, info.n_rows_taken);
+            }
+            if (n_rows > (int64_t) info.n_rows) {
                 return -1 - (int64_t) info.n_cells; // there is no such row
             }
+        } else {
+            n_rows = 0;
         }
 
-        return kv_lazy_cells(info, n_rows_mark) - (int64_t) info.n_cells_taken + n_cells_free - n_promised;
+        return kv_lazy_cells(info, (uint32_t) n_rows) - (int64_t) info.n_cells_taken + n_cells_free - n_promised;
     }
 
     // an idle slot gives up what it holds, its cells and its row, saved to the prompt cache first
@@ -2756,13 +2767,13 @@ private:
     // conversations come back from there when they go on, into the pool that has the room then.
     // With that, the cells in a pool never add up to more than it has, and no step is refused for a cached prompt.
     // slot: the task's own, which is not counted.
-    void kv_fit_make_room(const server_slot & slot, bool overflow, int64_t n_room) {
-        // Lazy sequence memory: the row of the task, and its cells when it is fitted to the first pool, have to fit
-        // in what the memory may take beside what is in use and promised. Until they do, the idle slots give up
-        // what they hold, the least recently used first, whichever pool their cells are in: each has a row.
+    // n_rows_new: with lazy sequence memory, the rows that the task and its children are still to take
+    void kv_fit_make_room(const server_slot & slot, bool overflow, int64_t n_room, int32_t n_rows_new = 0) {
+        // Lazy sequence memory: the rows of the task and of its children, and its cells when it is fitted to the
+        // first pool, have to fit in what the memory may take beside what is in use and promised. Until they do,
+        // the idle slots give up what they hold, the least recently used first, whichever pool their cells are in:
+        // each has a row.
         if (kv_lazy) {
-            const int32_t n_rows_new = slot.prompt.n_tokens() > 0 ? 0 : 1;
-
             while (kv_lazy_free(&slot, n_rows_new, false) < (overflow ? 0 : n_room)) {
                 server_slot * lru = nullptr;
                 for (auto & other : slots) {
@@ -5276,6 +5287,16 @@ private:
                             return;
                         }
 
+                        // The room of the task: the limit of its slot, and with fitted tasks what its pool has
+                        // for it beside the tasks at work and the slots that come first (kv_fit_task), which is less
+                        // when the task was started with what there is. A prompt that does not fit in it is not
+                        // read: its cells would be those that are promised to others.
+                        const int32_t n_ctx_room = kv_fit ? std::min(slot.n_ctx, slot.n_ctx_task) : slot.n_ctx;
+                        if (n_ctx_room < slot.n_ctx && slot.task->n_tokens() >= n_ctx_room) {
+                            SLT_WRN(slot, "the prompt (%d tokens) does not fit in the %d KV cells that the %s pool has for the task now\n",
+                                    slot.task->n_tokens(), n_ctx_room, slot.kv_overflow ? "second" : "first");
+                        }
+
                         if (!slot.can_split()) {
                             if (slot.task->n_tokens() > n_ubatch) {
                                 send_error(slot,
@@ -5288,23 +5309,23 @@ private:
                                 return;
                             }
 
-                            if (slot.task->n_tokens() > slot.n_ctx) {
+                            if (slot.task->n_tokens() > n_ctx_room) {
                                 send_error(
-                                    slot,
+                                    slot.task->id,
                                     string_format(
                                         "input (%d tokens) is larger than the max context size (%d tokens). skipping",
-                                        slot.task->n_tokens(), slot.n_ctx),
-                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                        slot.task->n_tokens(), n_ctx_room),
+                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE, slot.task->n_tokens(), n_ctx_room);
                                 slot.release();
                                 return;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
-                                send_error(slot,
+                            if (slot.task->n_tokens() >= n_ctx_room) {
+                                send_error(slot.task->id,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
-                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                                         slot.task->n_tokens(), n_ctx_room),
+                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE, slot.task->n_tokens(), n_ctx_room);
                                 slot.release();
                                 return;
                             }
