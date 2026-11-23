@@ -12,6 +12,7 @@
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/batch-get.cuh"
 #include "ggml-cuda/binbcast.cuh"
+#include "ggml-cuda/card-memory.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
@@ -6034,10 +6035,27 @@ static int ggml_cuda_physical_device_share_count(int device) {
     return info.devices[device].physical_share_count;
 }
 
+// CUDA's figure of the free memory is not always the whole card's (card-memory.cuh): the smaller of the two is what
+// the card can give.
+static void ggml_cuda_limit_free_memory_to_card(int device, size_t * free) {
+    char pci_bus_id[32] = {};
+    if (cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), ggml_cuda_get_physical_device(device)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+
+    size_t free_card = 0;
+    if (ggml_cuda_card_memory_free(pci_bus_id, &free_card)) {
+        *free = std::min(*free, free_card);
+    }
+}
+
 void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total) {
     ggml_cuda_set_device(device);
 
     CUDA_CHECK(cudaMemGetInfo(free, total));
+
+    ggml_cuda_limit_free_memory_to_card(device, free);
 
     // virtual devices sharing one physical GPU share its memory pool; split it between them
     const int share_count = ggml_cuda_physical_device_share_count(device);
@@ -6210,6 +6228,8 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
         }
     }
 #endif // defined(__linux__) && !defined(GGML_USE_HIP)
+
+    ggml_cuda_limit_free_memory_to_card(ctx->device, free);
 
     // virtual devices sharing one physical GPU share its memory pool; split it between them
     const int share_count = ggml_cuda_physical_device_share_count(ctx->device);
