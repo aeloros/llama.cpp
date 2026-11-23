@@ -1843,6 +1843,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MODEL_COPY_CACHE_RAM").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--model-copy-keep-conversations" },
+        "a conversation that the model copy read last goes on in the copy while it is loaded and has the room, also\n"
+        "when the first model is free (default: disabled). it is not read again then, and the copy stays loaded for\n"
+        "as long as such a conversation goes on. without it the first model comes first",
+        [](common_params & params) {
+            params.model_copy_keep_conversations = true;
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_KEEP_CONVERSATIONS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

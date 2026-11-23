@@ -105,6 +105,7 @@ class ServerProcess:
     model_copy_headroom: int | None = None
     model_copy_draft: bool | None = None
     model_copy_cache_ram: int | None = None
+    model_copy_keep_conversations: bool = False
     extra_args: list | None = None # more server arguments, as they are
     swa_full: bool | None = False
     server_slots: bool | None = False
@@ -265,6 +266,8 @@ class ServerProcess:
                 server_args.append("--no-model-copy-draft")
             if self.model_copy_cache_ram is not None:
                 server_args.extend(["--model-copy-cache-ram", self.model_copy_cache_ram])
+            if self.model_copy_keep_conversations:
+                server_args.append("--model-copy-keep-conversations")
         if self.swa_full:
             server_args.append("--swa-full")
         if self.server_slots:

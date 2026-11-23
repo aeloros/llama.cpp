@@ -482,7 +482,9 @@ def test_a_server_with_a_second_pool_a_slot_that_comes_first_and_a_copy():
     assert copy["tasks_first"] == 0
 
 
-# A conversation goes on in the model that read it: the copy has cells and a prompt cache of its own.
+# Where a conversation goes on. The copy has cells and a prompt cache of its own, so a conversation that it read is
+# read again by the first model. By default the first model comes first all the same; with
+# --model-copy-keep-conversations the conversation goes on in the copy while the copy is loaded.
 
 STORY = (
     "Once upon a time there was a little cat who lived in a big house. The cat had a friend, a small brown dog, and "
@@ -521,6 +523,7 @@ def wait_fast(what, cond, seconds=10.0):
 
 def test_a_conversation_goes_on_in_the_copy_that_read_it():
     global server
+    server.model_copy_keep_conversations = True
     server.model_copy_after = 1
     server.model_copy_ctx_size = 2048
     server.model_copy_release = 60
@@ -553,6 +556,7 @@ def test_a_conversation_goes_on_in_the_copy_that_read_it():
 
 def test_a_conversation_that_the_first_model_read_last_stays_there():
     global server
+    server.model_copy_keep_conversations = True
     server.model_copy_after = 1
     server.model_copy_ctx_size = 2048
     server.model_copy_release = 60
@@ -849,3 +853,28 @@ def test_the_second_pool_leaves_the_memory_that_a_loading_copy_has_claimed(tmp_p
     text = log()
     assert "the second pool of KV cells gets no task for now" in text
     assert "the second pool of KV cells took its memory" not in text
+
+
+def test_the_first_model_comes_first_for_a_conversation_of_the_copy():
+    global server
+    server.model_copy_after = 1
+    server.model_copy_ctx_size = 2048
+    server.model_copy_release = 60
+    server.start()
+    assert the_copy()["keep_conversations"] is False
+
+    n_story = n_tokens(STORY)
+
+    # the first request of the conversation arrives while the first model works on a task, so it goes to the copy
+    out, first = while_a_task_runs(LONG_TASK, lambda: complete(n_predict=16, prompt=STORY, cache_prompt=True))
+    assert out["res"].status_code == 200
+    assert the_copy()["n_tasks_total"] == 1
+
+    # the first model is free now, and it comes first: the conversation goes on there, where it is read again
+    second = complete(n_predict=16, prompt=STORY + first["content"] + " And then the cat", cache_prompt=True)
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 1
+    assert copy["n_tasks_back"] == 0
+    assert copy["state"] == "loaded"
+    # read again there, but for its first sentence: that is the long task's prompt, which the slot still had
+    assert second["timings"]["prompt_n"] >= n_story - n_tokens(PROMPT) - 1

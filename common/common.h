@@ -682,6 +682,7 @@ struct common_params {
     int32_t              model_copy_headroom   = 1024;     // MiB that the copy's devices have to have free beyond what the copy takes, for it to be loaded; -1 = the devices are not asked
     bool                 model_copy_draft      = true;     // the copy drafts tokens as the first model does
     int32_t              model_copy_cache_ram_mib = 8192;  // the copy's own prompt cache, as cache_ram_mib
+    bool                 model_copy_keep_conversations = false; // a conversation that the copy read last goes on there, also when the first model is free
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise

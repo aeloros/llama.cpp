@@ -6514,6 +6514,10 @@ struct server_model_copy {
         }
         SRV_INF("model copy: its own prompt cache holds up to %d MiB of system memory (--model-copy-cache-ram)\n",
                 params_first.model_copy_cache_ram_mib);
+        if (params_first.model_copy_keep_conversations) {
+            SRV_INF("%s", "model copy: a conversation that the copy read last goes on there, also when the first model is free "
+                          "(--model-copy-keep-conversations)\n");
+        }
         thread_timer = std::thread([this]() { run_timer(); });
     }
 
@@ -6548,8 +6552,9 @@ struct server_model_copy {
         std::unique_lock<std::mutex> lock(mutex);
         to_copy = false;
 
-        // which model has this conversation
-        const int32_t n_prefix    = tokens != nullptr && counted ? (int32_t) tokens->size() - N_PREFIX_TAIL : 0;
+        // which model has this conversation (--model-copy-keep-conversations)
+        const bool    keeps       = params_first.model_copy_keep_conversations;
+        const int32_t n_prefix    = keeps && tokens != nullptr && counted ? (int32_t) tokens->size() - N_PREFIX_TAIL : 0;
         uint64_t      hash_prefix = 0;
         prefix_rec    rec_old     = { 0, 0, false, 0 };
         if (n_prefix > 0) {
@@ -6564,7 +6569,8 @@ struct server_model_copy {
         // the first pool cannot hold it at all
         const bool is_large = n_home > 0 && n_cells > n_home;
 
-        // a conversation that the copy has goes on there while the copy is loaded, also when the first model is free
+        // With --model-copy-keep-conversations a conversation that the copy has goes on there while the copy is loaded,
+        // also when the first model is free. Without it the first model comes first: is_back is never set
         const bool is_back = rec_old.n > 0 && rec_old.in_copy && state == LOADED;
 
         // A task that the first pool cannot hold and an empty copy can waits here for the copy's room, as long as the
@@ -6666,6 +6672,7 @@ struct server_model_copy {
             { "after",         n_after },
             { "release",       n_release },
             { "cache_ram",     params_first.model_copy_cache_ram_mib }, // MiB, the copy's own prompt cache
+            { "keep_conversations", params_first.model_copy_keep_conversations },
             { "tasks",         n_copy },         // the tasks the copy has now
             { "tasks_first",   n_first },        // the counted tasks the first model has now
             { "n_tasks_total", n_tasks_total },  // tasks sent to the copy since the server started
