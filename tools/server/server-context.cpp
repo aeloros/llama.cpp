@@ -2079,6 +2079,10 @@ private:
         // with per-slot limits, only a slot whose context holds the prompt can serve an unpinned task
         const int n_ctx_min = n_ctx_needed(task);
 
+        // With a model copy the tasks come without the id of a slot, but for the slots that come first: such a slot is
+        // given only to the task that asks for it by its id
+        const bool keeps_first_slots = !params_base.model_copy_devices.empty() && task.id_slot == -1;
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -2098,6 +2102,10 @@ private:
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
+                    continue;
+                }
+
+                if (keeps_first_slots && is_batch_priority_slot(slot.id)) {
                     continue;
                 }
 
@@ -2154,14 +2162,19 @@ private:
         // find an empty slot, or the one that has been least recently used
         if (ret == nullptr) {
             // none free that is large enough: the caller defers the task until one is released
-            const auto free_slots = get_free_slots(1, -1, n_ctx_min);
+            const auto free_slots = get_free_slots(keeps_first_slots ? slots.size() : 1, -1, n_ctx_min);
 
-            if (!free_slots.empty()) {
-                ret = free_slots[0];
+            for (server_slot * slot : free_slots) {
+                if (keeps_first_slots && is_batch_priority_slot(slot->id)) {
+                    continue;
+                }
+
+                ret = slot;
 
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
 
                 update_cache = true;
+                break;
             }
         }
 
@@ -6653,6 +6666,60 @@ struct server_model_copy {
         });
     }
 
+    // a slot that comes first (--batch-priority-slots): its id is binding, and its tasks stay with the first model
+    bool comes_first(int id_slot) const {
+        const auto & prio = params_first.batch_priority_slots;
+        return std::find(prio.begin(), prio.end(), id_slot) != prio.end();
+    }
+
+    // The slots of the copy for /slots, numbered from id_first on: asked of the copy when it is loaded, reported idle
+    // when it is not.
+    json slots_json(int id_first, const std::function<bool()> & should_stop) {
+        json res = json::array();
+
+        bool is_asked = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (state == LOADED) {
+                n_queries++; // the copy is not unloaded while it is asked
+                is_asked = true;
+            }
+        }
+        if (is_asked) {
+            {
+                server_response_reader rd(ctx->impl->queue_tasks, ctx->impl->queue_results, HTTP_POLLING_SECONDS);
+                server_task task(SERVER_TASK_TYPE_SLOT_GET);
+                task.id = rd.get_new_id();
+                rd.post_task(std::move(task), true);
+
+                auto result = rd.next(should_stop);
+                if (result && !result->is_error()) {
+                    if (auto * res_slots = dynamic_cast<server_task_result_slots *>(result.get())) {
+                        res = res_slots->slots_data;
+                    }
+                }
+            }
+            std::unique_lock<std::mutex> lock(mutex);
+            n_queries--;
+            cv.notify_all();
+        }
+
+        if (res.empty()) {
+            for (int i = 0; i < n_parallel; i++) {
+                res.push_back(json {
+                    { "id",            i },
+                    { "n_ctx",         n_ctx },
+                    { "is_processing", false },
+                });
+            }
+        }
+        for (auto & slot : res) {
+            slot["id"]         = id_first + json_value(slot, "id", 0);
+            slot["model_copy"] = true;
+        }
+        return res;
+    }
+
     // the queues of the copy: only for a task that route() sent there, while its handle is held
     server_queue    & queue_tasks()   { return ctx->impl->queue_tasks; }
     server_response & queue_results() { return ctx->impl->queue_results; }
@@ -6793,6 +6860,7 @@ private:
                                  // there is one the copy gets no task, and it is unloaded when it has none
     uint64_t n_tasks_spill = 0;  // tasks that went to the copy because the first pool had not the cells for them
     uint64_t n_tasks_waited = 0; // tasks that went to the copy after they had waited for its room
+    int32_t  n_queries     = 0;  // requests that ask the copy for its slots now: it is not unloaded meanwhile
     int32_t  n_copy        = 0;  // tasks that the copy has, the ones that wait for it to load included
     int64_t  n_cells_copy  = 0;  // the KV cells that those tasks are counted with
     int64_t  t_idle        = 0;  // when the copy's last task ended
@@ -6865,6 +6933,12 @@ private:
         }
 
         p.sleep_idle_seconds = -1;
+
+        // the outputs of a batch for its own slots, as a model load works them out: params_first has those of the
+        // first model's slots, and the copy's size is measured with these parameters before any load
+        const auto output_limits = server_output_limits(p);
+        p.n_outputs_max         = output_limits.total;
+        p.n_outputs_max_per_seq = output_limits.per_seq;
 
         return p;
     }
@@ -7178,7 +7252,7 @@ private:
             }
 
             const bool is_idle = n_release >= 0 && ggml_time_ms() - t_idle >= (int64_t) n_release * 1000;
-            if (state == LOADED && n_copy == 0 && (is_idle || n_pool > 0 || gives_way)) {
+            if (state == LOADED && n_copy == 0 && n_queries == 0 && (is_idle || n_pool > 0 || gives_way)) {
                 if (gives_way) {
                     SRV_INF("%s", "model copy: unloading, its device is short of memory\n");
                 } else if (n_pool > 0) {
@@ -7299,8 +7373,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.apply_chat_session(chat_session);
 
-            // a slot id names a slot of the first model
-            task.id_slot = to_copy ? -1 : json_value(data, "id_slot", -1);
+            // A slot id names a slot of the first model. With a model copy the server places the tasks itself: only
+            // the id of a slot that comes first is binding then, and any other id says no more than that the request
+            // was let in (a proxy in front lets in one request for each slot that /props counts)
+            task.id_slot = json_value(data, "id_slot", -1);
+            if (model_copy != nullptr && (to_copy || !model_copy->comes_first(task.id_slot))) {
+                task.id_slot = -1;
+            }
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -7610,7 +7689,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
-        { "total_slots",                 params.n_parallel },
+        // the slots of a model copy count: a proxy in front lets in one request for each slot
+        { "total_slots",                 params.n_parallel + (params.model_copy_devices.empty() ? 0 : std::max(1, params.model_copy_n_parallel)) },
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
@@ -7789,7 +7869,14 @@ void server_routes::init_routes() {
             }
         }
 
-        res->ok(res_task->to_json());
+        json slots = res_task->to_json();
+        if (model_copy != nullptr) {
+            // the slots of the model copy follow on, numbered after those of the first model
+            for (auto & slot : model_copy->slots_json(params.n_parallel, req.should_stop)) {
+                slots.push_back(std::move(slot));
+            }
+        }
+        res->ok(slots);
         return res;
     };
 

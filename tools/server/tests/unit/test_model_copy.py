@@ -90,6 +90,9 @@ def test_without_the_option_there_is_no_copy():
     res = server.make_request("GET", "/props")
     assert res.status_code == 200
     assert "model_copy" not in res.body
+    assert res.body["total_slots"] == 2
+    res = server.make_request("GET", "/slots")
+    assert [slot["id"] for slot in res.body] == [0, 1]
     assert complete()["tokens_predicted"] == 16
 
 
@@ -878,3 +881,81 @@ def test_the_first_model_comes_first_for_a_conversation_of_the_copy():
     assert copy["state"] == "loaded"
     # read again there, but for its first sentence: that is the long task's prompt, which the slot still had
     assert second["timings"]["prompt_n"] >= n_story - n_tokens(PROMPT) - 1
+
+
+# The slots of the copy count as slots of the server: /props and /slots have them after those of the first model. A
+# proxy in front that lets in one request for each slot so lets in as many as both models have slots for. The server
+# places the tasks itself then: the id of a slot is binding only for a slot that comes first.
+
+def test_the_copys_slots_count_as_slots_of_the_server():
+    global server
+    server.model_copy_parallel = 3
+    server.model_copy_release = 60
+    server.start()
+
+    res = server.make_request("GET", "/props")
+    assert res.body["total_slots"] == 2 + 3
+
+    def slots():
+        res = server.make_request("GET", "/slots")
+        assert res.status_code == 200
+        return res.body
+
+    # not loaded yet: its slots are there, idle
+    body = slots()
+    assert [slot["id"] for slot in body] == [0, 1, 2, 3, 4]
+    assert [bool(slot.get("model_copy")) for slot in body] == [False, False, True, True, True]
+    assert not any(slot["is_processing"] for slot in body)
+
+    # a task in the copy shows in one of its slots (every task goes to the copy here, --model-copy-after 0)
+    t, out = in_background({"prompt": PROMPT, "n_predict": 900, "ignore_eos": True, "cache_prompt": False})
+    try:
+        seen = {}
+
+        def a_copy_slot_works():
+            body = slots()
+            seen["ids"] = [slot["id"] for slot in body]
+            seen["busy"] = [slot["id"] for slot in body if slot["is_processing"]]
+            return len(seen["busy"]) > 0
+
+        wait_fast("no slot started processing", a_copy_slot_works)
+    finally:
+        t.join()
+    assert out["res"].status_code == 200
+    assert seen["ids"] == [0, 1, 2, 3, 4]
+    assert len(seen["busy"]) == 1 and seen["busy"][0] >= 2
+    assert the_copy()["n_tasks_total"] == 1
+
+
+def test_with_a_copy_only_the_id_of_a_slot_that_comes_first_is_binding():
+    global server
+    server.n_slots = 3
+    server.n_ctx = 8192
+    server.model_copy_after = 5       # far away: the tasks stay with the first model here
+    server.model_copy_release = 60
+    server.extra_args = ["--kv-unified-per-slot", "256,2048,2048", "--batch-priority-slots", "0"]
+    server.start()
+
+    # a task without a slot id never takes the slot that comes first, though that one is empty and unused
+    seen = set()
+    for i in range(6):
+        seen.add(complete(n_predict=8, prompt="Story %d. " % i + PROMPT)["id_slot"])
+    assert seen <= {1, 2}
+
+    # the slot that comes first is given to the task that asks for it
+    assert complete(n_predict=8, id_slot=0)["id_slot"] == 0
+
+    # the id of another slot is not binding: a task with the id of a slot that is at work does not wait for that slot
+    t, out = in_background({"prompt": PROMPT, "n_predict": 1900, "ignore_eos": True, "cache_prompt": False, "id_slot": 1})
+    try:
+        wait_fast("the first model got no task", lambda: the_copy()["tasks_first"] == 1)
+        body = complete(n_predict=8, id_slot=1)
+        long_one_at_work = the_copy()["tasks_first"] == 1
+    finally:
+        t.join()
+    assert out["res"].status_code == 200
+    assert out["res"].body["tokens_predicted"] == 1900
+    assert long_one_at_work
+    assert body["id_slot"] in (1, 2)
+    assert body["id_slot"] != out["res"].body["id_slot"]
+    assert the_copy()["n_tasks_total"] == 0
