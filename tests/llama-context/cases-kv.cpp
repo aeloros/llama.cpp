@@ -576,6 +576,149 @@ struct case_streams_release : ctx_test {
     }
 };
 
+// - a context with lazy memory holds none of its cells before a sequence has any
+// - a sequence takes the cells that it needs and decodes to the logits of a context that holds its memory whole
+// - removing the sequence that lies above the others gives its cells back; removing one below them does not
+// - a sequence restores from its saved state into cells that are taken for it
+// - clearing the memory gives everything back, and the memory is usable afterwards
+// On the CPU the memory that is not taken faults when it is touched, so a stray read or write ends the test.
+struct case_lazy_cells : ctx_test {
+    const char * name() const override { return "lazy_c"; }
+
+    const char * description() const override {
+        return "lazy memory: cells take their memory when sequences need them, and give it back";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 4096;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        ctx_opts opts_lazy = opts;
+        opts_lazy.n_seq_budget = 2;
+        opts_lazy.quiet        = true;
+
+        auto ctx = mr.ctx(opts_lazy);
+        if (!ctx) {
+            // LLAMA_TEST_LAZY_STRICT: for a run over models whose memory has to support it
+            if (getenv("LLAMA_TEST_LAZY_STRICT")) {
+                return case_result::fail("a context with lazy memory was refused");
+            }
+            return case_result::skip("the memory of this model cannot be lazy");
+        }
+
+        auto ctx_ref = mr.ctx(opts);
+        if (!ctx_ref) {
+            return case_result::fail();
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx.get());
+
+        llama_memory_lazy_info info;
+        CTX_REQUIRE(!llama_memory_get_lazy_info(llama_get_memory(ctx_ref.get()), &info), "a context with its memory whole says that it is lazy");
+        CTX_REQUIRE(llama_memory_get_lazy_info(mem, &info), "a context that was created with lazy memory says that it is not lazy");
+        CTX_REQUIRE(info.n_cells >= 4096 && info.cell_bytes > 0, "the lazy memory does not say what its cells are");
+        CTX_REQUIRE(info.budget > 0, "the lazy memory has no budget");
+        CTX_REQUIRE(info.n_cells_taken == 0, "cells are taken before a sequence has any");
+        CTX_REQUIRE(info.taken == llama_memory_lazy_bytes(mem, 0, info.n_rows_taken), "memory is taken before a sequence has cells");
+
+        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        // tokens [p0, p1) of a sequence, and the logits of the last one
+        auto decode_n = [&](llama_context * c, llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<float> & logits) {
+            const llama_pos n_chunk = 128;
+            for (llama_pos p = p0; p < p1 - 1; p += n_chunk) {
+                if (!decode_gen(c, n_vocab, seq_id, p, std::min(p + n_chunk, p1 - 1))) {
+                    return false;
+                }
+            }
+            return decode_one(c, gen_token(n_vocab, seq_id, p1 - 1), p1 - 1, seq_id) && get_current_logits(c, logits);
+        };
+
+        // what the memory says it holds is what the marks take, and it stays within the budget
+        auto consistent = [&](uint32_t n_cells_expected, std::string & why) {
+            llama_memory_lazy_info cur;
+            if (!llama_memory_get_lazy_info(mem, &cur)) {
+                why = "the memory no longer says that it is lazy";
+                return false;
+            }
+            if (cur.n_cells_taken != n_cells_expected) {
+                why = "the cell mark is at " + std::to_string(cur.n_cells_taken) + ", expected " + std::to_string(n_cells_expected);
+                return false;
+            }
+            if (cur.taken != llama_memory_lazy_bytes(mem, cur.n_cells_taken, cur.n_rows_taken)) {
+                why = "the memory holds " + std::to_string(cur.taken) + " bytes, and its marks take " +
+                      std::to_string(llama_memory_lazy_bytes(mem, cur.n_cells_taken, cur.n_rows_taken));
+                return false;
+            }
+            if (cur.taken > cur.budget) {
+                why = "the memory holds more than its budget";
+                return false;
+            }
+            return true;
+        };
+
+        // the positions stay within the context that the model was trained with: a model with learned positions
+        // has no more of them
+        const llama_pos n_train = llama_model_n_ctx_train(mr.model);
+        CTX_REQUIRE(n_train >= 16, "the model was trained with too short a context");
+
+        const llama_pos n1 = std::min<llama_pos>(1500, n_train - 2);
+        const llama_pos n0 = std::min<llama_pos>(200, n1/2);
+
+        // the marks: the highest cell in use, in steps of 256
+        const uint32_t mark0  = GGML_PAD((uint32_t) n0, 256);
+        const uint32_t mark01 = GGML_PAD((uint32_t) (n0 + n1 + 1), 256);
+
+        std::string why;
+
+        std::vector<float> logits0;
+        std::vector<float> logits1;
+        CTX_REQUIRE(decode_n(ctx.get(), 0, 0, n0, logits0), "failed to decode seq 0");
+        CTX_REQUIRE(consistent(mark0, why), "after seq 0: " + why);
+        CTX_REQUIRE(decode_n(ctx.get(), 1, 0, n1, logits1), "failed to decode seq 1");
+        CTX_REQUIRE(consistent(GGML_PAD((uint32_t) (n0 + n1), 256), why), "after seq 1: " + why);
+
+        std::vector<float> ref0;
+        std::vector<float> ref1;
+        CTX_REQUIRE(decode_n(ctx_ref.get(), 0, 0, n0, ref0), "failed to decode seq 0 with its memory whole");
+        CTX_REQUIRE(decode_n(ctx_ref.get(), 1, 0, n1, ref1), "failed to decode seq 1 with its memory whole");
+
+        logits_diff diff = compare_logits(ref0.data(), logits0.data(), ref0.size());
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 0 produced different logits in lazy memory" + diff_str(diff));
+        diff = compare_logits(ref1.data(), logits1.data(), ref1.size());
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 1 produced different logits in lazy memory" + diff_str(diff));
+
+        // seq 1 lies above seq 0: without it the mark comes down to seq 0, and its state takes the cells again
+        std::vector<uint8_t> state1;
+        CTX_REQUIRE(get_seq_state(ctx.get(), 1, 0, state1), "failed to save seq 1");
+        CTX_REQUIRE(seq_rm(ctx.get(), 1), "failed to remove seq 1");
+        CTX_REQUIRE(consistent(mark0, why), "after seq 1 was removed: " + why);
+        CTX_REQUIRE(set_seq_state(ctx.get(), 1, 0, state1), "failed to restore seq 1");
+        CTX_REQUIRE(consistent(GGML_PAD((uint32_t) (n0 + n1), 256), why), "after seq 1 was restored: " + why);
+
+        CTX_REQUIRE(decode_n(ctx.get(),     1, n1, n1 + 1, logits1), "failed to go on with the restored seq 1");
+        CTX_REQUIRE(decode_n(ctx_ref.get(), 1, n1, n1 + 1, ref1),    "failed to go on with seq 1 with its memory whole");
+        diff = compare_logits(ref1.data(), logits1.data(), ref1.size());
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "the restored seq 1 produced different logits in lazy memory" + diff_str(diff));
+
+        // seq 0 lies below seq 1: its cells stay taken when it goes
+        CTX_REQUIRE(seq_rm(ctx.get(), 0), "failed to remove seq 0");
+        CTX_REQUIRE(consistent(mark01, why), "after seq 0 was removed: " + why);
+
+        llama_memory_clear(mem, true);
+        CTX_REQUIRE(consistent(0, why), "after the memory was cleared: " + why);
+
+        CTX_REQUIRE(decode_n(ctx.get(), 0, 0, n0, logits0), "failed to decode seq 0 after the memory was cleared");
+        CTX_REQUIRE(consistent(mark0, why), "after seq 0 was decoded again: " + why);
+        diff = compare_logits(ref0.data(), logits0.data(), ref0.size());
+        CTX_REQUIRE(diff.nmse() <= NMSE_THRESHOLD, "seq 0 produced different logits after the memory went back and was taken again" + diff_str(diff));
+
+        return case_result::pass();
+    }
+};
+
 // - load the state saved by the baseline case
 // - replay its last token
 // - generate again and compare against the baseline logits
@@ -1366,6 +1509,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_streams_state>(false));
     cases.push_back(std::make_unique<case_streams_state>(true));
     cases.push_back(std::make_unique<case_streams_release>());
+    cases.push_back(std::make_unique<case_lazy_cells>());
     cases.push_back(std::make_unique<case_state_load>());
     cases.push_back(std::make_unique<case_seq_cp>(false));
     cases.push_back(std::make_unique<case_seq_cp>(true));

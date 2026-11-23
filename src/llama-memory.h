@@ -9,11 +9,46 @@
 #include <vector>
 
 struct llama_ubatch;
+struct llama_memory_lazy_info; // llama-ext.h
 
 class llama_batch_allocr;
 
 class llama_io_write_i;
 class llama_io_read_i;
+
+// Lazy sequence memory of a context (llama_context_params::n_seq_budget). The memory modules take the memory of their
+// cells and rows when sequences need it and give it back, and what they hold together stays within one budget.
+struct llama_memory_lazy {
+    size_t budget = 0; // bytes that the modules may take together; 0 until the context has set it: no limit
+    size_t taken  = 0; // bytes taken now
+
+    // Finishes the work of the context that is under way. Called before memory goes back: a graph that still runs
+    // may read cells that are no longer in use, and memory that is given back under it costs the process the device.
+    std::function<void()> synchronize;
+
+    bool fits(size_t n_bytes) const {
+        return budget == 0 || taken + n_bytes <= budget;
+    }
+};
+
+// a part of a tensor that lives in a lazy buffer: size bytes from offset, in bytes from the start of the tensor
+struct llama_memory_lazy_range {
+    const ggml_tensor * tensor;
+    size_t offset;
+    size_t size;
+};
+
+// Take the memory of the ranges, within the budget. Returns false if the budget or the device does not have it: what
+// the call took before it failed stays taken, and counted, until it is given back.
+bool llama_memory_lazy_take(llama_memory_lazy & lazy, const std::vector<llama_memory_lazy_range> & ranges);
+
+// Give back the memory of the tensors that the ranges do not need: every unit of a tensor that none of the ranges
+// touches (a tensor in a lazy buffer of a memory module has its units to itself, see llama_memory_bufs::emplace_lazy).
+// The work of the context that is under way is finished first (llama_memory_lazy::synchronize).
+void llama_memory_lazy_keep(llama_memory_lazy & lazy, const std::vector<const ggml_tensor *> & tensors, const std::vector<llama_memory_lazy_range> & keep);
+
+// The bytes that the ranges take in buffers that hold nothing else: the units that they touch, each counted once.
+size_t llama_memory_lazy_size(const std::vector<llama_memory_lazy_range> & ranges);
 
 struct llama_memory_params {
     // kv cache
@@ -29,6 +64,9 @@ struct llama_memory_params {
 
     // only simulate the memory allocations
     bool no_alloc;
+
+    // not null: the cells and rows are to take their memory lazily, within this budget
+    llama_memory_lazy * lazy;
 };
 
 // the tensor contexts and backend buffers of a memory instance
@@ -40,7 +78,12 @@ struct llama_memory_bufs {
     // returns the buffer, for logging
     ggml_backend_buffer_t emplace(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft, const char * name);
 
-    // the memory used by the tensors: the buffer sizes, or the simulated sizes if no_alloc is set
+    // as emplace, with a lazy buffer (ggml_backend_buft_alloc_buffer_lazy): the address range of the tensors is
+    // reserved and no memory is taken. Every tensor starts on a unit of the buffer type, so that its memory is taken
+    // and given back without regard to its neighbours.
+    ggml_backend_buffer_t emplace_lazy(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft, const char * name);
+
+    // the memory used by the tensors: what the buffers hold, or the simulated sizes if no_alloc is set
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
     // allocate a single ctx buffer - for the memory instances that keep their own buffer layout
@@ -184,6 +227,27 @@ struct llama_memory_i {
         GGML_UNUSED(seq_id);
         GGML_UNUSED(strm);
         return false;
+    }
+
+    //
+    // lazy memory (llama_memory_lazy)
+    //
+
+    // what the memory holds lazily; false if it holds all of its memory from the start
+    virtual bool lazy_info(llama_memory_lazy_info & info) const {
+        GGML_UNUSED(info);
+        return false;
+    }
+
+    // the bytes that the cells [0, n_cells) of stream 0 and the rows [0, n_rows) take together
+    virtual size_t lazy_bytes(uint32_t n_cells, uint32_t n_rows) const {
+        GGML_UNUSED(n_cells);
+        GGML_UNUSED(n_rows);
+        return 0;
+    }
+
+    // give back the memory above the cells and rows that are in use
+    virtual void lazy_trim() {
     }
 
     //

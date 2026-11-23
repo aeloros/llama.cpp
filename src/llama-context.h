@@ -346,6 +346,9 @@ private:
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
+    // the budget of the memory module when it is lazy (cparams.n_seq_budget); it has to outlive the module
+    llama_memory_lazy memory_lazy;
+
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 

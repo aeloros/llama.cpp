@@ -80,7 +80,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
                const char * name_tag,
-                     bool   is_indexer) :
+                     bool   is_indexer,
+        llama_memory_lazy * lazy_in) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), unified(unified || n_seq_max == 1), name_tag(name_tag), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
@@ -278,8 +279,24 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // Lazy memory: one pool of cells that this cache owns, with a cell a row of each tensor (the transposed V of a
+    // cache without flash attention is not), in one buffer of a type that can make lazy buffers. Otherwise the cache
+    // holds its memory whole, and lazy_info() says so.
+    if (lazy_in != nullptr && this->unified && n_stream == 1 && other == nullptr && !v_trans && !no_alloc &&
+            ctx_map.size() == 1 && ggml_backend_buft_lazy_granularity(ctx_map.begin()->first) > 0) {
+        lazy = lazy_in;
+    }
+
     // allocate the tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
+        if (lazy) {
+            // the address range of the tensors, and no memory: what is taken later is zero
+            ggml_backend_buffer_t buf = ctxs_bufs.emplace_lazy(std::move(ctx), buft, "kv cache");
+
+            LLAMA_LOG_INFO("%s: %10s KV buffer of %8.2f MiB takes its memory as its cells are used\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+            continue;
+        }
+
         ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
@@ -445,6 +462,9 @@ void llama_kv_cache::clear(bool data) {
             }
         }
     }
+
+    // no cell is in use: a lazy cache gives all of its memory back
+    lazy_trim_cells(true);
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -512,6 +532,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             }
         }
     }
+
+    // lazy memory: what lies above the cells that are left goes back. All of it when a sequence went from its first
+    // position on; after a removal of last tokens, which a rollback of a draft is, only when it is a lot.
+    lazy_trim_cells(p0 == 0);
 
     return true;
 }
@@ -640,6 +664,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
+
+    lazy_trim_cells(true);
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -887,6 +913,26 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     if (!success) {
         return {};
+    }
+
+    // Lazy memory: the cells that the batch was placed in take their memory now, before anything is applied. A
+    // batch that finds none is refused like one that finds no cells.
+    if (lazy) {
+        uint32_t n_cells = 0;
+        for (const auto & sinfo : res) {
+            for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+                if (sinfo.strm[s] != 0) {
+                    continue;
+                }
+                for (const uint32_t idx : sinfo.idxs[s]) {
+                    n_cells = std::max(n_cells, idx + 1);
+                }
+            }
+        }
+
+        if (!lazy_take(n_cells)) {
+            return {};
+        }
     }
 
     return res;
@@ -1286,6 +1332,10 @@ bool llama_kv_cache::get_can_shift() const {
     if (unified && n_stream > 1) {
         return false;
     }
+    // the K-shift graph covers every cell of the stream, and a lazy cache has memory only for those below its mark
+    if (lazy) {
+        return false;
+    }
     return true;
 }
 
@@ -1474,6 +1524,117 @@ bool llama_kv_cache::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
     seq_to_stream[seq_id] = strm;
 
     return true;
+}
+
+//
+// lazy memory
+//
+
+std::vector<llama_memory_lazy_range> llama_kv_cache::lazy_ranges(uint32_t c0, uint32_t c1) const {
+    std::vector<llama_memory_lazy_range> res;
+    if (c1 <= c0) {
+        return res;
+    }
+
+    // a cell is a row of each tensor
+    for (const auto & layer : layers) {
+        if (layer.k) {
+            res.push_back({ layer.k, (size_t) c0*layer.k->nb[1], (size_t) (c1 - c0)*layer.k->nb[1] });
+        }
+        if (layer.v) {
+            res.push_back({ layer.v, (size_t) c0*layer.v->nb[1], (size_t) (c1 - c0)*layer.v->nb[1] });
+        }
+    }
+
+    return res;
+}
+
+std::vector<const ggml_tensor *> llama_kv_cache::lazy_tensors() const {
+    std::vector<const ggml_tensor *> res;
+    for (const auto & layer : layers) {
+        if (layer.k) {
+            res.push_back(layer.k);
+        }
+        if (layer.v) {
+            res.push_back(layer.v);
+        }
+    }
+
+    return res;
+}
+
+bool llama_kv_cache::lazy_take(uint32_t n_cells) {
+    const uint32_t mark = std::min(get_size(0), (uint32_t) GGML_PAD(n_cells, LAZY_PAD));
+    if (mark <= lazy_mark) {
+        return true;
+    }
+
+    if (!llama_memory_lazy_take(*lazy, lazy_ranges(lazy_mark, mark))) {
+        LLAMA_LOG_WARN("%s: no memory for the cells %u to %u (%.2f of %.2f MiB are taken)\n", __func__,
+                lazy_mark, mark, lazy->taken/1024.0/1024.0, lazy->budget/1024.0/1024.0);
+
+        // what the call took above the mark goes back
+        llama_memory_lazy_keep(*lazy, lazy_tensors(), lazy_ranges(0, lazy_mark));
+        return false;
+    }
+
+    LLAMA_LOG_DEBUG("%s: the cells %u to %u have their memory (%.2f MiB are taken)\n", __func__, lazy_mark, mark, lazy->taken/1024.0/1024.0);
+
+    lazy_mark = mark;
+
+    return true;
+}
+
+void llama_kv_cache::lazy_trim_cells(bool exact) {
+    if (!lazy) {
+        return;
+    }
+
+    const uint32_t mark = std::min(get_size(0), (uint32_t) GGML_PAD(v_cells[0].used_max_p1(), LAZY_PAD));
+    if (mark >= lazy_mark) {
+        return;
+    }
+    if (!exact && lazy_mark - mark < LAZY_TRIM_MIN) {
+        return;
+    }
+
+    llama_memory_lazy_keep(*lazy, lazy_tensors(), lazy_ranges(0, mark));
+
+    LLAMA_LOG_DEBUG("%s: the memory of the cells %u to %u went back (%.2f MiB are taken)\n", __func__, mark, lazy_mark, lazy->taken/1024.0/1024.0);
+
+    lazy_mark = mark;
+}
+
+bool llama_kv_cache::lazy_info(llama_memory_lazy_info & info) const {
+    if (!lazy) {
+        return false;
+    }
+
+    info.budget        = lazy->budget;
+    info.taken         = lazy->taken;
+    info.n_cells       = get_size(0);
+    info.n_cells_taken = lazy_mark;
+
+    info.cell_bytes = 0;
+    for (const auto & r : lazy_ranges(0, 1)) {
+        info.cell_bytes += r.size;
+    }
+
+    return true;
+}
+
+size_t llama_kv_cache::lazy_bytes(uint32_t n_cells, uint32_t n_rows) const {
+    GGML_UNUSED(n_rows);
+
+    if (!lazy) {
+        return 0;
+    }
+
+    return llama_memory_lazy_size(lazy_ranges(0, std::min(get_size(0), (uint32_t) GGML_PAD(n_cells, LAZY_PAD))));
+}
+
+void llama_kv_cache::lazy_trim() {
+    lazy_trim_cells(true);
 }
 
 uint32_t llama_kv_cache::get_n_seq_max() const {
@@ -2612,6 +2773,15 @@ const slot_info_vec_t *   sinfos_in) {
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
 
+        // lazy memory: the cells that the state was placed in take their memory before the data is written
+        if (res && lazy && strm == 0 && !sinfo.empty()) {
+            uint32_t n_cells = 0;
+            for (const uint32_t idx : sinfo.idxs[0]) {
+                n_cells = std::max(n_cells, idx + 1);
+            }
+            res = lazy_take(n_cells);
+        }
+
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
         } catch (...) {
@@ -3140,7 +3310,7 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id) {
 }
 
 // the cleared ranges mirror the write pattern of state_read_data() - keep both in sync
-void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo) {
+void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo_in) {
     if (seq_id == -1) {
         clear(true);
         return;
@@ -3149,9 +3319,24 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
     seq_rm(seq_id, -1, -1);
 
     // zero the K/V data of the failed restore attempt - the attention can still read the data of free cells
-    if (sinfo.empty() || sinfo.size() == 0) {
+    if (sinfo_in.empty() || sinfo_in.size() == 0) {
         return;
     }
+
+    // lazy memory: the cells at or above the mark have no memory to clear, and are zero when they take it
+    slot_info sinfo_low;
+    if (lazy && strm == 0) {
+        sinfo_low = sinfo_in;
+
+        auto & idxs = sinfo_low.idxs[0];
+        idxs.erase(std::remove_if(idxs.begin(), idxs.end(), [&](uint32_t idx) { return idx >= lazy_mark; }), idxs.end());
+
+        if (idxs.empty()) {
+            return;
+        }
+    }
+
+    const slot_info & sinfo = lazy && strm == 0 ? sinfo_low : sinfo_in;
 
     const auto & cells = v_cells[strm];
 

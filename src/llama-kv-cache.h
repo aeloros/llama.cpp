@@ -117,7 +117,10 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // lightning indexer keys are rotated with the indexer RoPE parameters
-                       bool   is_indexer = false);
+                       bool   is_indexer = false,
+        // not null: the cells of the cache take their memory lazily, within this budget (see lazy below). It is
+        // honoured for one pool of cells that the cache owns, on one buffer type that can make lazy buffers
+          llama_memory_lazy *   lazy = nullptr);
 
     ~llama_kv_cache() = default;
 
@@ -156,6 +159,11 @@ public:
     bool stream_release(uint32_t strm) override;
     size_t stream_size(uint32_t strm) const override;
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
+
+    // lazy memory
+    bool   lazy_info (llama_memory_lazy_info & info) const override;
+    size_t lazy_bytes(uint32_t n_cells, uint32_t n_rows) const override;
+    void   lazy_trim () override;
 
     // state write/load
 
@@ -413,6 +421,29 @@ private:
 
     // false for an added stream that is without its memory (stream_release)
     bool stream_has_memory(uint32_t strm) const;
+
+    // Lazy memory (llama_memory_lazy), null if the cache holds all of its memory. The tensors of stream 0 are in a
+    // lazy buffer, and the cells below lazy_mark have their memory. The mark rises, in steps of LAZY_PAD cells, when a
+    // batch or a restored state is placed in cells above it (lazy_take), and it falls to the highest cell in use
+    // when cells are removed (lazy_trim_cells). Nothing may read or write a cell at or above the mark: get_n_kv() is
+    // the highest cell in use, padded to the same step, and the K-shift, which covers every cell, is off.
+    llama_memory_lazy * lazy = nullptr;
+
+    uint32_t lazy_mark = 0;
+
+    static constexpr uint32_t LAZY_PAD      = 256;  // as n_kv is padded
+    static constexpr uint32_t LAZY_TRIM_MIN = 8192; // a removal of last tokens gives back no less
+
+    // the memory of the cells [c0, c1) of stream 0, in every tensor, and those tensors
+    std::vector<llama_memory_lazy_range> lazy_ranges(uint32_t c0, uint32_t c1) const;
+    std::vector<const ggml_tensor *>     lazy_tensors() const;
+
+    // have the memory of the cells [0, n_cells); false if it cannot be had, and the mark stays
+    bool lazy_take(uint32_t n_cells);
+
+    // give back the memory above the highest cell in use. exact: all of it; otherwise only if LAZY_TRIM_MIN cells
+    // or more go back, so that a sequence that removes its last tokens and goes on keeps what it had
+    void lazy_trim_cells(bool exact);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

@@ -134,6 +134,38 @@ LLAMA_API size_t llama_memory_stream_size(llama_memory_t mem, int32_t strm);
 // Take the new cells of a sequence from a stream. Stream 0 is the one the cache was created with.
 // Returns false if the sequence still has cells.
 LLAMA_API bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm);
+
+//
+// Lazy sequence memory (llama_context_params::n_seq_budget)
+//
+// The cells of stream 0 and the rows of the recurrent state take their memory when sequences need it, and what they
+// hold together stays within a budget: what n_ctx cells and n_seq_budget rows take. The memory below the marks is
+// taken: a mark rises when a batch or a restored state needs cells or rows above it, and a batch that finds no
+// memory for them is refused like one that finds no cells. A mark falls when the sequences above it are removed.
+
+struct llama_memory_lazy_info {
+    size_t   budget        = 0; // bytes that cells and rows may take together
+    size_t   taken         = 0; // bytes taken now
+    uint32_t n_cells       = 0; // the cells of stream 0
+    uint32_t n_cells_taken = 0; // the cell mark: the cells below it have their memory
+    size_t   cell_bytes    = 0; // of one cell
+    uint32_t n_rows        = 0; // the rows of the recurrent state that are taken lazily, 0 if there are none
+    uint32_t n_rows_taken  = 0; // the row mark
+    size_t   row_bytes     = 0; // of one row, the part that is taken lazily
+};
+
+// false if the memory holds all of it from the start
+LLAMA_API bool llama_memory_get_lazy_info(llama_memory_t mem, llama_memory_lazy_info * info);
+
+// The bytes that the cells [0, n_cells) and the rows [0, n_rows) take together, in the units of the device. 0 if the
+// memory is not lazy.
+LLAMA_API size_t llama_memory_lazy_bytes(llama_memory_t mem, uint32_t n_cells, uint32_t n_rows);
+
+// Give back the memory above the cells and rows that are in use. The memory does that itself when a sequence is
+// removed from its first position on or the memory is cleared; after a removal of the last tokens of a sequence it
+// keeps what it has, so that a sequence that rolls back and goes on does not give memory back at every step.
+LLAMA_API void llama_memory_lazy_trim(llama_memory_t mem);
+
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);

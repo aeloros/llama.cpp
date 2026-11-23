@@ -39,7 +39,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* not null: lazy memory, see llama_memory_lazy */
+      llama_memory_lazy *   lazy = nullptr);
 
     ~llama_memory_hybrid() = default;
 
@@ -74,6 +76,10 @@ public:
     bool stream_release(uint32_t strm) override;
     size_t stream_size(uint32_t strm) const override;
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
+
+    bool   lazy_info (llama_memory_lazy_info & info) const override;
+    size_t lazy_bytes(uint32_t n_cells, uint32_t n_rows) const override;
+    void   lazy_trim () override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 

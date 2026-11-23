@@ -341,6 +341,9 @@ llama_context_ptr make_ctx(llama_model * model, const common_params & params, co
         cparams.n_batch  = std::max(cparams.n_batch,  (uint32_t) (opts.n_rs_seq + 1));
         cparams.n_ubatch = std::max(cparams.n_ubatch, (uint32_t) (opts.n_rs_seq + 1));
     }
+    if (opts.n_seq_budget) {
+        cparams.n_seq_budget = opts.n_seq_budget;
+    }
     if (opts.n_batch) {
         cparams.n_batch = opts.n_batch;
     }

@@ -189,6 +189,8 @@ llama_context::llama_context(
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
+    cparams.n_seq_budget = params.n_seq_budget;
+
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && (!llm_arch_supports_rs_rollback(model.arch) || !hparams.causal_attn)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
@@ -537,9 +539,28 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
             /*.no_alloc  =*/ model.no_alloc(),
+            /*.lazy      =*/ cparams.n_seq_budget > 0 ? &memory_lazy : nullptr,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (cparams.n_seq_budget > 0) {
+            // before memory goes back, the graphs of this context that are under way are finished
+            memory_lazy.synchronize = [this]() { synchronize(); };
+
+            // the memory takes its cells and rows when sequences need them: within what all the cells and
+            // n_seq_budget rows take, so that the context holds no more than it does with its memory whole
+            llama_memory_lazy_info info;
+            if (!memory || !memory->lazy_info(info)) {
+                throw std::runtime_error("n_seq_budget: the memory of this context cannot be lazy (it takes one pool of KV cells "
+                        "(kv_unified), a memory type with plain or recurrent state, and one device that can reserve memory)");
+            }
+
+            memory_lazy.budget = memory->lazy_bytes(info.n_cells, std::min(cparams.n_seq_budget, info.n_rows));
+
+            LLAMA_LOG_INFO("%s: lazy memory: %u cells of %zu bytes and %u rows of %.2f MiB take their memory when sequences need it, %.2f MiB at most\n",
+                    __func__, info.n_cells, info.cell_bytes, info.n_rows, info.row_bytes/1024.0/1024.0, memory_lazy.budget/1024.0/1024.0);
+        }
     }
 
     // init backends
@@ -4465,6 +4486,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.n_seq_budget                =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
@@ -5046,6 +5068,32 @@ bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_id, int32_
     }
 
     return mem->seq_set_stream(seq_id, (uint32_t) strm);
+}
+
+bool llama_memory_get_lazy_info(llama_memory_t mem, llama_memory_lazy_info * info) {
+    if (!mem || !info) {
+        return false;
+    }
+
+    *info = llama_memory_lazy_info();
+
+    return mem->lazy_info(*info);
+}
+
+size_t llama_memory_lazy_bytes(llama_memory_t mem, uint32_t n_cells, uint32_t n_rows) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->lazy_bytes(n_cells, n_rows);
+}
+
+void llama_memory_lazy_trim(llama_memory_t mem) {
+    if (!mem) {
+        return;
+    }
+
+    mem->lazy_trim();
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

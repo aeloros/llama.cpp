@@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+      llama_memory_lazy *   lazy) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -49,7 +50,10 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        "",
+        false,
+        lazy
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -281,6 +285,18 @@ const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
+}
+
+bool llama_memory_hybrid::lazy_info(llama_memory_lazy_info & info) const {
+    return mem_attn->lazy_info(info);
+}
+
+size_t llama_memory_hybrid::lazy_bytes(uint32_t n_cells, uint32_t n_rows) const {
+    return mem_attn->lazy_bytes(n_cells, n_rows);
+}
+
+void llama_memory_hybrid::lazy_trim() {
+    mem_attn->lazy_trim();
 }
 
 int32_t llama_memory_hybrid::stream_add(ggml_backend_buffer_type_t buft, uint32_t size, bool alloc) {

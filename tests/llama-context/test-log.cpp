@@ -64,6 +64,11 @@ void test_log_callback(enum ggml_log_level level, const char * text, void * user
     if (common_log_get_verbosity(level) <= std::max(common_log_get_verbosity_thold(), LOG_LEVEL_INFO)) {
         test_log_level(level);
         fputs(text, t_file);
+
+        // an abort may follow an error at once, and it does not write what is buffered
+        if (level == GGML_LOG_LEVEL_ERROR) {
+            fflush(t_file);
+        }
     }
 }
 
