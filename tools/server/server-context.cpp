@@ -6509,7 +6509,7 @@ struct server_model_copy {
 
         // a conversation that the copy has goes on there while the copy is loaded, also when the first model is free
         const bool is_back = rec_old.n > 0 && rec_old.in_copy && state == LOADED;
-        if (!stays && counted && !stopping && n_pool == 0 && (is_back || n_first >= n_after || spills) &&
+        if (!stays && counted && !stopping && !gives_way && n_pool == 0 && (is_back || n_first >= n_after || spills) &&
                 n_copy < n_parallel && n_cells_copy + n_cells <= n_ctx) {
             // counted before the copy is there, so that the tasks that arrive while it loads see its room taken
             n_copy++;
@@ -6601,6 +6601,7 @@ struct server_model_copy {
             { "n_home",        n_home },         // KV cells of the first pool that a counted task can have, 0 = not known
             { "n_loads",       n_loads },        // times the copy was loaded
             { "n_refused",     n_refused },      // times it was not loaded for want of memory on a device
+            { "gives_way",     gives_way },      // a device of the copy is short of memory: the copy gets no new task
             { "headroom",      n_headroom },     // MiB
             { "need_mib",      need_mib },       // what the copy takes of each device, once it is measured
         };
@@ -6716,6 +6717,9 @@ private:
     uint64_t n_tasks_total = 0;
     uint64_t n_loads       = 0;
     uint64_t n_refused     = 0;  // times the copy was not loaded because a device had not the memory
+    bool     gives_way     = false; // a device of the copy has less than half the headroom free: no new task goes to
+                                    // the copy, and it is unloaded when its tasks have ended
+    uint32_t n_ticks       = 0;  // of the timer
     int64_t  t_refused     = 0;  // when that was last said in the log
     std::vector<device_need> need; // empty until it is measured, before the first load
     std::vector<prefix_rec> prefixes;
@@ -6849,6 +6853,23 @@ private:
 
     enum load_res { LOAD_OK, LOAD_NO_MEMORY, LOAD_FAILED };
 
+    // What a device of the copy has free, SIZE_MAX when it does not say.
+    // LLAMA_SERVER_DEBUG_MODEL_COPY_FREE, for the tests: a file with the reading in MiB, in place of the device's own.
+    // A test writes there what another program would leave of the device.
+    static size_t device_free(ggml_backend_dev_t dev) {
+        static const std::string debug_free = common_get_env("LLAMA_SERVER_DEBUG_MODEL_COPY_FREE");
+
+        double debug_mib = 0.0;
+        if (!debug_free.empty() && (std::ifstream(debug_free) >> debug_mib)) {
+            return (size_t) (debug_mib * 1024.0 * 1024.0);
+        }
+
+        size_t free  = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        return free == 0 && total == 0 ? SIZE_MAX : free;
+    }
+
     // What the copy takes of each of its devices, found without taking memory: the model and its contexts are set up
     // with no allocation, as the fitting of the first model does it. Throws when that fails.
     std::vector<device_need> measure(common_params & p) const {
@@ -6925,9 +6946,7 @@ private:
                 need = need_now;
             }
             for (const auto & n : need_now) {
-                size_t free  = 0;
-                size_t total = 0;
-                ggml_backend_dev_memory(n.dev, &free, &total);
+                const size_t free = device_free(n.dev);
                 free_before.push_back(free);
                 if (free < n.bytes + (size_t) n_headroom * MiB) {
                     why = string_format("%s has %zu MiB free, and the copy takes %zu MiB with %d MiB to stay free",
@@ -6957,9 +6976,10 @@ private:
         bool is_short = false;
         for (size_t i = 0; i < need_now.size(); i++) {
             auto & n = need_now[i];
-            size_t free  = 0;
-            size_t total = 0;
-            ggml_backend_dev_memory(n.dev, &free, &total);
+            const size_t free  = device_free(n.dev);
+            if (free == SIZE_MAX) {
+                continue;
+            }
             const size_t taken = free_before[i] > free ? free_before[i] - free : 0;
             SRV_INF("model copy: %s has %zu MiB free with the copy, %zu MiB less than before (measured: %zu MiB)\n",
                     ggml_backend_dev_name(n.dev), free / MiB, taken / MiB, n.bytes / MiB);
@@ -7020,14 +7040,47 @@ private:
             if (stopping) {
                 break;
             }
+            // every two seconds: has another program taken the memory of a device of the copy?
+            if (state == LOADED && n_headroom >= 0 && ++n_ticks % 8 == 0) {
+                const std::vector<device_need> devs = need;
+                lock.unlock();
+                bool        is_short   = false;
+                size_t      free_short = 0;
+                const char * dev_short = "";
+                for (const auto & d : devs) {
+                    const size_t free = device_free(d.dev);
+                    if (free < (size_t) n_headroom * MiB / 2) {
+                        is_short   = true;
+                        free_short = free;
+                        dev_short  = ggml_backend_dev_name(d.dev);
+                    }
+                }
+                lock.lock();
+                if (stopping) {
+                    break;
+                }
+                if (state == LOADED && is_short != gives_way) {
+                    gives_way = is_short;
+                    if (is_short) {
+                        SRV_WRN("model copy: %s has %zu MiB free, less than half of the %d MiB that are to stay free; the copy gets "
+                                "no new task and is unloaded when its tasks have ended\n", dev_short, free_short / MiB, n_headroom);
+                    } else {
+                        SRV_INF("%s", "model copy: its devices have the memory again, tasks go to the copy as before\n");
+                    }
+                }
+            }
+
             const bool is_idle = n_release >= 0 && ggml_time_ms() - t_idle >= (int64_t) n_release * 1000;
-            if (state == LOADED && n_copy == 0 && (is_idle || n_pool > 0)) {
-                if (n_pool > 0) {
+            if (state == LOADED && n_copy == 0 && (is_idle || n_pool > 0 || gives_way)) {
+                if (gives_way) {
+                    SRV_INF("%s", "model copy: unloading, its device is short of memory\n");
+                } else if (n_pool > 0) {
                     SRV_INF("%s", "model copy: unloading, a task needs the device for the second pool of KV cells\n");
                 } else {
                     SRV_INF("model copy: %d s without a task, unloading\n", n_release);
                 }
                 unload(lock);
+                gives_way = false;
                 SRV_INF("%s", "model copy: unloaded\n");
             }
         }

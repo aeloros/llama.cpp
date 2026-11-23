@@ -693,3 +693,57 @@ def test_the_copys_prompt_cache_has_a_limit_of_its_own(tmp_path):
         log = f.read()
     assert "copy srv    load_model: prompt cache is enabled, size limit: 64 MiB" in log
     assert "srv    load_model: prompt cache is enabled, size limit: 2048 MiB" in log
+
+
+# What the copy's device has free is asked before the copy is loaded, and every two seconds while it is loaded.
+# LLAMA_SERVER_DEBUG_MODEL_COPY_FREE names a file that holds the reading in MiB, in place of the device's own: a test
+# writes there what another program would leave of the device.
+
+@pytest.fixture
+def device_free(tmp_path, monkeypatch):
+    """Sets what the device of the copy says it has free, in MiB."""
+    path = tmp_path / "device-free.txt"
+
+    def set_free(mib: int):
+        # written whole: the server reads it at any moment
+        tmp = tmp_path / "device-free.tmp"
+        tmp.write_text(str(mib))
+        os.replace(tmp, path)
+
+    set_free(1024 * 1024)
+    monkeypatch.setenv("LLAMA_SERVER_DEBUG_MODEL_COPY_FREE", str(path))
+    return set_free
+
+
+@needs_device
+def test_the_copy_gives_way_when_another_program_takes_its_devices_memory(device_free):
+    global server
+    server.model_copy_headroom = 1024
+    server.model_copy_release = 60
+    server.start()
+
+    assert complete()["tokens_predicted"] == 16
+    copy = the_copy()
+    assert copy["state"] == "loaded"
+    assert copy["gives_way"] is False
+
+    # another program takes the device: 300 MiB are left, less than half the headroom. The copy is idle, so it goes
+    # at once and does not wait out its 60 seconds
+    device_free(300)
+    wait_until("the copy did not give way", lambda: the_copy()["state"] == "unloaded", seconds=8.0)
+
+    # and it is not loaded again while the device is short
+    assert complete()["tokens_predicted"] == 16
+    copy = the_copy()
+    assert copy["state"] == "unloaded"
+    assert copy["n_loads"] == 1
+    assert copy["n_tasks_total"] == 1
+    assert copy["n_refused"] == 1
+
+    # the other program is gone
+    device_free(1024 * 1024)
+    assert complete()["tokens_predicted"] == 16
+    copy = the_copy()
+    assert copy["state"] == "loaded"
+    assert copy["n_loads"] == 2
+    assert copy["n_tasks_total"] == 2
