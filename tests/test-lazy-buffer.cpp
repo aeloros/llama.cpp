@@ -308,6 +308,63 @@ static void test_threads(ggml_backend_buffer_type_t buft, const char * name) {
     CHECK(n_bad == 0);
 }
 
+// A copy from one place of a buffer to another is done by the buffer's device, whichever device the thread used
+// last. llama_memory_recurrent moves the state of a sequence between rows this way, from the thread of a server that
+// may just have asked another device what it has free: with two GPUs the copy ran with that other device current.
+static void test_copy_after(ggml_backend_dev_t dev, ggml_backend_dev_t other) {
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    const size_t unit = ggml_backend_buft_lazy_granularity(buft);
+    if (unit == 0) {
+        return;
+    }
+
+    const size_t n_units = 4;
+
+    ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer_lazy(buft, n_units*unit));
+    CHECK(buf != nullptr);
+    if (!buf) {
+        return;
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead()*8, nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+
+    ggml_tensor * a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) (n_units*unit));
+    CHECK(ggml_backend_tensor_alloc(buf.get(), a, ggml_backend_buffer_get_base(buf.get())) == GGML_STATUS_SUCCESS);
+    CHECK(ggml_backend_buffer_commit(buf.get(), 0, n_units*unit));
+
+    const size_t n       = std::min<size_t>(unit, 256*1024) + 5;
+    const size_t off_src = 3;
+    const size_t off_dst = 2*unit - 7; // across two units
+
+    std::vector<uint8_t> data(n);
+    for (size_t i = 0; i < n; i++) {
+        data[i] = (uint8_t) (i*31 + 7);
+    }
+    ggml_backend_tensor_set(a, data.data(), off_src, n);
+
+    ggml_tensor * src = ggml_view_1d(ctx.get(), a, (int64_t) n, off_src);
+    ggml_tensor * dst = ggml_view_1d(ctx.get(), a, (int64_t) n, off_dst);
+    CHECK(ggml_backend_view_init(src) == GGML_STATUS_SUCCESS);
+    CHECK(ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS);
+
+    // the thread uses the other device last
+    size_t free = 0;
+    size_t total = 0;
+    ggml_backend_dev_memory(other, &free, &total);
+
+    ggml_backend_tensor_copy(src, dst);
+
+    std::vector<uint8_t> back(n);
+    ggml_backend_tensor_get(a, back.data(), off_dst, n);
+    CHECK(memcmp(data.data(), back.data(), n) == 0);
+
+    ggml_backend_buffer_decommit(buf.get(), 0, n_units*unit);
+
+    printf("%s: a copy inside a buffer after the thread used %s\n", ggml_backend_dev_name(dev), ggml_backend_dev_name(other));
+}
+
 int main(int argc, char ** argv) {
     std::vector<std::string> must;
     for (int i = 1; i < argc; i++) {
@@ -332,6 +389,12 @@ int main(int argc, char ** argv) {
 
         test_buft(ggml_backend_dev_buffer_type(dev), backend.get(), name, is_must);
         test_threads(ggml_backend_dev_buffer_type(dev), name);
+    }
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        for (size_t j = 0; j < ggml_backend_dev_count(); j++) {
+            test_copy_after(ggml_backend_dev_get(i), ggml_backend_dev_get(j));
+        }
     }
 
     for (const auto & m : must) {

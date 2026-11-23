@@ -1136,14 +1136,19 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+#ifdef GGML_CUDA_NO_PEER_COPY
+        if (src_physical != dst_physical) {
+            return false;
+        }
+#endif
+        // The destination's device does the copy, whichever device this thread used last, as in every other function
+        // of the buffer (and in cpy_tensor_n). Without this the copy and its stream were those of the thread's current
+        // device: a copy inside a buffer of one GPU failed with "invalid argument" after the thread had used another.
+        ggml_cuda_set_device(dst_ctx->device);
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
-#ifdef GGML_CUDA_NO_PEER_COPY
-            return false;
-#else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
-#endif
         }
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return true;
