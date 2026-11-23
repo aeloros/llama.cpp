@@ -774,3 +774,78 @@ def test_a_task_too_large_for_the_first_pool_waits_for_the_copys_room():
     assert copy["n_tasks_waited"] == 1
     assert copy["tasks"] == 0
     assert copy["tasks_first"] == 0
+
+
+# The second pool of KV cells of the first model and the copy are on the same device here, and both take their memory
+# when they find it free. A copy that is being loaded has claimed its memory: the second pool does not take it.
+
+@needs_device
+def test_the_second_pool_leaves_the_memory_that_a_loading_copy_has_claimed(tmp_path, monkeypatch):
+    import re
+
+    global server
+    pool_free = tmp_path / "pool-free.txt"
+    copy_free = tmp_path / "copy-free.txt"
+
+    def write(path, mib):
+        tmp = tmp_path / (path.name + ".tmp")
+        tmp.write_text(str(mib))
+        os.replace(tmp, path)
+
+    write(pool_free, 1024 * 1024)
+    write(copy_free, 1024 * 1024)
+    monkeypatch.setenv("LLAMA_SERVER_DEBUG_KV_OVERFLOW_FREE", str(pool_free))
+    monkeypatch.setenv("LLAMA_SERVER_DEBUG_MODEL_COPY_FREE", str(copy_free))
+    # the copy's load takes a second and a half longer, as a large model's does
+    monkeypatch.setenv("LLAMA_SERVER_DEBUG_MODEL_COPY_LOAD_MS", "1500")
+
+    server.n_ctx = 2048
+    server.n_slots = 3
+    server.kv_overflow_device = DEVICE
+    server.kv_overflow_size = 1024
+    server.kv_overflow_release = 60
+    server.kv_overflow_headroom = 500
+    server.model_copy_ctx_size = 1024
+    server.model_copy_after = 1
+    server.model_copy_release = 60
+    server.model_copy_headroom = 64
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    def log():
+        with open(server.log_path) as f:
+            return f.read()
+
+    # the device is made to have just what a task in the second pool needs: the pool's cells, the headroom of 500 MiB,
+    # and half a MiB. The copy takes more than that half
+    pool_mib = float(re.search(r"on top of the ([0-9.]+) MiB of the pool's cells", log()).group(1))
+    write(pool_free, 500 + pool_mib + 0.5)
+
+    # the first model works on a long task, so the next task goes to the copy, whose load begins
+    t_b, out_b = in_background({"prompt": PROMPT, "n_predict": 1500, "ignore_eos": True, "cache_prompt": False})
+    try:
+        wait_fast("the first model got no task", lambda: the_copy()["tasks_first"] == 1)
+        t_a, out_a = in_background({"prompt": PROMPT, "n_predict": 500, "ignore_eos": True, "cache_prompt": False})
+        try:
+            wait_fast("the copy did not start to load", lambda: the_copy()["state"] == "loading")
+            assert the_copy()["need_mib"][DEVICE] > 0.5
+            # a third task fits neither beside the long one in the first pool nor beside the copy's task. The first
+            # model would give it the second pool, whose device has the memory by its own figure. The copy has
+            # claimed it, so the task waits for the first pool
+            third = complete(n_predict=600, ignore_eos=True)
+        finally:
+            t_a.join()
+    finally:
+        t_b.join()
+
+    assert third["tokens_predicted"] == 600
+    assert out_a["res"].status_code == 200
+    assert out_a["res"].body["tokens_predicted"] == 500
+    assert out_b["res"].status_code == 200
+    assert out_b["res"].body["tokens_predicted"] == 1500
+    copy = the_copy()
+    assert copy["n_loads"] == 1
+    assert copy["n_tasks_total"] == 1
+    text = log()
+    assert "the second pool of KV cells gets no task for now" in text
+    assert "the second pool of KV cells took its memory" not in text

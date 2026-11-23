@@ -30,6 +30,7 @@
 #include <cinttypes>
 #include <deque>
 #include <exception>
+#include <map>
 #include <memory>
 #include <optional>
 #include <filesystem>
@@ -47,6 +48,46 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// What is about to be taken of a device's memory by the takers in this process that first ask the device what it has
+// free: the second pool of KV cells of a server context, and a model copy. The device's own figure shows a taker's
+// memory only once it is allocated, so two takers that ask at about the same time would both find it free. A taker
+// claims its memory when it has found the room, and gives the claim up when it has the memory or has failed to get it.
+struct server_device_claims {
+    // free: what the device says it has free. Returns true when n_need of that are free beside the claims of the
+    // others, and claims n_claim then
+    static bool claim(ggml_backend_dev_t dev, size_t free, size_t n_need, size_t n_claim) {
+        std::lock_guard<std::mutex> lock(mutex());
+        size_t & n = claims()[dev];
+        if (free < n || free - n < n_need) {
+            return false;
+        }
+        n += n_claim;
+        return true;
+    }
+
+    static void unclaim(ggml_backend_dev_t dev, size_t n_claim) {
+        std::lock_guard<std::mutex> lock(mutex());
+        size_t & n = claims()[dev];
+        n -= std::min(n, n_claim);
+    }
+
+    static size_t claimed(ggml_backend_dev_t dev) {
+        std::lock_guard<std::mutex> lock(mutex());
+        const auto it = claims().find(dev);
+        return it == claims().end() ? 0 : it->second;
+    }
+
+private:
+    static std::mutex & mutex() {
+        static std::mutex m;
+        return m;
+    }
+    static std::map<ggml_backend_dev_t, size_t> & claims() {
+        static std::map<ggml_backend_dev_t, size_t> c;
+        return c;
+    }
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -2138,7 +2179,14 @@ private:
                 const bool goes_on = ret->kv_overflow && ret->prompt.n_tokens() > 0 &&
                     2 * ret->prompt.tokens.get_common_prefix(task.tokens) >= (size_t) ret->prompt.n_tokens();
 
-                if (!(task.is_child() || goes_on || kv_overflow_device_has_room()) || !kv_overflow_acquire()) {
+                // the pool's memory is claimed on the device from the reading until it is taken (server_device_claims)
+                size_t n_claimed = 0;
+                const bool has_room = task.is_child() || goes_on || kv_overflow_device_has_room(n_claimed);
+                const bool is_taken = has_room && kv_overflow_acquire();
+                if (n_claimed > 0) {
+                    server_device_claims::unclaim(params_base.kv_overflow_device, n_claimed);
+                }
+                if (!is_taken) {
                     fit = kv_fit_task(*ret, task, true, 0);
                 }
             }
@@ -2382,7 +2430,11 @@ private:
     // headroom is for what the task computes with on the device, which is known only once it runs, and for what the
     // other programs on the device need to stay free.
     // Returns false when the device has less: the task is fitted without the pool.
-    bool kv_overflow_device_has_room() const {
+    // What another taker in this process has claimed of the device is not free (server_device_claims). When this
+    // returns true the pool's memory, if it is still to be taken, is claimed too: n_claimed, which the caller gives
+    // up once the memory is taken.
+    bool kv_overflow_device_has_room(size_t & n_claimed) const {
+        n_claimed = 0;
         if (params_base.kv_overflow_headroom < 0) {
             return true;
         }
@@ -2409,13 +2461,15 @@ private:
         const size_t n_pool = kv_overflow_held ? 0 : kv_overflow_bytes;
         const size_t n_need = n_pool + (size_t) params_base.kv_overflow_headroom * 1024 * 1024;
 
-        if (free >= n_need) {
+        if (server_device_claims::claim(params_base.kv_overflow_device, free, n_need, n_pool)) {
+            n_claimed = n_pool;
             return true;
         }
 
-        SRV_WRN("the second pool of KV cells gets no task for now: %s has %zu MiB free, and a task there needs %zu MiB free "
-                "(%zu MiB for the pool's cells, %d MiB of headroom)\n",
-                ggml_backend_dev_name(params_base.kv_overflow_device), free / 1024 / 1024, n_need / 1024 / 1024,
+        SRV_WRN("the second pool of KV cells gets no task for now: %s has %zu MiB free, %zu MiB of them claimed by a model copy "
+                "that is being loaded, and a task there needs %zu MiB free (%zu MiB for the pool's cells, %d MiB of headroom)\n",
+                ggml_backend_dev_name(params_base.kv_overflow_device), free / 1024 / 1024,
+                server_device_claims::claimed(params_base.kv_overflow_device) / 1024 / 1024, n_need / 1024 / 1024,
                 n_pool / 1024 / 1024, params_base.kv_overflow_headroom);
 
         return false;
@@ -6944,6 +6998,17 @@ private:
     load_res load(std::string & why) {
         common_params p = params_for_copy();
 
+        // What the copy claims of its devices, from the reading until it is loaded or has failed to load: the second
+        // pool of the first model, on the same device, must not find that memory free meanwhile (server_device_claims)
+        struct claims_held {
+            std::vector<device_need> held;
+            ~claims_held() {
+                for (const auto & n : held) {
+                    server_device_claims::unclaim(n.dev, n.bytes);
+                }
+            }
+        } claims;
+
         // each device of the copy has to have the copy's size free, and the headroom on top
         std::vector<device_need> need_now;
         std::vector<size_t>      free_before;
@@ -6969,12 +7034,22 @@ private:
             for (const auto & n : need_now) {
                 const size_t free = device_free(n.dev);
                 free_before.push_back(free);
-                if (free < n.bytes + (size_t) n_headroom * MiB) {
-                    why = string_format("%s has %zu MiB free, and the copy takes %zu MiB with %d MiB to stay free",
-                            ggml_backend_dev_name(n.dev), free / MiB, n.bytes / MiB, n_headroom);
+                if (!server_device_claims::claim(n.dev, free, n.bytes + (size_t) n_headroom * MiB, n.bytes)) {
+                    why = string_format("%s has %zu MiB free, %zu MiB of them claimed by a second pool of KV cells that is "
+                            "taking its memory, and the copy takes %zu MiB with %d MiB to stay free",
+                            ggml_backend_dev_name(n.dev), free == SIZE_MAX ? 0 : free / MiB,
+                            server_device_claims::claimed(n.dev) / MiB, n.bytes / MiB, n_headroom);
                     return LOAD_NO_MEMORY;
                 }
+                claims.held.push_back(n);
             }
+        }
+
+        // LLAMA_SERVER_DEBUG_MODEL_COPY_LOAD_MS, for the tests: the load takes this much longer, as that of a large
+        // model does
+        static const int debug_load_ms = std::atoi(common_get_env("LLAMA_SERVER_DEBUG_MODEL_COPY_LOAD_MS").c_str());
+        if (debug_load_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(debug_load_ms));
         }
 
         SRV_INF("model copy: loading on %s\n", device_names().c_str());
