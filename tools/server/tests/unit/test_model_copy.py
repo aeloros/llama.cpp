@@ -835,6 +835,8 @@ def test_the_second_pool_leaves_the_memory_that_a_loading_copy_has_claimed(tmp_p
         t_a, out_a = in_background({"prompt": PROMPT, "n_predict": 500, "ignore_eos": True, "cache_prompt": False})
         try:
             wait_fast("the copy did not start to load", lambda: the_copy()["state"] == "loading")
+            # its size is measured as the first thing of the load, and claimed on the device then
+            wait_fast("the copy's size was not measured", lambda: DEVICE in the_copy()["need_mib"])
             assert the_copy()["need_mib"][DEVICE] > 0.5
             # a third task fits neither beside the long one in the first pool nor beside the copy's task. The first
             # model would give it the second pool, whose device has the memory by its own figure. The copy has
