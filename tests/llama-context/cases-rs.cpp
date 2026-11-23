@@ -742,32 +742,70 @@ struct case_lazy_rows : ctx_test {
                 CTX_REQUIRE(same(ref, logits), "seq " + std::to_string(s) + " produced different logits in lazy memory");
             }
 
-            if (n_rs > 0) {
-                // seq 0 goes on by two tokens in one batch, rolls the last one back and decodes it again: that reads a
-                // snapshot row of its row, and gives the logits of the first time
-                auto two = [&](llama_context * c, std::vector<float> & out) {
-                    common_batch batch(c);
-                    batch.add(gen_token(n_vocab, 0, n),     n,     0, false);
-                    batch.add(gen_token(n_vocab, 0, n + 1), n + 1, 0, true);
-                    return llama_process(c, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0 && get_current_logits(c, out);
-                };
-                auto again = [&](llama_context * c, std::vector<float> & out) {
-                    return llama_memory_seq_rm(llama_get_memory(c), 0, n + 1, -1) &&
-                           decode_one(c, gen_token(n_vocab, 0, n + 1), n + 1, 0) && get_current_logits(c, out);
-                };
+            // a sequence goes on by two tokens in one batch, which leaves a snapshot to roll the last one back to
+            auto two = [&](llama_context * c, llama_seq_id s, llama_pos p, std::vector<float> & out) {
+                common_batch batch(c);
+                batch.add(gen_token(n_vocab, s, p),     p,     s, false);
+                batch.add(gen_token(n_vocab, s, p + 1), p + 1, s, true);
+                return llama_process(c, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0 && get_current_logits(c, out);
+            };
+            // it rolls its last token back and decodes it again: that reads a snapshot row of its row
+            auto again = [&](llama_context * c, llama_seq_id s, llama_pos p, std::vector<float> & out) {
+                return llama_memory_seq_rm(llama_get_memory(c), s, p, -1) &&
+                       decode_one(c, gen_token(n_vocab, s, p), p, s) && get_current_logits(c, out);
+            };
+            // a sequence goes on by one token, in both contexts, and has the logits of the memory that is held whole
+            auto goes_on = [&](llama_seq_id s, llama_pos p, const std::string & when) {
+                if (!decode_n(ctx.get(), s, p, p + 1, logits) || !decode_n(ctx_ref.get(), s, p, p + 1, ref)) {
+                    why = "seq " + std::to_string(s) + " failed to go on " + when;
+                    return false;
+                }
+                if (!same(ref, logits)) {
+                    why = "seq " + std::to_string(s) + " produced different logits in lazy memory " + when;
+                    return false;
+                }
+                return true;
+            };
 
+            if (n_rs > 0) {
+                // seq 0 goes on by two tokens, rolls the last one back and decodes it again, which gives the logits
+                // of the first time
                 std::vector<float> first;
-                CTX_REQUIRE(two(ctx.get(), first) && two(ctx_ref.get(), ref), "seq 0 failed to go on by two tokens");
+                CTX_REQUIRE(two(ctx.get(), 0, n, first) && two(ctx_ref.get(), 0, n, ref), "seq 0 failed to go on by two tokens");
                 CTX_REQUIRE(same(ref, first), "seq 0 produced different logits in lazy memory when it went on");
-                CTX_REQUIRE(again(ctx.get(), logits) && again(ctx_ref.get(), ref), "seq 0 failed to roll back a token and decode it again");
+                CTX_REQUIRE(again(ctx.get(), 0, n + 1, logits) && again(ctx_ref.get(), 0, n + 1, ref), "seq 0 failed to roll back a token and decode it again");
                 CTX_REQUIRE(same(first, logits), "seq 0 produced different logits after a rollback in lazy memory");
                 CTX_REQUIRE(same(ref, logits), "seq 0 produced different logits after a rollback than with its memory whole");
                 CTX_REQUIRE(consistent(mem, 3, why), "after the rollback of seq 0: " + why);
             }
 
-            // seq 2 holds the highest row: the row of seq 1 below it stays taken, and both go back with seq 2
+            // The rows that hold memory are the rows in use. Seq 2 holds the highest row: when seq 1 below it is
+            // removed, seq 2 moves into that row, with its rollback snapshots, and the memory of the highest goes back.
+            llama_pos n2 = n; // tokens of seq 2
+            std::vector<float> first2;
+            if (n_rs > 0) {
+                // seq 2 leaves a snapshot behind before it moves, and rolls back to it afterwards
+                CTX_REQUIRE(two(ctx.get(), 2, n2, first2) && two(ctx_ref.get(), 2, n2, ref), "seq 2 failed to go on by two tokens");
+                CTX_REQUIRE(same(ref, first2), "seq 2 produced different logits in lazy memory when it went on");
+                n2 += 2;
+            }
+
             CTX_REQUIRE(seq_rm(ctx.get(), 1) && seq_rm(ctx_ref.get(), 1), "failed to remove seq 1");
-            CTX_REQUIRE(consistent(mem, 3, why), "after seq 1 was removed: " + why);
+            CTX_REQUIRE(consistent(mem, 2, why), "after seq 1 was removed from the row below the highest: " + why);
+
+            if (n_rs > 0) {
+                CTX_REQUIRE(again(ctx.get(), 2, n2 - 1, logits) && again(ctx_ref.get(), 2, n2 - 1, ref), "seq 2 failed to roll back a token after it moved");
+                CTX_REQUIRE(same(first2, logits), "seq 2 produced different logits when it rolled back after it moved to a lower row");
+                CTX_REQUIRE(same(ref, logits), "seq 2 produced different logits after it moved than with its memory whole");
+            }
+            CTX_REQUIRE(goes_on(2, n2, "after it moved to a lower row"), why);
+            n2 += 1;
+            {
+                const llama_pos n0 = llama_memory_seq_pos_max(mem, 0) + 1;
+                CTX_REQUIRE(goes_on(0, n0, "after another sequence moved"), why);
+            }
+            CTX_REQUIRE(consistent(mem, 2, why), "after seq 2 moved and both went on: " + why);
+
             CTX_REQUIRE(seq_rm(ctx.get(), 2) && seq_rm(ctx_ref.get(), 2), "failed to remove seq 2");
             CTX_REQUIRE(consistent(mem, 1, why), "after seq 2 was removed: " + why);
 
@@ -788,6 +826,48 @@ struct case_lazy_rows : ctx_test {
             CTX_REQUIRE(decode_n(ctx.get(),     3, n, n + 1, logits), "failed to go on with the restored seq 3");
             CTX_REQUIRE(decode_n(ctx_ref.get(), 3, n, n + 1, ref),    "failed to go on with seq 3 with its memory whole");
             CTX_REQUIRE(same(ref, logits), "the restored seq 3 produced different logits in lazy memory");
+
+            // A copy of seq 3 shares its row until it goes on by itself, and then has the next one. When seq 0 leaves
+            // the lowest row, the copy, which holds the highest, moves into it.
+            llama_memory_seq_cp(mem, 3, 1, -1, -1);
+            llama_memory_seq_cp(llama_get_memory(ctx_ref.get()), 3, 1, -1, -1);
+            CTX_REQUIRE(consistent(mem, 2, why), "after seq 3 was copied to seq 1: " + why);
+            CTX_REQUIRE(goes_on(1, n + 1, "as a copy of seq 3"), why);
+            CTX_REQUIRE(consistent(mem, 3, why), "after the copy of seq 3 went on by itself: " + why);
+
+            CTX_REQUIRE(seq_rm(ctx.get(), 0) && seq_rm(ctx_ref.get(), 0), "failed to remove seq 0");
+            CTX_REQUIRE(consistent(mem, 2, why), "after seq 0 was removed from the lowest row: " + why);
+            CTX_REQUIRE(goes_on(1, n + 2, "after it moved to the lowest row"), why);
+            CTX_REQUIRE(goes_on(3, n + 1, "after its copy moved"), why);
+
+            // only seq 1 is kept: one row is left, the lowest
+            llama_memory_seq_keep(mem, 1);
+            llama_memory_seq_keep(llama_get_memory(ctx_ref.get()), 1);
+            CTX_REQUIRE(consistent(mem, 1, why), "after all but seq 1 were removed: " + why);
+            CTX_REQUIRE(goes_on(1, n + 3, "as the only sequence that is left"), why);
+
+            // A token of two sequences merges them into the row of the one that is named first, without a removal:
+            // the row of the other is free then, below a row in use. The next batch finds the rows in use together.
+            // (A memory of states only takes no such batch: its split is sequential.)
+            if (!arch_reserves_single_seq(mr.model) && info.n_cells > 0) {
+                for (llama_seq_id s : { 0, 2 }) {
+                    CTX_REQUIRE(decode_n(ctx.get(),     s, 0, n, logits), "failed to decode seq " + std::to_string(s) + " again");
+                    CTX_REQUIRE(decode_n(ctx_ref.get(), s, 0, n, ref),    "failed to decode seq " + std::to_string(s) + " again with its memory whole");
+                }
+                CTX_REQUIRE(consistent(mem, 3, why), "with three sequences again: " + why);
+
+                auto merged = [&](llama_context * c, std::vector<float> & out) {
+                    common_batch batch(c);
+                    batch.add(gen_token(n_vocab, 2, n), n, std::vector<llama_seq_id>{ 2, 0 }, true);
+                    return llama_process(c, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0 && get_current_logits(c, out);
+                };
+                CTX_REQUIRE(merged(ctx.get(), logits) && merged(ctx_ref.get(), ref), "failed to decode a token of two sequences");
+                CTX_REQUIRE(same(ref, logits), "a token of two sequences produced different logits in lazy memory");
+
+                CTX_REQUIRE(goes_on(1, n + 4, "after two other sequences merged into one row"), why);
+                CTX_REQUIRE(consistent(mem, 2, why), "after two sequences merged into one row and another went on: " + why);
+                CTX_REQUIRE(goes_on(2, n + 1, "after it moved with the sequence that shares its row"), why);
+            }
 
             llama_memory_clear(mem, true);
             CTX_REQUIRE(consistent(mem, 0, why), "after the memory was cleared: " + why);

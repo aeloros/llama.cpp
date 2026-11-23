@@ -545,6 +545,11 @@ llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lct
 }
 
 bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {
+    // Lazy memory: the batch finds the rows in use together at the low end, and no memory above them. A batch can
+    // leave a row free below a row in use without a removal: a token of several sequences merges them into the row
+    // of the first (find_slot), and a batch that was prepared and not applied has taken rows for nothing.
+    lazy_trim_rows();
+
     // simply remember the full state because it is very small for this type of cache
     // TODO: optimize
     auto org_cells = cells;
@@ -873,10 +878,111 @@ bool llama_memory_recurrent::lazy_take(uint32_t n_rows) {
     return true;
 }
 
+void llama_memory_recurrent::lazy_move_row(uint32_t from, uint32_t to) {
+    // the state: the row of every tensor, in every rollback group, copied where the tensors are
+    const size_t n_views = 2*(r_l.size() + s_l.size() + p_l.size())*(1 + n_rs_seq);
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ n_views*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create ggml context for a move in the rs cache");
+    }
+
+    for (const auto * tensors : { &r_l, &s_l, &p_l }) {
+        for (ggml_tensor * t : *tensors) {
+            if (t == nullptr || t->ne[0] == 0) {
+                continue;
+            }
+
+            for (uint32_t g = 0; g <= n_rs_seq; ++g) {
+                ggml_tensor * src = ggml_view_1d(ctx.get(), t, t->ne[0], (size_t) (g*size + from)*t->nb[1]);
+                ggml_tensor * dst = ggml_view_1d(ctx.get(), t, t->ne[0], (size_t) (g*size + to)*t->nb[1]);
+
+                if (ggml_backend_view_init(src) != GGML_STATUS_SUCCESS || ggml_backend_view_init(dst) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("failed to address a row of the rs cache");
+                }
+
+                ggml_backend_tensor_copy(src, dst);
+            }
+        }
+    }
+
+    // the cell, and what points to its row (a tail is that of the sequence with the index's id, not of the row)
+    mem_cell & cell_from = cells[from];
+    mem_cell & cell_to   = cells[to];
+
+    cell_to.pos    = cell_from.pos;
+    cell_to.src    = cell_from.src;
+    cell_to.src0   = cell_from.src0;
+    cell_to.rs_max = cell_from.rs_max;
+    cell_to.seq_id = std::move(cell_from.seq_id);
+
+    cell_from.pos    = -1;
+    cell_from.src    = -1;
+    cell_from.src0   = -1;
+    cell_from.rs_max = 0;
+    cell_from.seq_id.clear();
+
+    for (auto & cell : cells) {
+        if (cell.tail == (int32_t) from) { cell.tail = (int32_t) to; }
+        if (cell.src  == (int32_t) from) { cell.src  = (int32_t) to; }
+        if (cell.src0 == (int32_t) from) { cell.src0 = (int32_t) to; }
+    }
+
+    LLAMA_LOG_DEBUG("%s: the state in row %u moved to row %u\n", __func__, from, to);
+}
+
+void llama_memory_recurrent::lazy_pack_rows() {
+    bool synchronized = false;
+
+    while (true) {
+        // a row is in use while a sequence has it, and while a cell has its state to copy from it
+        std::vector<bool> in_use(size, false);
+        for (uint32_t i = 0; i < size; ++i) {
+            if (cells[i].is_empty()) {
+                continue;
+            }
+            in_use[i] = true;
+            if (cells[i].src >= 0) {
+                in_use[cells[i].src] = true;
+            }
+        }
+
+        uint32_t lowest_free = 0;
+        while (lowest_free < size && in_use[lowest_free]) {
+            lowest_free++;
+        }
+
+        uint32_t n_rows = size; // one more than the highest row in use
+        while (n_rows > 0 && !in_use[n_rows - 1]) {
+            n_rows--;
+        }
+
+        if (lowest_free >= n_rows) {
+            break; // the rows in use are [0, n_rows)
+        }
+
+        // the graphs that are under way read and write the rows where they are
+        if (!synchronized && lazy->synchronize) {
+            lazy->synchronize();
+        }
+        synchronized = true;
+
+        lazy_move_row(n_rows - 1, lowest_free);
+    }
+}
+
 void llama_memory_recurrent::lazy_trim_rows() {
     if (!lazy) {
         return;
     }
+
+    lazy_pack_rows();
 
     const uint32_t mark = lazy_rows_in_use();
     if (mark >= lazy_mark) {
@@ -1453,13 +1559,9 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
         return;
     }
 
-    seq_rm(seq_id, -1, -1);
-
-    if (cell_count == 0) {
-        return;
-    }
-
-    const uint32_t n_layer = hparams.n_layer();
+    // The rows are cleared while they are still those of the sequence. Once it is removed, a lazy memory may have
+    // moved another sequence into its row (lazy_pack_rows).
+    const uint32_t n_layer = cell_count > 0 ? hparams.n_layer() : 0;
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (r_l[il] != nullptr) {
@@ -1482,6 +1584,8 @@ void llama_memory_recurrent::state_clear(llama_seq_id seq_id, uint32_t cell_head
             llama_clear_tensor_data(p_l[il], cell_head * p_size_row, cell_count * p_size_row);
         }
     }
+
+    seq_rm(seq_id, -1, -1);
 }
 
 //

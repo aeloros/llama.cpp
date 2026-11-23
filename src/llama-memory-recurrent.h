@@ -155,10 +155,14 @@ private:
 
     // Lazy memory (llama_memory_lazy), null if the module holds all of its memory. The s tensors, which are nearly
     // all of a row, are in a lazy buffer of their own, and the rows below lazy_mark have their memory, in every
-    // rollback group. The r states are small and are held whole. A sequence takes the lowest free row. The mark rises
-    // when a batch or a restored state uses a row above it (lazy_take) and falls to the highest row in use when
-    // sequences are removed (lazy_trim_rows). Nothing may read or write a row at or above the mark: a graph reads
-    // the rows that s_copy() names and writes those from head on, which are rows of cells in use.
+    // rollback group. The r states are small and are held whole.
+    // The rows that hold memory are the rows in use: those are kept together at the low end, [0, their number). A
+    // sequence takes the lowest free row, and when a sequence gives up a row below the highest one in use, the
+    // highest moves into it (lazy_pack_rows). So the mark rises when a batch or a restored state uses a row above
+    // it (lazy_take), and falls to the number of rows in use when sequences are removed (lazy_trim_rows): no row
+    // keeps memory because of where another one is.
+    // Nothing may read or write a row at or above the mark: a graph reads the rows that s_copy() names and writes
+    // those from head on, which are rows of cells in use.
     llama_memory_lazy * lazy = nullptr;
 
     uint32_t lazy_mark = 0;
@@ -173,7 +177,13 @@ private:
     // have the memory of the rows [0, n_rows); false if it cannot be had, and the mark stays
     bool lazy_take(uint32_t n_rows);
 
-    // give back the memory above the highest row in use
+    // the state of row `from` goes to the free row `to`, in every tensor and rollback group, and its cell with it
+    void lazy_move_row(uint32_t from, uint32_t to);
+
+    // the rows in use are together at the low end again: the highest ones move into the free rows below them
+    void lazy_pack_rows();
+
+    // pack the rows in use, and give back the memory above them
     void lazy_trim_rows();
 };
 
