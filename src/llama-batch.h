@@ -255,6 +255,10 @@ private:
     // false if a token has sequences of different groups, the batch cannot be split then
     bool token_group_ok = true;
 
+    // set by split_equal once a sequence has ended in a ubatch that wrote the snapshots for a rollback of its last
+    // tokens (n_keep_tail): the later ubatches of the split hold one sequence each
+    bool split_single_seq = false;
+
     uint32_t get_token_group(int32_t idx) const;
 
     std::vector<pos_set_t> seq_pos; // seq_pos[s]: the set of positions in sequence s

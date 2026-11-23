@@ -624,6 +624,8 @@ void llama_batch_allocr::split_reset(const std::vector<uint32_t> * seq_groups) {
     token_group.clear();
     token_group_ok = true;
 
+    split_single_seq = false;
+
     if (seq_groups == nullptr) {
         return;
     }
@@ -729,6 +731,9 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         add = add && (cur_seq_set.empty() || get_token_group(i) == group);
+
+        // one sequence per ubatch after a ubatch whose rollback snapshots are still needed, see below
+        add = add && (cur_seq_set.empty() || !split_single_seq);
 
         if (add) {
             group = get_token_group(i);
@@ -859,6 +864,22 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
 
         n_seqs = n_keep;
+
+        // A ubatch of 2 to n_keep_tail tokens per sequence writes the snapshots that a rollback of its last tokens
+        // needs, into the state cells that its sequences have at that moment. A recurrent memory puts the cells of a
+        // ubatch next to each other, and for that it may move the cell of a sequence that is not in the ubatch,
+        // without those snapshots: the rollback is then refused, or reads the snapshots of another sequence.
+        // So once a sequence has ended in such a ubatch, the later ubatches of this split hold one sequence each.
+        // A ubatch of one sequence moves the cell of no other sequence.
+        const size_t n_seq_tokens = idxs_per_seq[0].size();
+
+        if (n_seq_tokens >= 2 && n_seq_tokens <= n_keep_tail) {
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                if (n_remaining(s) == 0) {
+                    split_single_seq = true;
+                }
+            }
+        }
     }
 
     // concat the per-sequence-set lists

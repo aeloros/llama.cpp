@@ -487,11 +487,146 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// One batch holds the last tokens of a sequence, few enough to be rolled back, and tokens of other sequences that a later
+// ubatch decodes. That later ubatch re-orders the state cells so that its own sequences are next to each other, and it
+// may move the cell of the first sequence while doing so. The rollback has to survive that: a server rolls back the
+// rejected draft tokens of one slot after a batch that also read the prompts of other slots.
+// Compared against a context that decoded the sequence up to the rollback point and no further.
+struct case_rollback_other_seqs : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_others"; }
+
+    const char * description() const override {
+        return "a rollback is exact after a later ubatch of the same batch moved the sequence's state cell";
+    }
+
+    std::string skip_reason(model_run & mr) const override {
+        if (arch_reserves_single_seq(mr.model)) {
+            return "the batch is a multi-seq graph";
+        }
+
+        return ctx_test::skip_reason(mr);
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefix = 8;
+
+        // the sequence that rolls back, and the two whose cells are on either side of its cell
+        constexpr llama_seq_id seq_roll = 3;
+        constexpr llama_seq_id seq_a    = 1;
+        constexpr llama_seq_id seq_b    = 2;
+
+        const auto make_ctx = [&]() {
+            ctx_opts opts;
+            opts.n_ctx      = 512;
+            opts.n_batch    = 64;
+            opts.n_ubatch   = 64;
+            opts.n_seq_max  = 4;
+            opts.n_rs_seq   = 2; // a sampled token and two draft tokens
+            opts.kv_unified = 1;
+            return mr.ctx(opts);
+        };
+
+        {
+            llama_context_ptr ctx = make_ctx();
+            if (!ctx) {
+                return case_result::fail();
+            }
+            if (llama_n_rs_seq(ctx.get()) < 2) {
+                return case_result::skip("n_rs_seq is disabled");
+            }
+        }
+
+        // the token that follows the rollback point is not the one that was rolled back
+        const llama_token tok_next = (gen_token(n_vocab, seq_roll, n_prefix + 1) + 1) % n_vocab;
+
+        // the reference: the sequence alone, up to the rollback point, then the next token
+        std::vector<float> logits_ref;
+        {
+            llama_context_ptr ctx = make_ctx();
+            if (!ctx) {
+                return case_result::fail();
+            }
+
+            CTX_REQUIRE(decode_gen(ctx.get(), n_vocab, seq_roll, 0, n_prefix) &&
+                        decode_gen(ctx.get(), n_vocab, seq_roll, n_prefix, n_prefix + 1) &&
+                        decode_one(ctx.get(), tok_next, n_prefix + 1, seq_roll) &&
+                        get_current_logits(ctx.get(), logits_ref),
+                    "the reference decode failed");
+        }
+
+        // stale: the cell that the sequence is moved to still has the rollback count of another sequence's 3-token ubatch
+        for (const bool stale : { false, true }) {
+            const std::string what = stale ? " (moved to a cell with another sequence's snapshots)" : " (moved to a cell without snapshots)";
+
+            llama_context_ptr ctx = make_ctx();
+            if (!ctx) {
+                return case_result::fail();
+            }
+
+            // the sequences take their state cells in the order of their first decode: the cell of seq_roll is
+            // between those of seq_a and seq_b
+            llama_pos n_b = n_prefix;
+
+            bool ok = true;
+            ok = ok && decode_gen(ctx.get(), n_vocab, seq_a,    0, n_prefix);
+            ok = ok && decode_gen(ctx.get(), n_vocab, seq_roll, 0, n_prefix);
+            ok = ok && decode_gen(ctx.get(), n_vocab, seq_b,    0, n_prefix);
+            if (stale) {
+                ok = ok && decode_gen(ctx.get(), n_vocab, seq_b, n_b, n_b + 3);
+                n_b += 3;
+            }
+            CTX_REQUIRE(ok, "the prefill failed" + what);
+
+            // one batch: the three last tokens of seq_roll first, then one token of seq_a and eight of seq_b
+            // the split gives seq_roll a ubatch of its own, whose snapshots allow a rollback of two tokens, then
+            // seq_a and seq_b go on together
+            {
+                common_batch batch(ctx.get());
+                for (llama_pos i = 0; i < 3; ++i) {
+                    batch.add(gen_token(n_vocab, seq_roll, n_prefix + i), n_prefix + i, seq_roll, true);
+                }
+                batch.add(gen_token(n_vocab, seq_a, n_prefix), n_prefix, seq_a, true);
+                for (llama_pos i = 0; i < 8; ++i) {
+                    batch.add(gen_token(n_vocab, seq_b, n_b + i), n_b + i, seq_b, true);
+                }
+                CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0,
+                        "the batch of the three sequences failed" + what);
+            }
+
+            // both draft tokens are rejected
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx.get()), seq_roll, n_prefix + 1, -1),
+                    "the rollback of two tokens was refused" + what);
+
+            std::vector<float> logits;
+            CTX_REQUIRE(decode_one(ctx.get(), tok_next, n_prefix + 1, seq_roll) && get_current_logits(ctx.get(), logits),
+                    "the decode after the rollback failed" + what);
+
+            // as in the replay case: the first token after a rollback reads the restored state, and random dummy
+            // models drift up to ~1.7e-5
+            constexpr float nmse_eps = 1e-4f;
+
+            const logits_diff diff = compare_logits(logits.data(), logits_ref.data(), logits_ref.size());
+            CTX_REQUIRE(logits.size() == logits_ref.size() && diff.nmse() <= nmse_eps,
+                    "the logits after the rollback differ from the reference" + what + " (max diff " + std::to_string(diff.diff_max) +
+                    ", nmse " + std::to_string(diff.nmse()) + ")");
+
+            TLOG_INF("%s: rollback matched%s (max diff %g, nmse %g)\n", __func__, what.c_str(), (double) diff.diff_max, diff.nmse());
+        }
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
+    cases.push_back(std::make_unique<case_rollback_other_seqs>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 

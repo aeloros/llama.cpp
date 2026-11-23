@@ -970,6 +970,70 @@ static void test_keep_tail(testing & t) {
         t.assert_equal(1, ub.seq_id[0][0]);
         t.assert_equal(7u, ba.get_n_used());
     });
+
+    // A recurrent memory writes the snapshots for a rollback of the last tokens into the state cell that a sequence
+    // has in its last ubatch, and a later ubatch of several sequences may move that cell without them. So after a
+    // sequence has ended in a ubatch of 2 to n_keep_tail tokens, the ubatches that follow hold one sequence each.
+    t.test("one_seq_per_ubatch_after_a_tail_with_snapshots", [&](testing & t) {
+        batch_builder bb(2, nullptr, 16);
+        make_batch(bb, {3, 9, 9});
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        // 3 tokens of each: seq 0 ends here, with snapshots for a rollback of two tokens
+        llama_ubatch ub = ba.split_equal(16, false, 3);
+        t.assert_equal(9u, ub.n_tokens);
+        t.assert_equal(3u, ub.n_seqs);
+        t.assert_equal(3u, ub.n_seq_tokens);
+
+        // seqs 1 and 2 go on apart, where they would have shared a ubatch
+        ub = ba.split_equal(16, false, 3);
+        t.assert_equal("seq 1 alone", 1u, ub.n_seqs);
+        t.assert_equal(6u, ub.n_tokens);
+        t.assert_equal(1, ub.n_tokens > 0 ? ub.seq_id[0][0] : -1);
+
+        ub = ba.split_equal(16, false, 3);
+        t.assert_equal("seq 2 alone", 1u, ub.n_seqs);
+        t.assert_equal(6u, ub.n_tokens);
+        t.assert_equal(2, ub.n_tokens > 0 ? ub.seq_id[0][0] : -1);
+
+        t.assert_equal(21u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal(16, false, 3).n_tokens);
+
+        // a new split of the same batch starts over
+        ba.split_reset();
+        t.assert_equal(3u, ba.split_equal(16, false, 3).n_seqs);
+    });
+
+    t.test("ubatches_share_sequences_without_such_a_tail", [&](testing & t) {
+        // a sequence that ends with one token has no snapshot to roll back to, and one that ends with more than
+        // n_keep_tail tokens has none either: the sequences that go on share their ubatches as before
+        for (const int n_first : { 1, 4 }) {
+            batch_builder bb(2, nullptr, 16);
+            make_batch(bb, {n_first, 9, 9});
+
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+
+            llama_ubatch ub = ba.split_equal(16, false, 3);
+            t.assert_equal(3u, ub.n_seqs);
+            t.assert_equal((uint32_t) n_first, ub.n_seq_tokens);
+
+            ub = ba.split_equal(16, false, 3);
+            t.assert_equal("seqs 1 and 2 together", 2u, ub.n_seqs);
+        }
+
+        // without n_keep_tail nothing is rolled back
+        batch_builder bb(2, nullptr, 16);
+        make_batch(bb, {3, 9, 9});
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        t.assert_equal(3u, ba.split_equal(16, false, 0).n_seqs);
+        t.assert_equal(2u, ba.split_equal(16, false, 0).n_seqs);
+    });
 }
 
 static void test_mrope(testing & t) {
