@@ -747,3 +747,30 @@ def test_the_copy_gives_way_when_another_program_takes_its_devices_memory(device
     assert copy["state"] == "loaded"
     assert copy["n_loads"] == 2
     assert copy["n_tasks_total"] == 2
+
+
+def test_a_task_too_large_for_the_first_pool_waits_for_the_copys_room():
+    global server
+    server.n_ctx = 1024            # the first pool
+    server.model_copy_after = 5
+    server.model_copy_ctx_size = 2048
+    server.model_copy_release = 60
+    server.start()
+
+    # a task of 1500 tokens does not fit in the first pool; the copy has 2048 cells and one slot
+    t, out = in_background({"prompt": PROMPT, "n_predict": 1450, "ignore_eos": True, "cache_prompt": False})
+    try:
+        wait_fast("the task did not reach the copy", lambda: the_copy()["tasks"] == 1)
+        # a second one of that size arrives while the copy works on the first: it waits for the copy's slot, and is
+        # not cut short in the first pool
+        body = complete(n_predict=1400, ignore_eos=True)
+    finally:
+        t.join()
+    assert out["res"].status_code == 200
+    assert out["res"].body["tokens_predicted"] == 1450
+    assert body["tokens_predicted"] == 1400
+    copy = the_copy()
+    assert copy["n_tasks_total"] == 2
+    assert copy["n_tasks_waited"] == 1
+    assert copy["tasks"] == 0
+    assert copy["tasks_first"] == 0

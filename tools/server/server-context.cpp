@@ -6509,23 +6509,40 @@ struct server_model_copy {
 
         // a conversation that the copy has goes on there while the copy is loaded, also when the first model is free
         const bool is_back = rec_old.n > 0 && rec_old.in_copy && state == LOADED;
-        if (!stays && counted && !stopping && !gives_way && n_pool == 0 && (is_back || n_first >= n_after || spills) &&
-                n_copy < n_parallel && n_cells_copy + n_cells <= n_ctx) {
-            // counted before the copy is there, so that the tasks that arrive while it loads see its room taken
-            n_copy++;
-            n_cells_copy += n_cells;
-            if (ensure_loaded(lock)) {
-                to_copy = true;
-                n_tasks_total++;
-                if (is_back && n_first < n_after) {
-                    n_tasks_back++;
-                } else if (spills && n_first < n_after) {
-                    n_tasks_spill++;
+
+        // A task that the first pool cannot hold and an empty copy can waits here for the copy's room, as long as the
+        // copy is there or can be loaded: its other place is the second pool of the first model, which the copy would
+        // have to be unloaded for. Every other task takes the copy's room when it is there, and does not wait for it.
+        const bool waits_for_copy = is_large && n_cells <= n_ctx;
+        bool       has_waited     = false;
+        while (!stays && counted && !stopping && !gives_way && n_pool == 0 && (is_back || n_first >= n_after || spills)) {
+            if (n_copy < n_parallel && n_cells_copy + n_cells <= n_ctx) {
+                // counted before the copy is there, so that the tasks that arrive while it loads see its room taken
+                n_copy++;
+                n_cells_copy += n_cells;
+                if (ensure_loaded(lock)) {
+                    to_copy = true;
+                    n_tasks_total++;
+                    if (has_waited) {
+                        n_tasks_waited++;
+                    }
+                    if (is_back && n_first < n_after) {
+                        n_tasks_back++;
+                    } else if (spills && n_first < n_after) {
+                        n_tasks_spill++;
+                    }
+                } else {
+                    n_copy--;
+                    n_cells_copy -= n_cells;
                 }
-            } else {
-                n_copy--;
-                n_cells_copy -= n_cells;
+                break;
             }
+            if (!waits_for_copy || state == UNLOADED) {
+                break;
+            }
+            // until a task of the copy ends, or the copy's state changes
+            has_waited = true;
+            cv.wait(lock);
         }
         // A task that neither the first pool nor the copy takes needs the second pool of the first model, whose device
         // the copy fills. The copy gives way: it gets no task while such a task is there, the timer unloads it as soon
@@ -6597,6 +6614,7 @@ struct server_model_copy {
             { "n_tasks_total", n_tasks_total },  // tasks sent to the copy since the server started
             { "n_tasks_back",  n_tasks_back },   // of them: sent there because the copy had their conversation
             { "n_tasks_spill", n_tasks_spill },  // of them: sent there because the first pool had not the cells for them
+            { "n_tasks_waited", n_tasks_waited }, // of them: too large for the first pool, they waited for the copy's room
             { "tasks_pool",    n_pool },         // tasks now that only the second pool of the first model can hold
             { "n_home",        n_home },         // KV cells of the first pool that a counted task can have, 0 = not known
             { "n_loads",       n_loads },        // times the copy was loaded
@@ -6710,6 +6728,7 @@ private:
     int32_t  n_pool        = 0;  // of those tasks: the ones that only the second pool of the first model can hold. While
                                  // there is one the copy gets no task, and it is unloaded when it has none
     uint64_t n_tasks_spill = 0;  // tasks that went to the copy because the first pool had not the cells for them
+    uint64_t n_tasks_waited = 0; // tasks that went to the copy after they had waited for its room
     int32_t  n_copy        = 0;  // tasks that the copy has, the ones that wait for it to load included
     int64_t  n_cells_copy  = 0;  // the KV cells that those tasks are counted with
     int64_t  t_idle        = 0;  // when the copy's last task ended
@@ -6794,6 +6813,8 @@ private:
             if (n_copy == 0) {
                 t_idle = ggml_time_ms();
             }
+            // a task may wait for this room
+            cv.notify_all();
         } else if (counted) {
             n_first--;
             n_cells_first -= n_cells;
