@@ -666,3 +666,30 @@ def test_the_copy_gives_way_to_a_task_that_only_the_second_pool_can_hold():
     assert copy["n_loads"] == 1
     assert copy["n_tasks_total"] == 2
     assert copy["tasks_pool"] == 0
+
+
+# The copy has a prompt cache of its own, with its own limit: the first model's --cache-ram is not there twice.
+
+def test_the_copys_prompt_cache_has_a_limit_of_its_own(tmp_path):
+    global server
+    server.cache_ram = 2048
+    server.log_path = str(tmp_path / "server.log")
+    server.debug = True
+    server.start()
+    assert the_copy()["cache_ram"] == 8192   # the default, whatever --cache-ram says
+    assert complete()["tokens_predicted"] == 16
+    server.stop()
+    with open(server.log_path) as f:
+        log = f.read()
+    assert "copy srv    load_model: prompt cache is enabled, size limit: 8192 MiB" in log
+
+    server.model_copy_cache_ram = 64
+    server.log_path = str(tmp_path / "server2.log")
+    server.start()
+    assert the_copy()["cache_ram"] == 64
+    assert complete()["tokens_predicted"] == 16
+    server.stop()
+    with open(server.log_path) as f:
+        log = f.read()
+    assert "copy srv    load_model: prompt cache is enabled, size limit: 64 MiB" in log
+    assert "srv    load_model: prompt cache is enabled, size limit: 2048 MiB" in log

@@ -6455,6 +6455,8 @@ struct server_model_copy {
             SRV_INF("model copy: it is loaded only when each of its devices has its size and %d MiB free (--model-copy-headroom)\n",
                     n_headroom);
         }
+        SRV_INF("model copy: its own prompt cache holds up to %d MiB of system memory (--model-copy-cache-ram)\n",
+                params_first.model_copy_cache_ram_mib);
         thread_timer = std::thread([this]() { run_timer(); });
     }
 
@@ -6589,6 +6591,7 @@ struct server_model_copy {
             { "total_slots",   n_parallel },
             { "after",         n_after },
             { "release",       n_release },
+            { "cache_ram",     params_first.model_copy_cache_ram_mib }, // MiB, the copy's own prompt cache
             { "tasks",         n_copy },         // the tasks the copy has now
             { "tasks_first",   n_first },        // the counted tasks the first model has now
             { "n_tasks_total", n_tasks_total },  // tasks sent to the copy since the server started
@@ -6754,6 +6757,10 @@ private:
         p.kv_unified_per_slot_list.clear();
         p.kv_reserve          = false;
         p.cache_idle_slots    = true;
+
+        // a prompt cache of its own, with a limit of its own: the first model's --cache-ram is not there twice
+        p.cache_ram_mib       = params_first.model_copy_cache_ram_mib;
+        p.cache_ram_explicit  = true;
 
         p.kv_overflow_device = nullptr;
         p.kv_overflow_size   = 0;

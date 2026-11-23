@@ -1830,6 +1830,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MODEL_COPY_DRAFT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--model-copy-cache-ram" }, "N",
+        string_format(
+            "the maximum size in MiB of the prompt cache that the model copy has for itself, beside the one of\n"
+            "--cache-ram (default: %d, -1 - no limit, 0 - disable). the copy keeps the prompts of its idle slots\n"
+            "there, and the cache goes when the copy is unloaded", params.model_copy_cache_ram_mib),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--model-copy-cache-ram takes a number of MiB, 0 or -1");
+            }
+            params.model_copy_cache_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_MODEL_COPY_CACHE_RAM").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION
