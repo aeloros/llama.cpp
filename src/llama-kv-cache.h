@@ -154,6 +154,7 @@ public:
     int32_t stream_add(ggml_backend_buffer_type_t buft, uint32_t size, bool alloc) override;
     bool stream_alloc(uint32_t strm) override;
     bool stream_release(uint32_t strm) override;
+    size_t stream_size(uint32_t strm) const override;
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
 
     // state write/load

@@ -128,6 +128,9 @@ LLAMA_API int32_t llama_memory_stream_add(llama_memory_t mem, ggml_backend_dev_t
 LLAMA_API bool llama_memory_stream_alloc  (llama_memory_t mem, int32_t strm);
 LLAMA_API bool llama_memory_stream_release(llama_memory_t mem, int32_t strm);
 
+// The size in bytes of an added stream's memory, whether the stream has it now or not.
+LLAMA_API size_t llama_memory_stream_size(llama_memory_t mem, int32_t strm);
+
 // Take the new cells of a sequence from a stream. Stream 0 is the one the cache was created with.
 // Returns false if the sequence still has cells.
 LLAMA_API bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm);

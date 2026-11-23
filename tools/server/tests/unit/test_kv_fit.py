@@ -550,3 +550,246 @@ def test_a_task_waits_when_the_device_has_no_memory_for_the_second_pool(tmp_path
     log = log_text()
     assert LOG_NO_MEMORY in log
     assert LOG_TOOK not in log
+
+
+# The device of the second pool gives only what it has (--kv-overflow-headroom). When a task would go to the second
+# pool, the server reads what the device has free: the task goes there when that covers the pool's cells, if the pool
+# is still without its memory, and the headroom on top. Otherwise the task is fitted without the pool.
+#
+# LLAMA_SERVER_DEBUG_KV_OVERFLOW_FREE names a file that holds the reading in MiB, in place of the device's own: a
+# test writes there what another program would leave of the device.
+
+LOG_NO_ROOM = "the second pool of KV cells gets no task for now"
+
+
+@pytest.fixture
+def device_free(tmp_path, monkeypatch):
+    """Sets what the device of the second pool says it has free, in MiB."""
+    path = tmp_path / "device-free.txt"
+
+    def set_free(mib: int):
+        # written whole: the server reads it at any moment
+        tmp = tmp_path / "device-free.tmp"
+        tmp.write_text(str(mib))
+        os.replace(tmp, path)
+
+    set_free(1024 * 1024)
+    monkeypatch.setenv("LLAMA_SERVER_DEBUG_KV_OVERFLOW_FREE", str(path))
+    return set_free
+
+
+def test_a_task_does_not_go_to_the_second_pool_when_its_device_lacks_the_memory(tmp_path, device_free):
+    # 100 MiB free is less than the headroom (1536 MiB by default): nothing is taken from the device, and the task
+    # that would have gone to the second pool waits for the first one
+    global server
+    device_free(100)
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    older, newer, n_busy_max, seen = run_two(1800, 1800)
+
+    assert n_busy_max == 1, "two tasks of 1800 were at work at once in one pool of 2560"
+    assert_served(older, 1800)
+    assert_served(newer, 1800)
+    assert not seen[0]["kv_overflow"]
+    assert not seen[1]["kv_overflow"]
+
+    log = log_text()
+    assert LOG_NO_ROOM in log
+    assert LOG_TOOK not in log, "the pool took its memory from a device that did not have it free"
+    assert LOG_NO_MEMORY not in log, "the device was asked for the memory"
+
+
+def test_a_task_goes_to_the_second_pool_again_when_its_device_has_the_memory(tmp_path, device_free):
+    global server
+    device_free(100)
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    older, newer, n_busy_max, seen = run_two(1800, 1800)
+    assert n_busy_max == 1
+    assert not seen[1]["kv_overflow"]
+    assert LOG_TOOK not in log_text()
+
+    # the other program has left
+    device_free(20000)
+
+    older, newer, n_busy_max, seen = run_two(1800, 1800)
+    assert n_busy_max == 2
+    assert_served(older, 1800)
+    assert_served(newer, 1800)
+    assert seen[1]["kv_overflow"]
+    assert log_text().count(LOG_TOOK) == 1
+
+
+@pytest.mark.parametrize("headroom,free,goes", [
+    (None, 2000, True),   # the default, 1536 MiB
+    (4096, 2000, False),
+    (4096, 5000, True),
+    (0,    64,   True),   # only the pool's own cells have to be free: a few MiB here
+    (0,    0,    False),
+    (-1,   0,    True),   # the device is not asked
+])
+def test_the_headroom_is_what_the_device_has_free_beyond_the_pool(tmp_path, device_free, headroom, free, goes):
+    global server
+    device_free(free)
+    server.kv_overflow_headroom = headroom
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    older, newer, n_busy_max, seen = run_two(1800, 1800)
+
+    assert_served(older, 1800)
+    assert_served(newer, 1800)
+    assert n_busy_max == (2 if goes else 1)
+    assert seen[1]["kv_overflow"] == goes
+    assert (LOG_TOOK in log_text()) == goes
+    assert (LOG_NO_ROOM in log_text()) == (not goes)
+
+
+def test_a_task_does_not_join_the_second_pool_when_its_device_has_run_short(tmp_path, device_free):
+    # The pool has its memory and a task at work. Then another program takes the device's memory. A third task has
+    # the cells in the second pool, and not at home: it waits all the same, for the room at home
+    global server
+    server.kv_overflow_release = 0
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    results = {}
+    seen = {}
+
+    def run(key: str, n_predict: int, id_slot: int):
+        results[key] = complete(PROMPT_OLDER, n_predict, id_slot)
+
+    def wait_at_work(n: int):
+        t_end = time.time() + 10
+        while len(slots_at_work()) < n and time.time() < t_end:
+            time.sleep(0.002)
+        assert len(slots_at_work()) >= n
+
+    # at home: prompt + 1900 + 1 cells of 2560. The next task, of prompt + 1000 + 1, does not fit beside it
+    t_home = threading.Thread(target=run, args=("home", 1900, 0))
+    t_home.start()
+    wait_at_work(1)
+    t_pool = threading.Thread(target=run, args=("pool", 1000, 1))
+    t_pool.start()
+    wait_at_work(2)
+    assert log_text().count(LOG_TOOK) == 1
+
+    device_free(100)
+
+    # prompt + 700 + 1 cells: free in the second pool, and not at home
+    t_third = threading.Thread(target=run, args=("third", 700, 2))
+    t_third.start()
+
+    n_busy_max = 0
+    while t_home.is_alive() or t_pool.is_alive() or t_third.is_alive():
+        busy = slots_at_work()
+        n_busy_max = max(n_busy_max, len(busy))
+        for slot in busy:
+            seen[slot["id"]] = slot
+        time.sleep(0.002)
+    for t in (t_home, t_pool, t_third):
+        t.join()
+
+    assert_served(results["home"], 1900)
+    assert_served(results["pool"], 1000)
+    assert_served(results["third"], 700)
+    assert seen[1]["kv_overflow"]
+    assert not seen[2]["kv_overflow"], "the third task went to a pool whose device had run short"
+    assert n_busy_max == 2
+    assert LOG_NO_ROOM in log_text()
+
+
+def conversation_in_the_second_pool(n_long: int):
+    """A task of n_long tokens at work at home in slot 0, and one turn of a conversation in slot 1, which does not
+    fit beside it and so is in the second pool: prompt + 700 cells. Returns the thread of the task at home, where its
+    response goes, and the tokens that the conversation holds."""
+    results = {}
+
+    def run_long():
+        results["long"] = complete(PROMPT_NEWER, n_long, 0)
+
+    t_long = threading.Thread(target=run_long)
+    t_long.start()
+    t_end = time.time() + 10
+    while not slots_at_work() and time.time() < t_end:
+        time.sleep(0.002)
+
+    first = turn(PROMPT_OLDER, 700, 1)
+    assert_served(first, 700)
+    assert slots()[1]["kv_overflow"]
+    assert log_text().count(LOG_TOOK) == 1
+
+    return t_long, results, tokens_of(PROMPT_OLDER) + first.body["tokens"]
+
+
+def test_a_conversation_in_the_second_pool_goes_on_there_when_its_device_has_run_short(tmp_path, device_free):
+    # The next turn of a conversation whose cells are in the second pool does not fit at home. It is not turned
+    # away for the device's sake: it runs where its cells are, and nothing waits
+    global server
+    server.no_cache_idle_slots = True
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    # at home: prompt + 1900 + 1 cells of 2560, so prompt + 700 + 1 do not fit beside it
+    t_long, results, held = conversation_in_the_second_pool(1900)
+
+    device_free(100)
+
+    seen = {}
+
+    def run_again():
+        results["again"] = turn(held, 300, 1)
+
+    t_again = threading.Thread(target=run_again)
+    t_again.start()
+    while t_again.is_alive():
+        for slot in slots_at_work():
+            seen[slot["id"]] = slot
+        time.sleep(0.002)
+    t_again.join()
+    assert t_long.is_alive(), "the task at home ended first: the turn had the room at home, and the test tells nothing"
+    t_long.join()
+
+    assert_served(results["long"], 1900)
+    assert seen[1]["kv_overflow"], "the turn left the pool that holds its cells"
+    assert_not_read_again(results["again"])
+    assert results["again"].body["tokens_predicted"] == 300
+    assert LOG_NO_ROOM not in log_text()
+
+
+def test_a_new_conversation_in_a_slot_of_the_second_pool_is_turned_away_like_any_task(tmp_path, device_free):
+    # the slot holds the cells of another conversation in the second pool: a task that does not go on from them
+    # is a new task for the device, which has run short
+    global server
+    server.no_cache_idle_slots = True
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    t_long, results, held = conversation_in_the_second_pool(1900)
+
+    device_free(100)
+
+    seen = {}
+
+    def run_new():
+        # prompt + 700 + 1 cells: free in the second pool, and not at home
+        results["new"] = complete("The sun was warm and the birds sang in the old tree by the river.", 700, 1)
+
+    t_new = threading.Thread(target=run_new)
+    t_new.start()
+    n_busy_max = 0
+    while t_new.is_alive():
+        busy = slots_at_work()
+        n_busy_max = max(n_busy_max, len(busy))
+        for slot in busy:
+            seen[slot["id"]] = slot
+        time.sleep(0.002)
+    t_new.join()
+    t_long.join()
+
+    assert_served(results["long"], 1900)
+    assert_served(results["new"], 700)
+    assert not seen[1]["kv_overflow"], "a new task went to a pool whose device had run short"
+    assert LOG_NO_ROOM in log_text()

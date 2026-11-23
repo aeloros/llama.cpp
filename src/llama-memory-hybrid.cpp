@@ -295,6 +295,10 @@ bool llama_memory_hybrid::stream_release(uint32_t strm) {
     return mem_attn->stream_release(strm);
 }
 
+size_t llama_memory_hybrid::stream_size(uint32_t strm) const {
+    return mem_attn->stream_size(strm);
+}
+
 bool llama_memory_hybrid::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
     return mem_attn->seq_set_stream(seq_id, strm);
 }

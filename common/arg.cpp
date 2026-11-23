@@ -1729,6 +1729,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OVERFLOW_RELEASE").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--kv-overflow-headroom" }, "MiB",
+        string_format(
+            "with --kv-overflow-device and no --kv-overflow-slots: a task goes to the second pool only when the device\n"
+            "has this much memory free, on top of the pool's own memory when that is still to be taken. it is for what\n"
+            "the task computes with on the device and for the other programs that use it\n"
+            "(default: %d, -1 = the device is not asked)", params.kv_overflow_headroom),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--kv-overflow-headroom takes a number of MiB, or -1");
+            }
+            params.kv_overflow_headroom = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OVERFLOW_HEADROOM").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         { "--kv-overflow-keep-awake" },
         { "--no-kv-overflow-keep-awake" },
         "keep --kv-overflow-device at full clocks while it is in use (default: enabled).\n"

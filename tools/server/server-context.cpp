@@ -1163,6 +1163,9 @@ private:
     bool    kv_overflow_bare   = false;
     int64_t t_kv_overflow_idle = -1;
 
+    // what the second pool's cells take of its device, in the target context and in the draft context
+    size_t  kv_overflow_bytes  = 0;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -1628,6 +1631,7 @@ private:
         kv_overflow_held     = false;
         kv_overflow_bare     = false;
         t_kv_overflow_idle   = -1;
+        kv_overflow_bytes    = 0;
 
         if (params_base.kv_overflow_device != nullptr) {
             llama_memory_t mem = llama_get_memory(ctx_tgt);
@@ -1711,6 +1715,18 @@ private:
                             "run without speculative decoding or without --kv-overflow-device\n");
                     return false;
                 }
+            }
+
+            kv_overflow_bytes = llama_memory_stream_size(mem, kv_strm_overflow);
+            if (ctx_dft != nullptr) {
+                kv_overflow_bytes += llama_memory_stream_size(llama_get_memory(ctx_dft), kv_strm_overflow_dft);
+            }
+
+            if (kv_fit && params_base.kv_overflow_headroom >= 0) {
+                SRV_INF("a task goes to the second pool only when %s has %d MiB free (--kv-overflow-headroom), on top of the %.2f MiB "
+                        "of the pool's cells when they are still to be taken\n",
+                        ggml_backend_dev_name(params_base.kv_overflow_device), params_base.kv_overflow_headroom,
+                        kv_overflow_bytes / 1024.0 / 1024.0);
             }
 
             // only the attention of these slots runs on the device, too little to keep its clocks up
@@ -2112,10 +2128,18 @@ private:
         if (ret && kv_fit) {
             fit = kv_fit_task(*ret, task);
 
-            // the second pool takes its memory when a task goes there. When the device does not have it now, the
-            // task is fitted without that pool
-            if (fit.ok && fit.overflow && !kv_overflow_acquire()) {
-                fit = kv_fit_task(*ret, task, true, 0);
+            // The second pool takes a task when its device has the memory free, and takes its own memory from it
+            // when the first task goes there. When the device does not have it now, the task is fitted without that
+            // pool. Not turned away: the children of a task, whose room was found with their parent, and the next
+            // turn of a conversation whose cells the slot holds in the second pool, which runs where its cells are.
+            // A task is such a turn when it keeps at least half of what the slot holds, as for the prompt cache above
+            if (fit.ok && fit.overflow) {
+                const bool goes_on = ret->kv_overflow && ret->prompt.n_tokens() > 0 &&
+                    2 * ret->prompt.tokens.get_common_prefix(task.tokens) >= (size_t) ret->prompt.n_tokens();
+
+                if (!(task.is_child() || goes_on || kv_overflow_device_has_room()) || !kv_overflow_acquire()) {
+                    fit = kv_fit_task(*ret, task, true, 0);
+                }
             }
 
             if (!fit.ok) {
@@ -2350,6 +2374,50 @@ private:
         }
 
         return { false, false, 0, 0 };
+    }
+
+    // The device of the second pool gives only what it has free (--kv-overflow-headroom), read when a task is fitted
+    // there: the memory of the pool's cells, when the pool is still without it, and the headroom on top. The
+    // headroom is for what the task computes with on the device, which is known only once it runs, and for what the
+    // other programs on the device need to stay free.
+    // Returns false when the device has less: the task is fitted without the pool.
+    bool kv_overflow_device_has_room() const {
+        if (params_base.kv_overflow_headroom < 0) {
+            return true;
+        }
+
+        size_t free  = 0;
+        size_t total = 0;
+
+        // LLAMA_SERVER_DEBUG_KV_OVERFLOW_FREE, for the tests: a file with the reading in MiB, in place of the device's
+        // own. A test writes there what another program would leave of the device
+        static const std::string debug_free = common_get_env("LLAMA_SERVER_DEBUG_KV_OVERFLOW_FREE");
+
+        double debug_mib = 0.0;
+        if (!debug_free.empty() && (std::ifstream(debug_free) >> debug_mib)) {
+            free  = (size_t) (debug_mib * 1024.0 * 1024.0);
+            total = SIZE_MAX;
+        } else {
+            ggml_backend_dev_memory(params_base.kv_overflow_device, &free, &total);
+        }
+
+        if (free == 0 && total == 0) {
+            return true; // the device does not say what it has
+        }
+
+        const size_t n_pool = kv_overflow_held ? 0 : kv_overflow_bytes;
+        const size_t n_need = n_pool + (size_t) params_base.kv_overflow_headroom * 1024 * 1024;
+
+        if (free >= n_need) {
+            return true;
+        }
+
+        SRV_WRN("the second pool of KV cells gets no task for now: %s has %zu MiB free, and a task there needs %zu MiB free "
+                "(%zu MiB for the pool's cells, %d MiB of headroom)\n",
+                ggml_backend_dev_name(params_base.kv_overflow_device), free / 1024 / 1024, n_need / 1024 / 1024,
+                n_pool / 1024 / 1024, params_base.kv_overflow_headroom);
+
+        return false;
     }
 
     // The second pool takes its memory from the device, in the target context and in the draft context.

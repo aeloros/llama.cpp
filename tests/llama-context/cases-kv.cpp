@@ -506,6 +506,11 @@ struct case_streams_release : ctx_test {
 
         CTX_REQUIRE(ctx_mem_bytes(ctx.get()) == n_bytes_before, "a stream that was added without its memory took memory");
         CTX_REQUIRE(!llama_memory_seq_set_stream(mem, 1, strm), "a stream without its memory took a sequence");
+
+        // what its memory takes is known before it is taken
+        const size_t n_bytes_strm = llama_memory_stream_size(mem, strm);
+        CTX_REQUIRE(n_bytes_strm > 0, "a stream without its memory does not say what its memory takes");
+        CTX_REQUIRE(llama_memory_stream_size(mem, 0) == 0, "the first stream says it is an added one");
         CTX_REQUIRE(llama_memory_stream_release(mem, strm), "giving back what a stream does not have is not an error");
 
         const llama_pos n_tokens = (llama_pos) std::min<size_t>(mr.tokens.size(), 128);
@@ -532,9 +537,12 @@ struct case_streams_release : ctx_test {
             if (round == 0) {
                 n_bytes_held = ctx_mem_bytes(ctx.get());
                 CTX_REQUIRE(n_bytes_held > n_bytes_before, "the memory of the stream does not show in the memory of the context");
+                CTX_REQUIRE(n_bytes_held - n_bytes_before == n_bytes_strm, "the stream took another amount of memory than it said");
             } else {
                 CTX_REQUIRE(ctx_mem_bytes(ctx.get()) == n_bytes_held, "the stream took a different amount of memory" + where);
             }
+
+            CTX_REQUIRE(llama_memory_stream_size(mem, strm) == n_bytes_strm, "the stream says another size with its memory" + where);
 
             CTX_REQUIRE(llama_memory_seq_set_stream(mem, 1, strm), "failed to assign seq 1 to the stream" + where);
 
@@ -552,6 +560,7 @@ struct case_streams_release : ctx_test {
             CTX_REQUIRE(llama_memory_stream_release(mem, strm), "the stream failed to give its memory back" + where);
 
             CTX_REQUIRE(ctx_mem_bytes(ctx.get()) == n_bytes_before, "the memory of the stream is still counted after it went back" + where);
+            CTX_REQUIRE(llama_memory_stream_size(mem, strm) == n_bytes_strm, "the stream says another size after its memory went back" + where);
             CTX_REQUIRE(!llama_memory_seq_set_stream(mem, 1, strm), "a stream without its memory took a sequence" + where);
 
             // the first stream is as it was

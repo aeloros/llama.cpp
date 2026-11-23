@@ -173,6 +173,12 @@ struct llama_memory_i {
         return false;
     }
 
+    // the size in bytes of an added stream's memory, taken or not; 0 for any other stream
+    virtual size_t stream_size(uint32_t strm) const {
+        GGML_UNUSED(strm);
+        return 0;
+    }
+
     // the stream that the new cells of seq_id are taken from, returns false if the sequence still has cells
     virtual bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
         GGML_UNUSED(seq_id);

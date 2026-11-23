@@ -1445,6 +1445,16 @@ bool llama_kv_cache::stream_release(uint32_t strm) {
     return true;
 }
 
+size_t llama_kv_cache::stream_size(uint32_t strm) const {
+    if (strm >= n_stream || !is_stream_added(strm)) {
+        return 0;
+    }
+
+    const auto & sb = strm_bufs[strm];
+
+    return sb.buf ? ggml_backend_buffer_get_size(sb.buf.get()) : ggml_backend_alloc_ctx_tensors_from_buft_size(sb.ctx.get(), sb.buft);
+}
+
 bool llama_kv_cache::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 

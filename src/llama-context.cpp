@@ -5032,6 +5032,14 @@ bool llama_memory_stream_release(llama_memory_t mem, int32_t strm) {
     return mem->stream_release((uint32_t) strm);
 }
 
+size_t llama_memory_stream_size(llama_memory_t mem, int32_t strm) {
+    if (!mem || strm < 0) {
+        return 0;
+    }
+
+    return mem->stream_size((uint32_t) strm);
+}
+
 bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm) {
     if (!mem || strm < 0) {
         return false;

@@ -670,6 +670,7 @@ struct common_params {
     std::vector<int32_t> kv_overflow_slots;            // slots that take their KV cells from the added stream; empty = each task is fitted when it starts
     int32_t              kv_fit_headroom    = 8192;    // fitting: room for a task's output that has to be free in the first pool for the task to go there
     int32_t              kv_overflow_release = 60;     // fitting: seconds without a task in the added stream after which its memory goes back to the device; -1 = taken at startup and kept
+    int32_t              kv_overflow_headroom = 1536;  // fitting: MiB that the device of the added stream has to have free, beyond the stream's own memory, for a task to go there; -1 = the device is not asked
     bool                 kv_overflow_keep_awake = true; // keep kv_overflow_device at full clocks while it is in use
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
