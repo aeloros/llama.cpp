@@ -539,12 +539,13 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
             /*.no_alloc  =*/ model.no_alloc(),
-            /*.lazy      =*/ cparams.n_seq_budget > 0 ? &memory_lazy : nullptr,
+            // a dry run without allocation has no memory to take: it counts all of it
+            /*.lazy      =*/ cparams.n_seq_budget > 0 && !model.no_alloc() ? &memory_lazy : nullptr,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
 
-        if (cparams.n_seq_budget > 0) {
+        if (cparams.n_seq_budget > 0 && !model.no_alloc()) {
             // before memory goes back, the graphs of this context that are under way are finished
             memory_lazy.synchronize = [this]() { synchronize(); };
 

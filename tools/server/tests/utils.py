@@ -95,6 +95,7 @@ class ServerProcess:
     kv_overflow_device: str | None = None
     kv_overflow_size: int | None = None
     kv_fit_headroom: int | None = None
+    slots_max: int | None = None
     kv_overflow_release: int | None = None
     kv_overflow_headroom: int | None = None
     model_copy_device: str | None = None
@@ -246,6 +247,15 @@ class ServerProcess:
             server_args.extend(["--kv-overflow-size", self.kv_overflow_size])
         if self.kv_fit_headroom is not None:
             server_args.extend(["--kv-fit-headroom", self.kv_fit_headroom])
+        if self.slots_max is not None:
+            server_args.extend(["--slots-max", self.slots_max])
+        elif os.environ.get("LLAMA_TEST_SLOTS_MAX") and self.kv_unified and "--kv-overflow-slots" not in (self.extra_args or []):
+            # for running the tests of other options with lazy sequence memory: every server with one pool of cells
+            # gets this many slots, with the memory of its --parallel slots set aside. Three kinds of tests fail
+            # then, and no other should: those that count the slots of their server; those of a pool whose tasks
+            # are not fitted when they start (test_step_refusal.py), which --slots-max does; and those whose
+            # server cannot have such memory and stops (no flash attention, a model with a sliding window).
+            server_args.extend(["--slots-max", os.environ["LLAMA_TEST_SLOTS_MAX"]])
         if self.kv_overflow_release is not None:
             server_args.extend(["--kv-overflow-release", self.kv_overflow_release])
         if self.kv_overflow_headroom is not None:

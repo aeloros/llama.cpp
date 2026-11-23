@@ -683,6 +683,9 @@ struct common_params {
     bool                 model_copy_draft      = true;     // the copy drafts tokens as the first model does
     int32_t              model_copy_cache_ram_mib = 8192;  // the copy's own prompt cache, as cache_ram_mib
     bool                 model_copy_keep_conversations = false; // a conversation that the copy read last goes on there, also when the first model is free
+
+    int32_t              slots_max    = 0; // the most slots: those beyond n_parallel take the memory of their state when a task uses them; 0 = n_parallel slots
+    int32_t              n_seq_budget = 0; // set from slots_max: the slots whose state the memory holds beside all the KV cells; 0 = sequence memory is not lazy
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise

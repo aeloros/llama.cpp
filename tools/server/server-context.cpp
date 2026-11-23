@@ -1192,6 +1192,15 @@ private:
     int32_t kv_strm_overflow_dft = -1;
     bool    kv_fit               = false;
 
+    // Lazy sequence memory (--slots-max). The first pool is not a fixed number of cells then: the rows of the
+    // sequences and the cells take their memory from one budget, what -c cells and --parallel rows take, and a row
+    // beyond --parallel takes its memory from what the cells have not taken. The tasks are fitted (kv_fit), with or
+    // without a second pool, and what the first pool can still promise comes from kv_lazy_free().
+    bool kv_lazy = false;
+
+    // the most cells that the memory may take beside n rows; -1 = not asked yet
+    mutable std::vector<int64_t> kv_lazy_cells_max;
+
     // With fitted tasks the second pool has its memory only while it is in use (--kv-overflow-release): it is taken
     // from the device when a task goes there (kv_overflow_acquire), and it goes back when the pool has been without
     // a task for that long (kv_overflow_release_idle). No slot is in the second pool while it is without its memory.
@@ -1782,6 +1791,29 @@ private:
             }
         }
 
+        kv_lazy = false;
+        kv_lazy_cells_max.clear();
+
+        if (params_base.n_seq_budget > 0) {
+            llama_memory_lazy_info info;
+            if (!llama_memory_get_lazy_info(llama_get_memory(ctx_tgt), &info)) {
+                SRV_ERR("%s", "--slots-max: the memory of this model does not take its cells and states lazily\n");
+                return false;
+            }
+
+            // each task is fitted when it starts: its row and its cells have to fit in what the memory may take
+            kv_lazy = true;
+            kv_fit  = true;
+
+            const int32_t n_rows_cells = info.cell_bytes > 0 ? (int32_t) ((info.row_bytes + info.cell_bytes - 1) / info.cell_bytes) : 0;
+
+            SRV_INF("%d slots, the memory of %d of them is set aside (--slots-max): the others take theirs from the KV cells when a task "
+                    "uses them, %.2f MiB or %d cells for a slot\n",
+                    params_base.n_parallel, params_base.n_seq_budget, info.row_bytes / 1024.0 / 1024.0, n_rows_cells);
+            SRV_INF("the KV cells and the states of the slots take their memory as they are used, %.2f MiB at most\n",
+                    info.budget / 1024.0 / 1024.0);
+        }
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
@@ -2348,7 +2380,7 @@ private:
             return false;
         }
 
-        int64_t n_free = kv_fit_free_home(slot) - slot.n_ctx_task;
+        int64_t n_free = kv_lazy ? kv_lazy_free(nullptr, 0, true) : kv_fit_free_home(slot) - slot.n_ctx_task;
         if (n_free <= 0) {
             server_slot * donor = nullptr;
             for (auto & other : slots) {
@@ -2417,7 +2449,10 @@ private:
             }
         }
 
-        const int64_t n_free_home = (int64_t) llama_n_ctx_seq(ctx_tgt) - n_home;
+        // lazy memory: the task needs a row if its slot holds none, and its children one each
+        const int32_t n_rows_new = (slot.prompt.n_tokens() > 0 ? 0 : 1) + (with_children ? (int32_t) task.child_tasks.size() : 0);
+
+        const int64_t n_free_home = kv_lazy ? kv_lazy_free(&slot, n_rows_new, true) : (int64_t) llama_n_ctx_seq(ctx_tgt) - n_home;
         const int64_t n_free_over = (int64_t) params_base.kv_overflow_size - n_over;
 
         const int64_t n_own  = n_ctx_task_of(slot, task);
@@ -2426,11 +2461,12 @@ private:
         if (pool != 1 && n_need <= n_free_home) {
             return { true, false, (int32_t) (n_need - (size - n_own)), n_need };
         }
-        if (pool != 0 && size <= n_free_over) {
+        // lazy memory: a task in the second pool has its row in the first all the same
+        if (pool != 0 && size <= n_free_over && (!kv_lazy || n_free_home >= 0)) {
             return { true, true, (int32_t) n_own, size };
         }
         if (!any_other || !with_children) {
-            const bool    overflow = pool >= 0 ? pool == 1 : n_free_over > n_free_home;
+            const bool    overflow = pool >= 0 ? pool == 1 : kv_strm_overflow >= 0 && n_free_over > n_free_home;
             const int64_t n_free   = overflow ? n_free_over : n_free_home;
             return { true, overflow, (int32_t) std::max<int64_t>(1, std::min<int64_t>(n_own, n_free - (size - n_own))), std::min<int64_t>(size, n_free) };
         }
@@ -2619,6 +2655,100 @@ private:
         SLT_INF(slot, "the slot takes its KV cells from the %s pool\n", overflow ? "second" : "first");
     }
 
+    // Lazy sequence memory: the most cells that the memory may take beside n_rows rows, by its budget.
+    int64_t kv_lazy_cells(const llama_memory_lazy_info & info, uint32_t n_rows) const {
+        if (kv_lazy_cells_max.size() <= n_rows) {
+            kv_lazy_cells_max.resize(n_rows + 1, -1);
+        }
+
+        if (kv_lazy_cells_max[n_rows] < 0) {
+            llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+            // the highest cell mark, in its steps of 256, that fits beside the rows
+            int64_t lo = 0;
+            int64_t hi = info.n_cells / 256;
+            while (lo < hi) {
+                const int64_t mid = (lo + hi + 1) / 2;
+                if (llama_memory_lazy_bytes(mem, (uint32_t) (mid * 256), n_rows) <= info.budget) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+
+            kv_lazy_cells_max[n_rows] = lo * 256;
+        }
+
+        return kv_lazy_cells_max[n_rows];
+    }
+
+    // Lazy sequence memory: the cells of the first pool that can still be promised to a task. What the memory has
+    // taken follows its marks, the highest cell and the highest row in use. New cells and rows fill what is free
+    // below the marks first, so a mark rises only by what does not fit there, and the cell mark may rise as far as
+    // the budget lets it beside the rows.
+    // Promised already: to the tasks at work in the first pool their limits, and to the slots that come first
+    // (--batch-priority-slots) their whole limits and a row each.
+    //   slot:       its own task is the one that asks: it is left out of the promises, and what it holds is its to use
+    //   n_rows_new: the rows that the task needs on top of those that are held
+    //   with_idle:  what the idle slots hold counts as free: they give it up when it is needed (kv_fit_make_room)
+    // Negative: there is not even the room for the rows beside what is promised.
+    int64_t kv_lazy_free(const server_slot * slot, int32_t n_rows_new, bool with_idle) const {
+        llama_memory_lazy_info info;
+        if (!llama_memory_get_lazy_info(llama_get_memory(ctx_tgt), &info)) {
+            return 0;
+        }
+
+        int64_t n_cells_free = (int64_t) info.n_cells_taken - (int64_t) info.n_cells_used; // below the cell mark
+        int64_t n_rows_free  = (int64_t) info.n_rows_taken  - (int64_t) info.n_rows_used;  // below the row mark
+        int64_t n_promised   = 0;
+        int64_t n_rows       = n_rows_new;
+
+        for (const auto & other : slots) {
+            const int64_t n_held = other.kv_overflow ? 0 : other.prompt.n_tokens(); // its cells of the first pool
+
+            if (is_batch_priority_slot(other.id)) {
+                // its whole limit and its row are kept for it, in use or not
+                n_promised += std::max<int64_t>(0, other.n_ctx - n_held);
+                n_rows     += other.prompt.n_tokens() > 0 ? 0 : 1;
+            } else if (&other == slot) {
+                n_cells_free += n_held;
+            } else if (other.is_processing()) {
+                n_promised += other.kv_overflow ? 0 : std::max<int64_t>(0, other.n_ctx_task - n_held);
+                n_rows     += other.prompt.n_tokens() > 0 ? 0 : 1; // a task that has not taken its row yet
+            } else if (with_idle && other.prompt.n_tokens() > 0) {
+                n_cells_free += n_held;
+                n_rows_free  += 1;
+            }
+        }
+
+        uint32_t n_rows_mark = info.n_rows_taken;
+        if (info.n_rows > 0) {
+            n_rows_mark += (uint32_t) std::max<int64_t>(0, n_rows - n_rows_free);
+            if (n_rows_mark > info.n_rows) {
+                return -1 - (int64_t) info.n_cells; // there is no such row
+            }
+        }
+
+        return kv_lazy_cells(info, n_rows_mark) - (int64_t) info.n_cells_taken + n_cells_free - n_promised;
+    }
+
+    // an idle slot gives up what it holds, its cells and its row, saved to the prompt cache first
+    void kv_fit_give_up(server_slot & idle, const server_slot & slot, const char * what) {
+        const int64_t t_start = ggml_time_us();
+        const int32_t n_cells = idle.prompt.n_tokens();
+
+        const bool saved = prompt_cache && idle.prompt_save(*prompt_cache);
+        if (saved) {
+            prompt_cache->update();
+        }
+        idle.prompt_clear();
+
+        SLT_INF(idle, "the idle slot gives up its %d KV cells %s to the task in slot %d, %s (%.2f ms)\n",
+                n_cells, what, slot.id,
+                saved ? "saved to the prompt cache" : "not saved: no prompt cache, or it has the prompt already",
+                (ggml_time_us() - t_start) / 1000.0);
+    }
+
     // An idle slot keeps the cells of its cached prompt for as long as no task needs them. A task that is fitted
     // into a pool may take n_room cells there. The pool has them when the limits of the tasks at work, what is kept
     // for the slots of --batch-priority-slots and the cached prompts of the idle slots leave that many: until then
@@ -2627,6 +2757,34 @@ private:
     // With that, the cells in a pool never add up to more than it has, and no step is refused for a cached prompt.
     // slot: the task's own, which is not counted.
     void kv_fit_make_room(const server_slot & slot, bool overflow, int64_t n_room) {
+        // Lazy sequence memory: the row of the task, and its cells when it is fitted to the first pool, have to fit
+        // in what the memory may take beside what is in use and promised. Until they do, the idle slots give up
+        // what they hold, the least recently used first, whichever pool their cells are in: each has a row.
+        if (kv_lazy) {
+            const int32_t n_rows_new = slot.prompt.n_tokens() > 0 ? 0 : 1;
+
+            while (kv_lazy_free(&slot, n_rows_new, false) < (overflow ? 0 : n_room)) {
+                server_slot * lru = nullptr;
+                for (auto & other : slots) {
+                    if (&other == &slot || is_batch_priority_slot(other.id) || other.is_processing() || other.prompt.n_tokens() == 0) {
+                        continue;
+                    }
+                    if (!lru || other.t_last_used < lru->t_last_used) {
+                        lru = &other;
+                    }
+                }
+                if (!lru) {
+                    break;
+                }
+
+                kv_fit_give_up(*lru, slot, "and its row");
+            }
+
+            if (!overflow) {
+                return;
+            }
+        }
+
         const int64_t n_pool = overflow ? (int64_t) params_base.kv_overflow_size : (int64_t) llama_n_ctx_seq(ctx_tgt);
 
         while (true) {
@@ -2655,19 +2813,7 @@ private:
                 return;
             }
 
-            const int64_t t_start = ggml_time_us();
-            const int32_t n_cells = lru->prompt.n_tokens();
-
-            const bool saved = prompt_cache && lru->prompt_save(*prompt_cache);
-            if (saved) {
-                prompt_cache->update();
-            }
-            lru->prompt_clear();
-
-            SLT_INF(*lru, "the idle slot gives up its %d KV cells of the %s pool to the task in slot %d, %s (%.2f ms)\n",
-                    n_cells, overflow ? "second" : "first", slot.id,
-                    saved ? "saved to the prompt cache" : "not saved: no prompt cache, or it has the prompt already",
-                    (ggml_time_us() - t_start) / 1000.0);
+            kv_fit_give_up(*lru, slot, overflow ? "of the second pool" : "of the first pool");
         }
     }
 
@@ -6911,6 +7057,10 @@ private:
         p.kv_unified_per_slot = 0;
         p.kv_unified_per_slot_list.clear();
         p.kv_reserve          = false;
+
+        // the copy holds the memory of its slots whole (--slots-max is for the first model)
+        p.slots_max    = 0;
+        p.n_seq_budget = 0;
         p.cache_idle_slots    = true;
 
         // a prompt cache of its own, with a limit of its own: the first model's --cache-ram is not there twice
@@ -7691,6 +7841,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "default_generation_settings", default_generation_settings_for_props },
         // the slots of a model copy count: a proxy in front lets in one request for each slot
         { "total_slots",                 params.n_parallel + (params.model_copy_devices.empty() ? 0 : std::max(1, params.model_copy_n_parallel)) },
+        // --slots-max: the slots of the first model whose memory is set aside; the others take theirs when a task uses them. 0 = all of them
+        { "slots_set_aside",             params.n_seq_budget },
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },

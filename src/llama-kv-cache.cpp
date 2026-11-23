@@ -1614,6 +1614,7 @@ bool llama_kv_cache::lazy_info(llama_memory_lazy_info & info) const {
     info.taken         = lazy->taken;
     info.n_cells       = get_size(0);
     info.n_cells_taken = lazy_mark;
+    info.n_cells_used  = v_cells[0].get_used();
 
     info.cell_bytes = 0;
     for (const auto & r : lazy_ranges(0, 1)) {

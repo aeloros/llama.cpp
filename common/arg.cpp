@@ -1852,6 +1852,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MODEL_COPY_KEEP_CONVERSATIONS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        { "--slots-max" }, "N",
+        "the most slots (default: --parallel). the slots beyond --parallel take the memory of their state when a\n"
+        "task uses them, out of the memory that the KV cells of -c have not taken, and give it back when they are\n"
+        "idle and it is needed: the server holds no more memory than with --parallel slots, and how many tasks run\n"
+        "at once follows what they need. the KV cells take their memory as they are used, too. needs --kv-unified,\n"
+        "flash attention and a model whose layers are on one device that can reserve memory (CUDA, the CPU);\n"
+        "the slots beyond the list of --kv-unified-per-slot have its last limit",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slots-max must not be negative");
+            }
+            params.slots_max = value;
+        }
+    ).set_env("LLAMA_ARG_SLOTS_MAX").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

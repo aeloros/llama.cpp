@@ -221,6 +221,30 @@ static bool server_prepare_params(common_params & params, server_role_type role_
                 params.kv_unified_per_slot, params.n_ctx);
     }
 
+    // --slots-max: the slots beyond --parallel take the memory of their state when a task uses them. The memory of
+    // --parallel states is what the context may take beside all the KV cells (lazy sequence memory).
+    if (role_type != SERVER_ROLE_ROUTER && params.slots_max > 0) {
+        if (params.slots_max <= params.n_parallel) {
+            SRV_WRN("--slots-max (%d) is not more than --parallel (%d): ignored\n", params.slots_max, params.n_parallel);
+            params.slots_max = 0;
+        } else if (!params.kv_unified) {
+            SRV_ERR("%s", "--slots-max needs --kv-unified (one shared KV pool)\n");
+            return false;
+        } else if (!params.kv_overflow_slots.empty()) {
+            SRV_ERR("%s", "--slots-max cannot be used with --kv-overflow-slots: its tasks are fitted when they start\n");
+            return false;
+        } else {
+            params.n_seq_budget = params.n_parallel;
+
+            // the slots beyond the list of limits have its last one
+            if (!params.kv_unified_per_slot_list.empty()) {
+                params.kv_unified_per_slot_list.resize(params.slots_max, params.kv_unified_per_slot_list.back());
+            }
+
+            params.n_parallel = params.slots_max;
+        }
+    }
+
     // for consistency between server router mode and single-model mode, we set the same model name as alias
     auto model_name = params.model.get_name();
     if (params.model_alias.empty() && !model_name.empty()) {

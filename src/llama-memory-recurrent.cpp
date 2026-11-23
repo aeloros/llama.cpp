@@ -899,6 +899,7 @@ bool llama_memory_recurrent::lazy_info(llama_memory_lazy_info & info) const {
     info.taken        = lazy->taken;
     info.n_rows       = size;
     info.n_rows_taken = lazy_mark;
+    info.n_rows_used  = (uint32_t) std::count_if(cells.begin(), cells.end(), [](const mem_cell & cell) { return !cell.is_empty(); });
 
     info.row_bytes = 0;
     for (const auto & r : lazy_ranges(0, 1)) {

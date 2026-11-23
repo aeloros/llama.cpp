@@ -148,9 +148,11 @@ struct llama_memory_lazy_info {
     size_t   taken         = 0; // bytes taken now
     uint32_t n_cells       = 0; // the cells of stream 0
     uint32_t n_cells_taken = 0; // the cell mark: the cells below it have their memory
+    uint32_t n_cells_used  = 0; // those of them that sequences hold; the free ones below the mark are filled first
     size_t   cell_bytes    = 0; // of one cell
     uint32_t n_rows        = 0; // the rows of the recurrent state that are taken lazily, 0 if there are none
     uint32_t n_rows_taken  = 0; // the row mark
+    uint32_t n_rows_used   = 0; // those of them that sequences hold; a new sequence takes the lowest free row
     size_t   row_bytes     = 0; // of one row, the part that is taken lazily
 };
 

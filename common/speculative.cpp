@@ -3031,6 +3031,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 
+    // the draft context holds its memory whole (--slots-max is for the target's)
+    result.slots_max    = 0;
+    result.n_seq_budget = 0;
+
     if (has_draft) {
         // default to global devices value
         if (!params_spec.devices.empty()) {
