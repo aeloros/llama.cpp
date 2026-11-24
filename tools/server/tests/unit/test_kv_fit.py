@@ -1031,6 +1031,29 @@ def test_a_conversation_with_cells_in_both_pools_comes_back_after_the_memory_of_
     assert again.body["tokens"] == goes_on_alone(said + more, 8), "what came back is not the conversation"
 
 
+def test_a_conversation_with_cells_in_both_pools_ends_at_its_limit_where_another_would_shift_its_context():
+    # --context-shift: a task that has filled its slot drops the oldest part of its conversation and moves the rest
+    # up. That is not built for a conversation with cells in two pools: such a task ends as truncated at the slot's
+    # limit, as it would without context shift. (Its positions cannot be moved: the server stopped itself there.)
+    global server
+    server.kv_fit_headroom = 256
+    server.enable_ctx_shift = True
+    start_on_cpu()
+
+    # 2200 tokens are more than a slot holds (2048), and two slots are more than the first pool (2560)
+    older, newer, seen = run_two_turns(2200, 2200)
+
+    assert seen[0]["kv_overflow"] and seen[1]["kv_overflow"], "both went on in the second pool"
+    assert seen[0]["kv_cells_home"] > 256 and seen[1]["kv_cells_home"] > 256
+
+    for res, prompt in ((older, PROMPT_OLDER), (newer, PROMPT_NEWER)):
+        assert res.status_code == 200, f"{res.status_code} {str(res.body)[:200]}"
+        assert res.body["truncated"]
+        assert res.body["tokens_predicted"] == 2048 - n_tokens(prompt), "it ended where its slot was full"
+
+    assert server.make_request("GET", "/health").status_code == 200
+
+
 def test_a_task_that_may_take_its_prompt_from_the_prompt_cache_is_fitted_with_all_of_it(tmp_path):
     # A slot whose conversation went on in the second pool keeps the cells that it holds in the first, and its next
     # turn needs no room for them in the second. A task that keeps less than half of what the slot holds is not such

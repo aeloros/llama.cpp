@@ -3392,7 +3392,11 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx_task && !kv_fit_extend(slot)) {
+        // A conversation with cells in both pools of KV cells does not shift its context either: its positions are
+        // moved in one stream of the cache only (llama_memory_seq_add), so it ends at its limit.
+        const bool no_shift = !params_base.ctx_shift || kv_span_home(slot) > 0;
+
+        if (no_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx_task && !kv_fit_extend(slot)) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -5508,9 +5512,11 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // not for a conversation with cells in both pools of KV cells: see process_token()
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    kv_span_home(slot) == 0;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
