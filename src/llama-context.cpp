@@ -2989,6 +2989,39 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return gf_res_prev[n_outputs > 0].get();
 }
 
+int32_t llama_context::n_attn_away() const {
+    if (gf_res_prev_active == nullptr) {
+        return -1;
+    }
+
+    ggml_cgraph * gf = gf_res_prev_active->get_gf();
+
+    int32_t res = 0;
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+
+        // The K of a cache is a view of the cache's tensor. Where the node runs on another backend than that
+        // tensor's, the scheduler has put a copy in the place of the view: a tensor of its own that no op computed.
+        const ggml_tensor * k = node->src[1];
+        if (k->view_src == nullptr) {
+            res += k->op == GGML_OP_NONE ? 1 : 0;
+            continue;
+        }
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+        if (k->view_src->buffer != nullptr &&
+                (backend == nullptr || !ggml_backend_supports_buft(backend, ggml_backend_buffer_get_type(k->view_src->buffer)))) {
+            res++;
+        }
+    }
+
+    return res;
+}
+
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
 static void ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,
@@ -5108,6 +5141,10 @@ int32_t llama_memory_seq_n_cells(llama_memory_t mem, llama_seq_id seq_id, int32_
     }
 
     return (int32_t) mem->seq_n_cells(seq_id, (uint32_t) strm);
+}
+
+int32_t llama_context_n_attn_away(const llama_context * ctx) {
+    return ctx ? ctx->n_attn_away() : -1;
 }
 
 bool llama_memory_get_lazy_info(llama_memory_t mem, llama_memory_lazy_info * info) {

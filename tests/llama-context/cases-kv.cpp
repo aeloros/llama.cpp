@@ -327,6 +327,10 @@ struct case_stream_span : ctx_test {
             return case_result::fail();
         }
 
+        // Attention has to run where the cells are: each of the two parts on the device of its stream. An attention
+        // that runs elsewhere gives the same result, with the K and V of its stream copied to it for every layer.
+        CTX_REQUIRE(llama_context_n_attn_away(ctx.get()) == 0, "an attention ran on another device than the cells it reads");
+
         CTX_REQUIRE(llama_memory_seq_n_cells(mem, 1, 0)    == n_half,            "seq 1 does not hold the first half of the prompt in the first stream");
         CTX_REQUIRE(llama_memory_seq_n_cells(mem, 1, strm) == n_tokens - n_half, "seq 1 does not hold the rest of the prompt in the second stream");
 

@@ -3230,8 +3230,45 @@ ggml_tensor * llm_graph_context::build_attn_mha_span(
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
 
+    // Attention has to run where the cells are: each part on the backend that holds the cells of its stream, and the
+    // combine on the layer's. The scheduler does not see to that: an op without a place of its own follows the op
+    // before it, so both parts and the combine would run on one device, with the K and V of the other stream copied
+    // there whole for every layer of every batch.
+    const auto pin = [&](ggml_tensor * node, ggml_backend_t backend) {
+        if (backend != nullptr && ggml_backend_supports_op(backend, node)) {
+            ggml_backend_sched_set_tensor_backend(sched, node, backend);
+        }
+    };
+
+    // the first of the scheduler's backends that takes the buffer of a stream's tensor, as for a view of it
+    const auto backend_of_cells = [&](const ggml_tensor * t) -> ggml_backend_t {
+        const ggml_tensor * base = t->view_src ? t->view_src : t;
+        if (base->buffer == nullptr) {
+            return nullptr;
+        }
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_supports_buft(backend, ggml_backend_buffer_get_type(base->buffer))) {
+                return backend;
+            }
+        }
+        return nullptr;
+    };
+
+    const auto backend_of_layer = [&]() -> ggml_backend_t {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_get_device(backend) == model.dev_layer(il)) {
+                return backend;
+            }
+        }
+        return nullptr;
+    };
+
     const auto part = [&](ggml_tensor * k, ggml_tensor * v, ggml_tensor * kq_mask, ggml_tensor * kv_rows) {
         const bool v_trans = v->nb[1] > v->nb[2];
+
+        ggml_backend_t backend = backend_of_cells(k);
 
         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
         v = ggml_permute(ctx0, v, 0, 2, 1, 3);
@@ -3244,6 +3281,8 @@ ggml_tensor * llm_graph_context::build_attn_mha_span(
                                                              hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
+        pin(cur, backend);
+
         return cur;
     };
 
@@ -3252,6 +3291,8 @@ ggml_tensor * llm_graph_context::build_attn_mha_span(
 
     ggml_tensor * cur = ggml_flash_attn_ext_combine(ctx0, part_a, part_b);
     cb(cur, "kqv_span", il);
+
+    pin(cur, backend_of_layer());
 
     cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
 

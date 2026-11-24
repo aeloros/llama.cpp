@@ -151,6 +151,12 @@ LLAMA_API bool llama_memory_can_span(llama_memory_t mem, int32_t strm);
 // The number of cells that a sequence holds in a stream of the KV cache, 0 for a memory without streams.
 LLAMA_API int32_t llama_memory_seq_n_cells(llama_memory_t mem, llama_seq_id seq_id, int32_t strm);
 
+// For tests of a cache with streams on two devices. The number of attention nodes of the context's last graph that
+// ran on another device than the one that holds the cells they read, -1 without a graph. Attention has to run where
+// the cells are: an attention that runs elsewhere has the K and V of its stream copied to it whole, for every layer
+// of every batch.
+LLAMA_API int32_t llama_context_n_attn_away(const struct llama_context * ctx);
+
 //
 // Lazy sequence memory (llama_context_params::n_seq_budget)
 //

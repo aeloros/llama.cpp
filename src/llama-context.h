@@ -288,6 +288,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // see llama_context_n_attn_away
+    int32_t n_attn_away() const;
+
 private:
     llm_graph_result * get_gf_res_prev();
 
