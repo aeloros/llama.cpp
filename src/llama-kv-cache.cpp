@@ -1553,6 +1553,16 @@ bool llama_kv_cache::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
 bool llama_kv_cache::seq_span_stream(llama_seq_id seq_id, uint32_t strm) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
+    if (!can_span_strm(strm)) {
+        return false;
+    }
+
+    seq_to_stream[seq_id] = strm;
+
+    return true;
+}
+
+bool llama_kv_cache::can_span_strm(uint32_t strm) const {
     // Attention over the cells of a sequence is one result, or two that are combined: the cache has two streams then,
     // the one it was created with and one that was added. A cache that mirrors the cells of another one, and one that
     // masks cells by their distance, find their cells through one stream.
@@ -1561,13 +1571,23 @@ bool llama_kv_cache::seq_span_stream(llama_seq_id seq_id, uint32_t strm) {
     }
 
     // no sequence takes its cells from a stream that is without its memory
-    if (!stream_has_memory(strm)) {
-        return false;
+    return stream_has_memory(strm);
+}
+
+bool llama_kv_cache::can_span(uint32_t strm) const {
+    return can_span_strm(strm) && reads_both && !reads_one;
+}
+
+void llama_kv_cache::note_read(bool span_ok) const {
+    (span_ok ? reads_both : reads_one) = true;
+}
+
+uint32_t llama_kv_cache::seq_n_cells(llama_seq_id seq_id, uint32_t strm) const {
+    if (other || strm >= n_stream || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
     }
 
-    seq_to_stream[seq_id] = strm;
-
-    return true;
+    return v_cells[strm].seq_n_cells(seq_id);
 }
 
 std::vector<uint32_t> llama_kv_cache::seq_streams(llama_seq_id seq_id) const {
@@ -3712,6 +3732,11 @@ static void check_span(int32_t strm_span, bool span_ok) {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, bool span_ok) const {
+    // of a batch: the graphs that a context builds to measure itself have no batch, and no lists of cells either
+    if (!ubatches.empty()) {
+        kv->note_read(span_ok);
+    }
+
     check_span(strm_span, span_ok);
 
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);

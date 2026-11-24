@@ -5094,6 +5094,22 @@ bool llama_memory_seq_span_stream(llama_memory_t mem, llama_seq_id seq_id, int32
     return mem->seq_span_stream(seq_id, (uint32_t) strm);
 }
 
+bool llama_memory_can_span(llama_memory_t mem, int32_t strm) {
+    if (!mem || strm < 0) {
+        return false;
+    }
+
+    return mem->can_span((uint32_t) strm);
+}
+
+int32_t llama_memory_seq_n_cells(llama_memory_t mem, llama_seq_id seq_id, int32_t strm) {
+    if (!mem || strm < 0 || seq_id < 0) {
+        return 0;
+    }
+
+    return (int32_t) mem->seq_n_cells(seq_id, (uint32_t) strm);
+}
+
 bool llama_memory_get_lazy_info(llama_memory_t mem, llama_memory_lazy_info * info) {
     if (!mem || !info) {
         return false;

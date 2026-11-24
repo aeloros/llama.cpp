@@ -3491,8 +3491,11 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
         }
 
-        k = mctx_cur->get_k(ctx0, il, true);
-        v = mctx_cur->get_v(ctx0, il, true);
+        // it reads the cells of a second stream too, when it has the lists of the cells of each sequence to read by
+        const bool span_ok = cparams.flash_attn && inp->self_attn_mask.rows != nullptr && kq_b == nullptr && sinks == nullptr;
+
+        k = mctx_cur->get_k(ctx0, il, span_ok);
+        v = mctx_cur->get_v(ctx0, il, span_ok);
     }
 
     const auto & kq_mask = inp->self_attn_mask.raw;
@@ -3504,9 +3507,8 @@ ggml_tensor * llm_graph_context::build_attn(
         // are, and the two results combined
         const auto & span = inp->self_attn_mask_span;
 
-        if (!cparams.flash_attn || !kv_rows || !span.raw || kq_b || sinks) {
-            throw std::runtime_error("a sequence of the batch holds cells in two streams of the KV cache, which needs flash attention over the cells of each sequence");
-        }
+        // without the lists of the cells of each sequence, get_k has refused the batch above
+        GGML_ASSERT(cparams.flash_attn && kv_rows && span.raw && !kq_b && !sinks);
 
         cur = build_attn_mha_span(q, k, v, kq_mask, kv_rows,
                 mctx_cur->get_k_span(ctx0, il), mctx_cur->get_v_span(ctx0, il), span.raw, span.rows, kq_scale, il);

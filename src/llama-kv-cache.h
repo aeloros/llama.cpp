@@ -161,6 +161,13 @@ public:
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
     bool seq_span_stream(llama_seq_id seq_id, uint32_t strm) override;
 
+    bool     can_span(uint32_t strm) const override;
+    uint32_t seq_n_cells(llama_seq_id seq_id, uint32_t strm) const override;
+
+    // An attention read the cells of the current batch through llama_kv_cache_context::get_k, and said whether it
+    // reads those of a second stream as well (span_ok): what can_span answers with.
+    void note_read(bool span_ok) const;
+
     // lazy memory
     bool    lazy_info  (llama_memory_lazy_info & info) const override;
     size_t  lazy_bytes (uint32_t n_cells, uint32_t n_rows) const override;
@@ -393,6 +400,13 @@ private:
     // The streams that hold cells of a sequence, the one of seq_to_stream first, with or without cells. In a unified
     // cache a sequence may hold cells in a second stream as well (seq_span_stream).
     std::vector<uint32_t> seq_streams(llama_seq_id seq_id) const;
+
+    // whether the cache itself can hold a sequence in stream strm and another one
+    bool can_span_strm(uint32_t strm) const;
+
+    // the attentions that have read the cache's cells so far (note_read)
+    mutable bool reads_both = false; // one that reads the cells of both streams of a sequence
+    mutable bool reads_one  = false; // one that reads the cells of one stream
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;

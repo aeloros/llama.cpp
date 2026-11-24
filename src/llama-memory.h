@@ -236,6 +236,18 @@ struct llama_memory_i {
         return false;
     }
 
+    // see llama_memory_can_span and llama_memory_seq_n_cells
+    virtual bool can_span(uint32_t strm) const {
+        GGML_UNUSED(strm);
+        return false;
+    }
+
+    virtual uint32_t seq_n_cells(llama_seq_id seq_id, uint32_t strm) const {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(strm);
+        return 0;
+    }
+
     //
     // lazy memory (llama_memory_lazy)
     //

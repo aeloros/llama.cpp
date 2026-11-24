@@ -142,6 +142,15 @@ LLAMA_API bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_
 // and a state of the sequence holds the cells of both. Returns false if the memory cannot do that.
 LLAMA_API bool llama_memory_seq_span_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm);
 
+// Whether a sequence that goes on in stream strm with llama_memory_seq_span_stream will be computed: the memory can
+// hold a sequence in two streams, the stream has its memory, and every attention that has read the cache's cells so
+// far reads both streams. The models whose attention is built by code of their own read one, and a batch of such a
+// sequence fails there. False before the first batch, when no attention has read the cache yet.
+LLAMA_API bool llama_memory_can_span(llama_memory_t mem, int32_t strm);
+
+// The number of cells that a sequence holds in a stream of the KV cache, 0 for a memory without streams.
+LLAMA_API int32_t llama_memory_seq_n_cells(llama_memory_t mem, llama_seq_id seq_id, int32_t strm);
+
 //
 // Lazy sequence memory (llama_context_params::n_seq_budget)
 //

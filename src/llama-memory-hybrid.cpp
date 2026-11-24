@@ -337,3 +337,11 @@ bool llama_memory_hybrid::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
 bool llama_memory_hybrid::seq_span_stream(llama_seq_id seq_id, uint32_t strm) {
     return mem_attn->seq_span_stream(seq_id, strm);
 }
+
+bool llama_memory_hybrid::can_span(uint32_t strm) const {
+    return mem_attn->can_span(strm);
+}
+
+uint32_t llama_memory_hybrid::seq_n_cells(llama_seq_id seq_id, uint32_t strm) const {
+    return mem_attn->seq_n_cells(seq_id, strm);
+}

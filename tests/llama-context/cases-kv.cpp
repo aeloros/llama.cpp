@@ -299,10 +299,16 @@ struct case_stream_span : ctx_test {
         if (!decode_seq(ctx.get(), tokens, 0, n_half, 1, false)) {
             return case_result::fail();
         }
+
+        // what the memory says of it, now that the model's attention has read the cache: it has to be what happens
+        const bool can_span = llama_memory_can_span(mem, strm);
+
         if (!llama_memory_seq_span_stream(mem, 1, strm)) {
             return case_result::fail("the memory does not let a sequence take its further cells from a second stream");
         }
         if (!decode_seq(ctx.get(), tokens, n_half, n_tokens - 1, 1, false)) {
+            CTX_REQUIRE(!can_span, "the memory said that a sequence may go on in a second stream, and its batch was refused");
+
             // An attention that reads the cells of one stream refuses the batch (llama_kv_cache_context::get_k), and so
             // does a model without flash attention over the cells of each sequence: nothing of the batch is left, and
             // the sequence is what it was. (A recurrent state cannot go back, after this failure as after any other.)
@@ -314,10 +320,15 @@ struct case_stream_span : ctx_test {
 
             return case_result::skip("the model's attention reads the cells of one stream: the batch was refused");
         }
+        CTX_REQUIRE(can_span, "the memory said that a sequence may not go on in a second stream, and its batch was computed");
+
         if (!decode_seq(ctx.get(), tokens, n_tokens - 1, n_tokens, 1, true)) {
             TLOG_ERR("%s: failed to decode the last token of sequence 1 in the second stream\n", __func__);
             return case_result::fail();
         }
+
+        CTX_REQUIRE(llama_memory_seq_n_cells(mem, 1, 0)    == n_half,            "seq 1 does not hold the first half of the prompt in the first stream");
+        CTX_REQUIRE(llama_memory_seq_n_cells(mem, 1, strm) == n_tokens - n_half, "seq 1 does not hold the rest of the prompt in the second stream");
 
         // a recurrent state is the state after the last token: such a memory starts there
         if (!mr.is_recurrent()) {
