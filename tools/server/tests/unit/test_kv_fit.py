@@ -3,6 +3,7 @@ import threading
 import time
 
 import pytest
+import requests
 from utils import *
 
 # A second pool of KV cells on another device (--kv-overflow-device, --kv-overflow-size) without a list of slots for
@@ -54,9 +55,15 @@ def n_tokens(text: str) -> int:
     return len(res.body["tokens"])
 
 
+# These tests ask /slots every few milliseconds while their tasks are at work. Over one connection that is kept: with
+# a connection for each request the client runs out of ports after a few runs of this file, and a test fails with
+# "Only one usage of each socket address" (Windows error 10048) while the server is well.
+kept = requests.Session()
+
+
 def slots_at_work():
-    res = server.make_request("GET", "/slots")
-    return [slot for slot in res.body if slot["is_processing"]] if res.status_code == 200 else []
+    res = kept.get(server.make_url("/slots"), timeout=10)
+    return [slot for slot in res.json() if slot["is_processing"]] if res.status_code == 200 else []
 
 
 def run_two(n_predict_older: int, n_predict_newer: int, prompt_older=PROMPT_OLDER, prompt_newer=PROMPT_NEWER):
