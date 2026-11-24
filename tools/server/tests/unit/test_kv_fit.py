@@ -59,7 +59,7 @@ def slots_at_work():
     return [slot for slot in res.body if slot["is_processing"]] if res.status_code == 200 else []
 
 
-def run_two(n_predict_older: int, n_predict_newer: int):
+def run_two(n_predict_older: int, n_predict_newer: int, prompt_older=PROMPT_OLDER, prompt_newer=PROMPT_NEWER):
     """The older task in slot 0, the newer one in slot 1 as soon as the older is at work. Returns both responses,
     the largest number of slots seen at work at once, and what /slots said of each slot while it was at work."""
     results = {}
@@ -68,12 +68,12 @@ def run_two(n_predict_older: int, n_predict_newer: int):
     def run(key: str, prompt, n_predict: int, id_slot: int):
         results[key] = complete(prompt, n_predict, id_slot)
 
-    t_older = threading.Thread(target=run, args=("older", PROMPT_OLDER, n_predict_older, 0))
+    t_older = threading.Thread(target=run, args=("older", prompt_older, n_predict_older, 0))
     t_older.start()
     t_end = time.time() + 10
     while not slots_at_work() and time.time() < t_end:
         time.sleep(0.002)
-    t_newer = threading.Thread(target=run, args=("newer", PROMPT_NEWER, n_predict_newer, 1))
+    t_newer = threading.Thread(target=run, args=("newer", prompt_newer, n_predict_newer, 1))
     t_newer.start()
 
     n_busy_max = 0
@@ -793,3 +793,339 @@ def test_a_new_conversation_in_a_slot_of_the_second_pool_is_turned_away_like_any
     assert_served(results["new"], 700)
     assert not seen[1]["kv_overflow"], "a new task went to a pool whose device had run short"
     assert LOG_NO_ROOM in log_text()
+
+
+# Rung 3: a task that the first pool has no more room for goes on in the second pool. Its cells are in both pools
+# then, and attention has to read the cells of each sequence by a list in each pool. The model is on the CPU for these
+# tests, where that is done for heads of any size: on a GPU the kernel takes heads of 64 and more, and this model's
+# are smaller, so there its tasks end as truncated as before (test_home_goes_first_for_tasks_...).
+
+
+def start_on_cpu():
+    global server
+    server.extra_args = (server.extra_args or []) + ["--n-gpu-layers", "0"]
+    server.start()
+
+
+def run_two_turns(n_predict_older: int, n_predict_newer: int):
+    """As run_two, with the tokens of each answer."""
+    results = {}
+    seen = {}
+
+    def run(key: str, prompt, n_predict: int, id_slot: int):
+        results[key] = turn(prompt, n_predict, id_slot)
+
+    t_older = threading.Thread(target=run, args=("older", PROMPT_OLDER, n_predict_older, 0))
+    t_older.start()
+    t_end = time.time() + 10
+    while not slots_at_work() and time.time() < t_end:
+        time.sleep(0.002)
+    t_newer = threading.Thread(target=run, args=("newer", PROMPT_NEWER, n_predict_newer, 1))
+    t_newer.start()
+
+    while t_older.is_alive() or t_newer.is_alive():
+        for slot in slots_at_work():
+            seen[slot["id"]] = slot
+        time.sleep(0.002)
+    t_older.join()
+    t_newer.join()
+
+    return results["older"], results["newer"], seen
+
+
+def goes_on_alone(tokens, n_predict: int):
+    """What a task that is alone, in a slot of its own, writes after these tokens."""
+    res = server.make_request("POST", "/completion", data={
+        "prompt": tokens,
+        "n_predict": n_predict,
+        "id_slot": 2,
+        "ignore_eos": True,
+        "temperature": 0.0,
+        "seed": 42,
+        "cache_prompt": False,
+        "return_tokens": True,
+    })
+    assert res.status_code == 200, f"{res.status_code} {str(res.body)[:200]}"
+    return res.body["tokens"]
+
+
+def test_a_task_that_the_first_pool_has_no_more_room_for_goes_on_in_the_second(tmp_path):
+    # both tasks go home with their prompts and 256 tokens of room, and their sizes together are more than the pool.
+    # The one that finds no more room there goes on in the second pool and keeps its cells in the first, so the other
+    # finds none either when it needs more: both go on in the second pool, with the first pool full between them, and
+    # both get to their ends
+    global server
+    server.kv_fit_headroom = 256
+    server.log_path = str(tmp_path / "server.log")
+    start_on_cpu()
+
+    older, newer, seen = run_two_turns(1800, 1800)
+
+    assert_served(older, 1800)
+    assert_served(newer, 1800)
+
+    assert seen[0]["kv_overflow"] and seen[1]["kv_overflow"], "both went on in the second pool"
+    assert seen[0]["kv_cells_home"] > 256 and seen[1]["kv_cells_home"] > 256, "and hold in the first pool what they had there"
+    assert N_HOME - 512 < seen[0]["kv_cells_home"] + seen[1]["kv_cells_home"] <= N_HOME, "the first pool is full between them"
+
+    # the limits in each pool add up to no more than it has: no step was refused for want of cells
+    assert "goes on in the second pool" in log_text()
+    assert "does not fit in the KV" not in log_text()
+
+    # What each wrote with its cells in both pools is what the model writes there: from three places of its text
+    # after it went on, a task that is alone and whole in the first pool goes on with the same tokens.
+    for res, prompt, slot in ((older, PROMPT_OLDER, seen[0]), (newer, PROMPT_NEWER, seen[1])):
+        text = tokens_of(prompt) + res.body["tokens"]
+        for at in (slot["kv_cells_home"] + 40, slot["kv_cells_home"] + 300, len(text) - 12):
+            assert goes_on_alone(text[:at], 8) == text[at:at + 8], f"slot {slot['id']} wrote something else at token {at}"
+
+
+def test_a_conversation_that_went_on_in_the_second_pool_comes_home_when_there_is_room():
+    # the newer task goes on in the second pool as above. Its next turn comes when nothing else is at work: the
+    # first pool has the room for all of it, and it comes there through the prompt cache, without being read again
+    global server
+    server.kv_fit_headroom = 256
+    server.no_cache_idle_slots = True
+    start_on_cpu()
+
+    results = {}
+
+    def run(key: str, prompt, n_predict: int, id_slot: int):
+        results[key] = turn(prompt, n_predict, id_slot)
+
+    t_older = threading.Thread(target=run, args=("older", PROMPT_OLDER, 1800, 0))
+    t_older.start()
+    t_end = time.time() + 10
+    while not slots_at_work() and time.time() < t_end:
+        time.sleep(0.002)
+    t_newer = threading.Thread(target=run, args=("newer", PROMPT_NEWER, 1800, 1))
+    t_newer.start()
+
+    seen = {}
+    while t_older.is_alive() or t_newer.is_alive():
+        for slot in slots_at_work():
+            seen[slot["id"]] = slot
+        time.sleep(0.002)
+    t_older.join()
+    t_newer.join()
+
+    assert_served(results["older"], 1800)
+    assert_served(results["newer"], 1800)
+
+    spanning = [slot for slot in seen.values() if slot["kv_overflow"]]
+    assert len(spanning) >= 1 and spanning[0]["kv_cells_home"] > 256, "a task went on in the second pool"
+
+    # the next turn of that conversation: what it said, and a few tokens more
+    id_slot = spanning[0]["id"]
+    key = "older" if id_slot == 0 else "newer"
+    prompt = PROMPT_OLDER if id_slot == 0 else PROMPT_NEWER
+    said = tokens_of(prompt) + results[key].body["tokens"]
+
+    res = turn(said + tokens_of(" And then")[1:], 16, id_slot)
+    assert_not_read_again_but(res, len(tokens_of(" And then")) - 1)
+    assert res.body["tokens_predicted"] == 16
+
+    after = [slot for slot in slots() if slot["id"] == id_slot][0]
+    assert not after["kv_overflow"], "the conversation is whole in the first pool"
+    assert after["kv_cells_home"] == 0
+
+
+def assert_not_read_again_but(res, n_new: int):
+    # the slot holds every token of the conversation but the last one of the turn before, which was never decoded
+    assert res.status_code == 200, f"{res.status_code} {str(res.body)[:200]}"
+    assert res.body["timings"]["prompt_n"] == n_new + 1, "the conversation is read again"
+
+
+def test_a_conversation_that_went_on_in_the_second_pool_goes_on_there_while_the_first_pool_is_taken():
+    # The second pool is small here: it holds what the two tasks need beyond the first pool, and little more. The
+    # newer task has gone on in it when it ends, and the older one is still at work. The newer one's next turn does
+    # not fit in the first pool, and not whole in the second: it fits because the cells that it holds in the first
+    # pool stay there. It goes on at once, where its cells are, and is not read again.
+    global server
+    server.kv_fit_headroom = 256
+    server.kv_overflow_size = 1280
+    server.no_cache_idle_slots = True
+    start_on_cpu()
+
+    results = {}
+
+    # what the next turn needs is at hand before the tasks start: the older one has some 460 tokens to go when the
+    # newer one ends
+    said = tokens_of(PROMPT_NEWER)
+    more = tokens_of(" And then")[1:]
+
+    def run(key: str, prompt, n_predict: int, id_slot: int):
+        results[key] = turn(prompt, n_predict, id_slot)
+
+    t_older = threading.Thread(target=run, args=("older", PROMPT_OLDER, 2020, 0))
+    t_older.start()
+    t_end = time.time() + 10
+    while not slots_at_work() and time.time() < t_end:
+        time.sleep(0.002)
+
+    first = turn(PROMPT_NEWER, 1560, 1)
+    said = said + first.body["tokens"]
+
+    seen = {}
+
+    def run_next():
+        results["next"] = turn(said + more, 16, 1)
+
+    t_next = threading.Thread(target=run_next)
+    t_next.start()
+    while t_next.is_alive():
+        for slot in slots_at_work():
+            seen.setdefault(slot["id"], slot)
+        time.sleep(0.001)
+    t_next.join()
+    t_older.join()
+
+    assert_served(first, 1560)
+    assert_served(results["older"], 2020)
+
+    if 0 not in seen or 1 not in seen:
+        pytest.skip("the older task had ended when the next turn of the newer one was at work: nothing to see")
+
+    assert seen[1]["kv_overflow"] and seen[1]["kv_cells_home"] > 256, "the next turn is where its cells are, in both pools"
+    assert_not_read_again_but(results["next"], len(more))
+    assert results["next"].body["tokens_predicted"] == 16
+
+
+def test_a_task_that_may_take_its_prompt_from_the_prompt_cache_is_fitted_with_all_of_it(tmp_path):
+    # A slot whose conversation went on in the second pool keeps the cells that it holds in the first, and its next
+    # turn needs no room for them in the second. A task that keeps less than half of what the slot holds is not such
+    # a turn: it may get its prompt from the prompt cache, and that comes whole into one pool. So it is fitted with
+    # all of it. Here neither pool has that much beside the older task, and the task waits for it to end; fitted as
+    # if the slot's cells stayed, it would start in the second pool with less room than its prompt.
+    global server
+    server.kv_fit_headroom = 256
+    server.kv_overflow_size = 1536
+    server.no_cache_idle_slots = True
+    server.log_path = str(tmp_path / "server.log")
+    start_on_cpu()
+
+    # a conversation of some 820 tokens, which goes to the prompt cache when another one takes its slot
+    first = turn(PROMPT_NEWER, 800, 1)
+    assert_served(first, 800)
+    cached = tokens_of(PROMPT_NEWER) + first.body["tokens"]
+    assert turn("The sun was hot and the sky was blue.", 1, 1).status_code == 200
+
+    results = {}
+
+    def run(key: str, prompt, n_predict: int, id_slot: int):
+        results[key] = turn(prompt, n_predict, id_slot)
+
+    t_older = threading.Thread(target=run, args=("older", PROMPT_OLDER, 2020, 0))
+    t_older.start()
+    t_end = time.time() + 10
+    while not slots_at_work() and time.time() < t_end:
+        time.sleep(0.002)
+
+    # A second conversation starts like the cached one, with 800 of its tokens, and goes another way from there. It
+    # goes on in the second pool beside the older task, with those 800 and more in the first.
+    other_way = tokens_of(" But then")[1:]
+    if other_way[0] == cached[800]:
+        other_way = tokens_of(" And so")[1:]
+    second = turn(cached[:800] + other_way, 1100, 1)
+    assert_served(second, 1100)
+
+    held = [slot for slot in slots() if slot["id"] == 1][0]
+    assert held["kv_overflow"] and held["kv_cells_home"] >= 800, "the second conversation holds cells in both pools"
+
+    # The cached conversation goes on in that slot, with 674 tokens more: 1500 in all, and 200 to write. It keeps
+    # 800 of the slot's 1900 tokens, and the prompt cache has all of its own. The first pool has some 1500 free
+    # beside the older task and the second 1280 or less: it fits in neither.
+    more = cached[100:774]
+    older_at_work = any(slot["id"] == 0 for slot in slots_at_work())
+    following = turn(cached + more, 200, 1)
+
+    t_older.join()
+    assert_served(results["older"], 2020)
+
+    if not older_at_work:
+        pytest.skip("the older task had ended when the cached conversation went on: nothing to see")
+
+    assert_served(following, 200)
+    assert following.body["timings"]["prompt_n"] <= len(more) + 1, "its prompt came from the prompt cache"
+
+
+def test_a_task_does_not_go_on_in_the_second_pool_when_its_device_lacks_the_memory(tmp_path, device_free):
+    # 100 MiB free on the device of the second pool is less than the headroom: nothing is taken from it. The task
+    # that the first pool has no more room for ends as truncated there, as it did before a task could go on, and the
+    # other one has the pool to itself then and gets to its end. (Which of the two it is depends on which one asks
+    # first when the pool is at its end.)
+    global server
+    device_free(100)
+    server.kv_fit_headroom = 256
+    server.log_path = str(tmp_path / "server.log")
+    start_on_cpu()
+
+    older, newer, n_busy_max, seen = run_two(1800, 1800)
+
+    assert n_busy_max == 2
+    assert older.status_code == 200, f"{older.status_code} {str(older.body)[:200]}"
+    assert newer.status_code == 200, f"{newer.status_code} {str(newer.body)[:200]}"
+    assert older.body["truncated"] != newer.body["truncated"], "one of the two ended as truncated, and one did not"
+    for res in (older, newer):
+        if res.body["truncated"]:
+            assert 256 < res.body["tokens_predicted"] < 1800
+        else:
+            assert res.body["tokens_predicted"] == 1800
+    assert not seen[0]["kv_overflow"] and not seen[1]["kv_overflow"]
+
+    log = log_text()
+    assert LOG_NO_ROOM in log
+    assert LOG_TOOK not in log, "the pool took its memory from a device that did not have it free"
+    assert "goes on in the second pool" not in log
+
+
+# The attention of some models is built by code of their own, which reads the cells of one pool: a task of such a
+# model cannot go on in the second pool (llama_memory_can_span). The test takes a dummy model of that kind, as
+# test-llama-archs writes them: LLAMA_TEST_DUMMY_MODELS names their folder (they are not downloaded). Its vocabulary
+# is not for text, so its prompts are token ids.
+DUMMY = os.environ.get("LLAMA_TEST_DUMMY_MODELS")
+ONE_POOL = os.path.join(DUMMY, "deepseek2-moe.gguf") if DUMMY else None
+
+LOG_ONE_POOL = "does not go on in the second"
+
+
+@pytest.mark.skipif(not ONE_POOL or not os.path.exists(ONE_POOL),
+                    reason="LLAMA_TEST_DUMMY_MODELS names no folder with deepseek2-moe.gguf")
+def test_nothing_is_taken_from_the_device_for_a_model_whose_attention_reads_one_pool(tmp_path):
+    # the task that the first pool has no more room for ends as truncated, as it did before a task could go on in
+    # the second pool. The device of that pool has the memory free and is not asked for it: the log says why, once
+    global server
+    server = ServerProcess()
+    server.model_hf_repo = None
+    server.model_hf_file = None
+    server.model_file = ONE_POOL
+    server.model_alias = "deepseek2-dummy"
+    server.kv_unified = True
+    server.server_slots = True
+    server.temperature = 0.0
+    server.seed = 42
+    server.n_ctx = N_HOME
+    server.n_batch = 64
+    server.n_slots = 3
+    server.kv_overflow_device = DEVICE
+    server.kv_overflow_size = N_OVERFLOW
+    server.kv_fit_headroom = 256
+    # the dummy model was "trained" with 256 tokens, which would be the limit of every slot; and it stays on the CPU
+    server.extra_args = ["--override-kv", "deepseek2.context_length=int:2048", "--n-gpu-layers", "0"]
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    ids_older = [1 + (7 + i * 13) % 97 for i in range(16)]
+    ids_newer = [1 + (21 + i * 13) % 97 for i in range(16)]
+
+    older, newer, n_busy_max, seen = run_two(1800, 1800, ids_older, ids_newer)
+
+    assert n_busy_max == 2
+    assert older.status_code == 200, f"{older.status_code} {str(older.body)[:200]}"
+    assert newer.status_code == 200, f"{newer.status_code} {str(newer.body)[:200]}"
+    assert older.body["truncated"] != newer.body["truncated"], "one of the two ended as truncated, and one did not"
+    assert not seen[0]["kv_overflow"] and not seen[1]["kv_overflow"]
+
+    log = log_text()
+    assert LOG_TOOK not in log, "the pool took its memory for a task that cannot go on in it"
+    assert log.count(LOG_ONE_POOL) == 1

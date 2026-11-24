@@ -869,6 +869,8 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"n_ctx_task",    n_ctx_task},
             {"kv_overflow",   kv_overflow},
+            // the cells that a slot of the second pool holds in the first: a task that went on from there
+            {"kv_cells_home", kv_overflow && ctx_tgt != nullptr ? llama_memory_seq_n_cells(llama_get_memory(ctx_tgt), id, 0) : 0},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
         };
@@ -2213,7 +2215,10 @@ private:
         // a second pool whose tasks are fitted: the task waits until one of the pools has the room
         kv_fit_result fit = { true, ret ? ret->kv_overflow : false, 0, 0 };
         if (ret && kv_fit) {
-            fit = kv_fit_task(*ret, task);
+            // update_cache: the slot may take its prompt from the prompt cache, in place of what it holds
+            const bool keeps_cells = !update_cache;
+
+            fit = kv_fit_task(*ret, task, true, -1, keeps_cells);
 
             // The second pool takes a task when its device has the memory free, and takes its own memory from it
             // when the first task goes there. When the device does not have it now, the task is fitted without that
@@ -2232,7 +2237,7 @@ private:
                     server_device_claims::unclaim(params_base.kv_overflow_device, n_claimed);
                 }
                 if (!is_taken) {
-                    fit = kv_fit_task(*ret, task, true, 0);
+                    fit = kv_fit_task(*ret, task, true, 0, keeps_cells);
                 }
             }
 
@@ -2345,6 +2350,34 @@ private:
     // with_children (kv_fit_task): the children of the task are still to start, and their sizes are counted with its own.
     //   Without them the task is being launched: it is in its pool already and gets the room that is there.
     // pool (kv_fit_task): -1, or the only pool that the task may go to, 0 the first and 1 the second
+    // keeps_cells (kv_fit_task): what the slot holds is what the task goes on from. False while the slot may still take
+    //   its prompt from the prompt cache instead, which comes whole into one pool.
+
+    // A task that the first pool has no more room for goes on in the second (kv_span_start): its slot takes its new
+    // cells there, and the cells that its conversation had stay in the first. kv_span_seen: a slot did that once;
+    // until then no slot holds cells in both pools, and the memory is not asked.
+    bool kv_span_seen    = false;
+    bool kv_span_refused = false; // the model's attention reads the cells of one pool, which the log has said
+
+    // the cells that a slot of the second pool holds in the first
+    int64_t kv_span_home(const server_slot & slot) const {
+        if (!kv_span_seen || !slot.kv_overflow) {
+            return 0;
+        }
+        return llama_memory_seq_n_cells(llama_get_memory(ctx_tgt), slot.id, 0);
+    }
+
+    // what a slot holds in a pool, and what the task at work in it may take there. A slot of the first pool has all
+    // of it there, one of the second pool what it does not hold in the first.
+    int64_t kv_held(const server_slot & slot, bool overflow) const {
+        const int64_t n_home = slot.kv_overflow ? std::min<int64_t>(kv_span_home(slot), slot.prompt.n_tokens()) : slot.prompt.n_tokens();
+        return overflow ? slot.prompt.n_tokens() - n_home : n_home;
+    }
+
+    int64_t kv_limit(const server_slot & slot, bool overflow) const {
+        const int64_t n_home = slot.kv_overflow ? std::min<int64_t>(kv_span_home(slot), slot.n_ctx_task) : slot.n_ctx_task;
+        return overflow ? slot.n_ctx_task - n_home : n_home;
+    }
 
     // the cells of the first pool that no limit of another task or slot covers
     int64_t kv_fit_free_home(const server_slot & slot) const {
@@ -2355,11 +2388,86 @@ private:
             }
             if (is_batch_priority_slot(other.id)) {
                 n_home += other.n_ctx;
-            } else if (other.is_processing() && !other.kv_overflow) {
-                n_home += other.n_ctx_task;
+            } else if (other.is_processing()) {
+                n_home += kv_limit(other, false);
             }
         }
         return (int64_t) llama_n_ctx_seq(ctx_tgt) - n_home;
+    }
+
+    // the cells of the second pool that no limit of another task covers
+    int64_t kv_fit_free_over(const server_slot & slot) const {
+        int64_t n_over = 0;
+        for (const auto & other : slots) {
+            if (&other != &slot && !is_batch_priority_slot(other.id) && other.is_processing()) {
+                n_over += kv_limit(other, true);
+            }
+        }
+        return (int64_t) params_base.kv_overflow_size - n_over;
+    }
+
+    // Rung 3 of the placement (design-kv-overflow.md 3.3): a task in the first pool that needs more than the pool has
+    // goes on in the second. Its slot takes its new cells from there, and the cells of its conversation stay where
+    // they are: attention runs over the cells of each pool on its device, and the two results are combined.
+    // As for a task that is fitted to the second pool: that pool has the room, its device has the memory free, and
+    // the pool takes its memory if it is without. And the model's attention has to read the cells of both pools,
+    // which that of some models does not (llama_memory_can_span).
+    // Returns false when the task cannot go on there: it has all it can have.
+    bool kv_span_start(server_slot & slot) {
+        if (kv_strm_overflow < 0 || slot.kv_overflow) {
+            return false;
+        }
+
+        // the room that the task has not used moves with it, and it needs a step's worth more
+        const int64_t n_unused = std::max<int64_t>(0, (int64_t) slot.n_ctx_task - slot.prompt.n_tokens());
+        if (kv_fit_free_over(slot) < n_unused + 1) {
+            return false;
+        }
+
+        llama_memory_t mem     = llama_get_memory(ctx_tgt);
+        llama_memory_t mem_dft = ctx_dft != nullptr ? llama_get_memory(ctx_dft) : nullptr;
+
+        // Asked before the device is: nothing is taken from it for a model that cannot. And asked of the first pool,
+        // which has its memory at all times, where the second may be without: the attention is the same for both.
+        const bool can_tgt = llama_memory_can_span(mem, 0);
+        const bool can_dft = mem_dft == nullptr || llama_memory_can_span(mem_dft, 0);
+
+        if (!can_tgt || !can_dft) {
+            // said once: it is so for every task of this model
+            if (!kv_span_refused) {
+                kv_span_refused = true;
+                SRV_WRN("a task that the first pool of KV cells has no more room for does not go on in the second: the attention of the %s reads the cells of one pool. "
+                        "Such a task ends as truncated\n", !can_tgt ? "model" : "draft context");
+            }
+            return false;
+        }
+
+        size_t n_claimed = 0;
+        const bool has_room = kv_overflow_device_has_room(n_claimed);
+        const bool is_taken = has_room && kv_overflow_acquire();
+        if (n_claimed > 0) {
+            server_device_claims::unclaim(params_base.kv_overflow_device, n_claimed);
+        }
+        if (!is_taken) {
+            return false;
+        }
+
+        bool ok = llama_memory_seq_span_stream(mem, slot.id, kv_strm_overflow);
+        if (ok && mem_dft != nullptr && !llama_memory_seq_span_stream(mem_dft, slot.id, kv_strm_overflow_dft)) {
+            llama_memory_seq_span_stream(mem, slot.id, 0); // its new cells from the first pool again
+            ok = false;
+        }
+        if (!ok) {
+            return false;
+        }
+
+        slot.kv_overflow = true;
+        kv_span_seen     = true;
+
+        SLT_INF(slot, "the first pool has no more room for the task: it goes on in the second pool, with %d KV cells in the first\n",
+                (int) kv_span_home(slot));
+
+        return true;
     }
 
     // what a task keeps of its room when it gives the rest up: the cells of its next step, its token and its draft
@@ -2367,10 +2475,17 @@ private:
 
     // A task in the first pool ran into its limit: it takes more room for its output, the headroom at most and never
     // above its own size, when the pool has it. When the pool has none, a newer task there gives up room that it has
-    // not used, the newest first: of two tasks that both need more than is left, the older one goes on.
+    // not used, the newest first: of two tasks that both need more than is left, the older one goes on. A task that
+    // gets nothing that way goes on in the second pool (kv_span_start), and takes its further room there.
     // Returns false when the task has all it can have.
     bool kv_fit_extend(server_slot & slot) {
-        if (!kv_fit || slot.kv_overflow || is_batch_priority_slot(slot.id)) {
+        if (!kv_fit || is_batch_priority_slot(slot.id)) {
+            return false;
+        }
+
+        // a task that was fitted to the second pool has its whole size there from its start
+        bool spans = slot.kv_overflow && kv_span_home(slot) > 0;
+        if (slot.kv_overflow && !spans) {
             return false;
         }
 
@@ -2380,44 +2495,65 @@ private:
             return false;
         }
 
-        int64_t n_free = kv_lazy ? kv_lazy_free(nullptr, 0, true) : kv_fit_free_home(slot) - slot.n_ctx_task;
-        if (n_free <= 0) {
-            server_slot * donor = nullptr;
-            for (auto & other : slots) {
-                if (&other == &slot || !other.is_processing() || other.kv_overflow || is_batch_priority_slot(other.id)) {
-                    continue;
+        if (!spans) {
+            int64_t n_free = kv_lazy ? kv_lazy_free(nullptr, 0, true) : kv_fit_free_home(slot) - slot.n_ctx_task;
+            if (n_free <= 0) {
+                server_slot * donor = nullptr;
+                for (auto & other : slots) {
+                    if (&other == &slot || !other.is_processing() || other.kv_overflow || is_batch_priority_slot(other.id)) {
+                        continue;
+                    }
+                    if (other.task->id < slot.task->id) {
+                        continue; // an older task keeps what it has
+                    }
+                    if ((int64_t) other.n_ctx_task - other.prompt.n_tokens() - KV_FIT_KEEP > 0 && (!donor || other.task->id > donor->task->id)) {
+                        donor = &other;
+                    }
                 }
-                if (other.task->id < slot.task->id) {
-                    continue; // an older task keeps what it has
-                }
-                if ((int64_t) other.n_ctx_task - other.prompt.n_tokens() - KV_FIT_KEEP > 0 && (!donor || other.task->id > donor->task->id)) {
-                    donor = &other;
-                }
-            }
-            if (donor) {
-                n_free = std::min<int64_t>(n_want, (int64_t) donor->n_ctx_task - donor->prompt.n_tokens() - KV_FIT_KEEP);
-                donor->n_ctx_task -= (int32_t) n_free;
+                if (donor) {
+                    n_free = std::min<int64_t>(n_want, (int64_t) donor->n_ctx_task - donor->prompt.n_tokens() - KV_FIT_KEEP);
+                    donor->n_ctx_task -= (int32_t) n_free;
 
-                SLT_DBG(*donor, "the task gives %d KV cells of its room to an older one, n_ctx_task = %d\n", (int) n_free, donor->n_ctx_task);
+                    SLT_DBG(*donor, "the task gives %d KV cells of its room to an older one, n_ctx_task = %d\n", (int) n_free, donor->n_ctx_task);
+                }
             }
+
+            const int64_t n_add = std::min<int64_t>(n_want, n_free);
+            if (n_add > 0) {
+                slot.n_ctx_task += (int32_t) n_add;
+
+                SLT_DBG(slot, "the task takes %d more KV cells of the first pool, n_ctx_task = %d\n", (int) n_add, slot.n_ctx_task);
+
+                // the cached prompt of an idle slot may be where it grows to
+                kv_fit_make_room(slot, false, slot.n_ctx_task);
+
+                return true;
+            }
+
+            // the first pool has no more for it
+            if (!kv_span_start(slot)) {
+                return false;
+            }
+            spans = true;
         }
 
-        const int64_t n_add = std::min<int64_t>(n_want, n_free);
+        // in the second pool: what the limits of the tasks there leave beside its own
+        const int64_t n_add = std::min<int64_t>(n_want, kv_fit_free_over(slot) - kv_limit(slot, true));
         if (n_add <= 0) {
             return false;
         }
 
         slot.n_ctx_task += (int32_t) n_add;
 
-        SLT_DBG(slot, "the task takes %d more KV cells of the first pool, n_ctx_task = %d\n", (int) n_add, slot.n_ctx_task);
+        SLT_DBG(slot, "the task takes %d more KV cells of the second pool, n_ctx_task = %d\n", (int) n_add, slot.n_ctx_task);
 
         // the cached prompt of an idle slot may be where it grows to
-        kv_fit_make_room(slot, false, slot.n_ctx_task);
+        kv_fit_make_room(slot, true, kv_limit(slot, true));
 
         return true;
     }
 
-    kv_fit_result kv_fit_task(const server_slot & slot, const server_task & task, bool with_children = true, int pool = -1) const {
+    kv_fit_result kv_fit_task(const server_slot & slot, const server_task & task, bool with_children = true, int pool = -1, bool keeps_cells = true) const {
         int64_t size = n_ctx_task_of(slot, task);
 
         if (is_batch_priority_slot(slot.id)) {
@@ -2444,8 +2580,19 @@ private:
             if (is_batch_priority_slot(other.id)) {
                 n_home += other.n_ctx;
             } else if (other.is_processing()) {
-                (other.kv_overflow ? n_over : n_home) += other.n_ctx_task;
+                n_home += kv_limit(other, false);
+                n_over += kv_limit(other, true);
                 any_other = true;
+            }
+        }
+
+        // A conversation that went on in the second pool holds its first cells in the first one (kv_span_start). What
+        // the task keeps of those it does not need in the second pool, where its next turn goes on.
+        int64_t n_keep_home = 0;
+        if (keeps_cells && slot.kv_overflow && slot.prompt.n_tokens() > 0) {
+            const int64_t n_span = kv_span_home(slot);
+            if (n_span > 0) {
+                n_keep_home = std::min<int64_t>(n_span, (int64_t) slot.prompt.tokens.get_common_prefix(task.tokens));
             }
         }
 
@@ -2462,12 +2609,12 @@ private:
             return { true, false, (int32_t) (n_need - (size - n_own)), n_need };
         }
         // lazy memory: a task in the second pool has its row in the first all the same
-        if (pool != 0 && size <= n_free_over && (!kv_lazy || n_free_home >= 0)) {
-            return { true, true, (int32_t) n_own, size };
+        if (pool != 0 && size - n_keep_home <= n_free_over && (!kv_lazy || n_free_home >= 0)) {
+            return { true, true, (int32_t) n_own, size - n_keep_home };
         }
         if (!any_other || !with_children) {
             const bool    overflow = pool >= 0 ? pool == 1 : kv_strm_overflow >= 0 && n_free_over > n_free_home;
-            const int64_t n_free   = overflow ? n_free_over : n_free_home;
+            const int64_t n_free   = overflow ? n_free_over + n_keep_home : n_free_home;
             return { true, overflow, (int32_t) std::max<int64_t>(1, std::min<int64_t>(n_own, n_free - (size - n_own))), std::min<int64_t>(size, n_free) };
         }
 
@@ -2705,7 +2852,7 @@ private:
         bool    gives_up     = false;      // an idle slot gives up its row
 
         for (const auto & other : slots) {
-            const int64_t n_held  = other.kv_overflow ? 0 : other.prompt.n_tokens(); // its cells of the first pool
+            const int64_t n_held  = kv_held(other, false);                           // its cells of the first pool
             const bool    has_row = other.prompt.n_tokens() > 0;                     // its state is in a row
 
             if (is_batch_priority_slot(other.id)) {
@@ -2716,7 +2863,7 @@ private:
                 n_cells_free += n_held;
                 n_rows       += has_row ? 1 : 0;
             } else if (other.is_processing()) {
-                n_promised += other.kv_overflow ? 0 : std::max<int64_t>(0, other.n_ctx_task - n_held);
+                n_promised += std::max<int64_t>(0, kv_limit(other, false) - n_held);
                 n_rows     += 1; // its row, taken or still to be
             } else if (has_row) {
                 if (with_idle) {
@@ -2806,14 +2953,13 @@ private:
                 if (&other == &slot) {
                     continue;
                 }
+                // a slot whose conversation went on in the second pool holds cells in both
                 if (is_batch_priority_slot(other.id)) {
                     n_held += overflow ? 0 : other.n_ctx;
-                } else if (other.kv_overflow != overflow) {
-                    continue;
                 } else if (other.is_processing()) {
-                    n_held += other.n_ctx_task;
-                } else if (other.prompt.n_tokens() > 0) {
-                    n_held += other.prompt.n_tokens();
+                    n_held += kv_limit(other, overflow);
+                } else if (kv_held(other, overflow) > 0) {
+                    n_held += kv_held(other, overflow);
                     if (!lru || other.t_last_used < lru->t_last_used) {
                         lru = &other;
                     }
@@ -4748,9 +4894,7 @@ private:
                 for (const bool overflow : { false, true }) {
                     int64_t n_cells = 0;
                     for (const auto & slot : slots) {
-                        if (slot.kv_overflow == overflow) {
-                            n_cells += slot.prompt.n_tokens();
-                        }
+                        n_cells += kv_held(slot, overflow);
                     }
 
                     const int64_t n_size = overflow ? params_base.kv_overflow_size : (int64_t) llama_n_ctx_seq(ctx_tgt);
