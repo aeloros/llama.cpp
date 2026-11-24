@@ -503,6 +503,39 @@ def test_a_task_waits_for_its_row_although_the_second_pool_has_the_cells():
 
 
 @needs_hybrid
+@needs_second_pool
+def test_a_task_goes_on_in_the_second_pool_with_lazy_memory(tmp_path):
+    # 4096 cells in each pool and the memory of one row. Two tasks of 2401 cells each start in the first pool with
+    # their prompts and 256 cells of room, and take more as they write. Beside two rows 3840 cells can have their
+    # memory, and the two need 4802: the one that finds no more there goes on in the second pool and keeps its cells
+    # in the first. Both get to their ends, and no step is refused.
+    assert cells_beside(4096, 1, 3, 2) == 3840
+    global server
+    start_hybrid(1, 3, second_pool=4096, more_args=["--kv-fit-headroom", "256", "--log-file", str(tmp_path / "server.log")])
+
+    tasks = [in_background({"prompt": ids(100, i + 1), "n_predict": 2300, "ignore_eos": True, "cache_prompt": False})
+             for i in range(2)]
+
+    seen_both = {}
+    while any(t.is_alive() for t, _ in tasks):
+        for s in slots():
+            if s["is_processing"] and s["kv_overflow"] and s["kv_cells_home"] > 0:
+                seen_both[s["id"]] = s["kv_cells_home"]
+    for t, out in tasks:
+        t.join()
+        assert out["res"].status_code == 200, out["res"].body
+        assert out["res"].body["tokens_predicted"] == 2300
+        assert not out["res"].body["truncated"]
+
+    assert seen_both, "no task was seen with cells in both pools"
+    assert all(n > 256 for n in seen_both.values())
+
+    log = open(tmp_path / "server.log", encoding="utf-8", errors="replace").read()
+    assert "goes on in the second pool" in log
+    assert "does not fit in the KV" not in log, "a step was refused"
+
+
+@needs_hybrid
 def test_the_answers_of_a_model_with_state_on_the_device_are_those_of_a_server_with_all_its_memory():
     # the model where the server puts it by default: on a GPU, where there is one, the rows and the cells take their
     # memory in the pieces that the device hands out
