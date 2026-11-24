@@ -998,6 +998,39 @@ def test_a_conversation_that_went_on_in_the_second_pool_goes_on_there_while_the_
     assert results["next"].body["tokens_predicted"] == 16
 
 
+def test_a_conversation_with_cells_in_both_pools_comes_back_after_the_memory_of_the_second_went_back(tmp_path):
+    # Both tasks go on in the second pool and end there. Nothing is asked of the server then: their cells, those of
+    # the first pool with them, are saved to the prompt cache, and the memory of the second pool goes back. The
+    # newer conversation goes on at home from the prompt cache, with the tokens that a task alone goes on with.
+    global server
+    server.kv_fit_headroom = 256
+    server.kv_overflow_release = 1
+    server.no_cache_idle_slots = True
+    server.log_path = str(tmp_path / "server.log")
+    start_on_cpu()
+
+    older, newer, seen = run_two_turns(1800, 1800)
+
+    assert_served(older, 1800)
+    assert_served(newer, 1800)
+    assert seen[0]["kv_overflow"] and seen[1]["kv_overflow"]
+    assert seen[0]["kv_cells_home"] > 256 and seen[1]["kv_cells_home"] > 256
+
+    assert wait_for_log(LOG_GAVE_BACK, 1), "the second pool kept its memory for idle slots"
+    assert not any(slot["kv_overflow"] or slot["kv_cells_home"] for slot in slots())
+
+    said = tokens_of(PROMPT_NEWER) + newer.body["tokens"]
+    more = tokens_of(" And then")[1:]
+
+    again = turn(said + more, 8, 1)
+    assert_not_read_again_but(again, len(more))
+    assert again.body["tokens_predicted"] == 8
+    assert not slots()[1]["kv_overflow"]
+    assert log_text().count(LOG_TOOK) == 1, "the conversation fits at home now"
+
+    assert again.body["tokens"] == goes_on_alone(said + more, 8), "what came back is not the conversation"
+
+
 def test_a_task_that_may_take_its_prompt_from_the_prompt_cache_is_fitted_with_all_of_it(tmp_path):
     # A slot whose conversation went on in the second pool keeps the cells that it holds in the first, and its next
     # turn needs no room for them in the second. A task that keeps less than half of what the slot holds is not such
