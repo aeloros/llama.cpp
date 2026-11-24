@@ -229,6 +229,13 @@ struct llama_memory_i {
         return false;
     }
 
+    // the same for a sequence that keeps the cells it has where they are, see llama_memory_seq_span_stream
+    virtual bool seq_span_stream(llama_seq_id seq_id, uint32_t strm) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(strm);
+        return false;
+    }
+
     //
     // lazy memory (llama_memory_lazy)
     //

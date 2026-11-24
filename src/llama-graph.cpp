@@ -657,6 +657,39 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
         mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
     }
+
+    set_input_span(mctx, ubatch);
+}
+
+void llm_graph_input_attn_kv::set_input_span(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch) const {
+    if (self_attn_mask_span.raw && self_attn_mask_span.raw->buffer) {
+        mctx->set_input_attn_mask(self_attn_mask_span, ubatch, cparams.causal_attn);
+    }
+}
+
+// the graph of a batch whose sequences hold cells in a second stream reads that stream's K/V as well
+bool llm_graph_input_attn_kv::can_reuse_span(const llama_kv_cache_context * mctx, const llama_ubatch & ubatch) const {
+    const int32_t strm_span = mctx->get_strm_span();
+
+    if ((strm_span >= 0) != (self_attn_mask_span.raw != nullptr)) {
+        return false;
+    }
+
+    if (strm_span < 0) {
+        return true;
+    }
+
+    const uint32_t n_slices = llama_kv_cache::get_n_kv_slices(ubatch);
+
+    bool res = true;
+
+    res &= self_attn_mask_span.strm_cells  == strm_span;
+    res &= self_attn_mask_span.n_kv        == mctx->get_n_kv_span();
+    res &= self_attn_mask_span.rows->ne[0] == mctx->get_n_kv_rows_span();
+    res &= self_attn_mask_span.rows->ne[1] == n_slices;
+    res &= self_attn_mask_span.raw->ne[1]  == ubatch.n_tokens/n_slices;
+
+    return res;
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -670,6 +703,8 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_attn_mask(self_attn_mask, mctx, params.ubatch, params.cparams);
+
+    res &= can_reuse_span(mctx, params.ubatch);
 
     return res;
 }
@@ -1216,6 +1251,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
 
+    inp_attn->set_input_span(mctx->get_attn(), ubatch);
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1240,6 +1277,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_attn_mask(inp_attn->self_attn_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    res &= inp_attn->can_reuse_span(mctx->get_attn(), params.ubatch);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3166,6 +3205,61 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+// Attention of a batch whose sequences hold cells in two streams of the KV cache: the partial form of the op over
+// the cells of each stream, where they are, and the combine of the two results (ggml_flash_attn_ext_rows_partial).
+// A slice whose sequence holds nothing in one of the streams has a list of padding there, and that result takes no
+// part in the combine.
+ggml_tensor * llm_graph_context::build_attn_mha_span(
+         ggml_tensor * q,
+         ggml_tensor * k_a,
+         ggml_tensor * v_a,
+         ggml_tensor * kq_mask_a,
+         ggml_tensor * kv_rows_a,
+         ggml_tensor * k_b,
+         ggml_tensor * v_b,
+         ggml_tensor * kq_mask_b,
+         ggml_tensor * kv_rows_b,
+               float   kq_scale,
+                 int   il) const {
+    GGML_ASSERT(cparams.flash_attn && kv_rows_a && kv_rows_b);
+    GGML_ASSERT(kv_rows_a->ne[1] == kv_rows_b->ne[1]);
+
+    // the slices of the batch, as in build_attn_mha
+    const auto n_stream = kv_rows_a->ne[1];
+
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/n_stream), 0);
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+
+    const auto part = [&](ggml_tensor * k, ggml_tensor * v, ggml_tensor * kq_mask, ggml_tensor * kv_rows) {
+        const bool v_trans = v->nb[1] > v->nb[2];
+
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+        if (v_trans) {
+            v = ggml_transpose(ctx0, v);
+        }
+
+        ggml_tensor * cur = ggml_flash_attn_ext_rows_partial(ctx0, q, k, v, kq_mask, kv_rows, kq_scale, hparams.f_max_alibi_bias,
+                                                             hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
+
+        return cur;
+    };
+
+    ggml_tensor * part_a = part(k_a, v_a, kq_mask_a, kv_rows_a);
+    ggml_tensor * part_b = part(k_b, v_b, kq_mask_b, kv_rows_b);
+
+    ggml_tensor * cur = ggml_flash_attn_ext_combine(ctx0, part_a, part_b);
+    cb(cur, "kqv_span", il);
+
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
@@ -3268,6 +3362,27 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
         inp->self_attn_mask = build_attn_inp_attn_mask(ctx0, mctx_cur, ubatch, cparams);
+
+        // sequences of the batch that hold cells in a second stream get a cell list and a mask over those as well;
+        // without the lists of the first stream there is none, and build_attn refuses the batch
+        if (mctx_cur->get_strm_span() >= 0 && inp->self_attn_mask.rows) {
+            const uint32_t n_slices = llama_kv_cache::get_n_kv_slices(ubatch);
+            const uint32_t n_rows   = mctx_cur->get_n_kv_rows_span();
+
+            auto & span = inp->self_attn_mask_span;
+
+            span.n_kv       = mctx_cur->get_n_kv_span();
+            span.strm       = (uint32_t) mctx_cur->get_strm_span();
+            span.strm_cells = mctx_cur->get_strm_span();
+
+            span.rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_rows, n_slices);
+            ggml_set_input(span.rows);
+            ggml_set_name(span.rows, "attn_inp_kv_rows_span");
+
+            span.raw = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_rows, ubatch.n_tokens/n_slices, 1, n_slices);
+            ggml_set_input(span.raw);
+            ggml_set_name(span.raw, "attn_inp_kq_mask_span");
+        }
     }
 
     inp->self_k_rot = mctx_cur->get_k_rot();
@@ -3376,14 +3491,28 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
         }
 
-        k = mctx_cur->get_k(ctx0, il);
-        v = mctx_cur->get_v(ctx0, il);
+        k = mctx_cur->get_k(ctx0, il, true);
+        v = mctx_cur->get_v(ctx0, il, true);
     }
 
     const auto & kq_mask = inp->self_attn_mask.raw;
     const auto & kv_rows = inp->self_attn_mask.rows;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur;
+    if (!cparams.training && mctx_cur->get_strm_span() >= 0) {
+        // a sequence of the batch holds cells in a second stream: attention over the cells of each stream where they
+        // are, and the two results combined
+        const auto & span = inp->self_attn_mask_span;
+
+        if (!cparams.flash_attn || !kv_rows || !span.raw || kq_b || sinks) {
+            throw std::runtime_error("a sequence of the batch holds cells in two streams of the KV cache, which needs flash attention over the cells of each sequence");
+        }
+
+        cur = build_attn_mha_span(q, k, v, kq_mask, kv_rows,
+                mctx_cur->get_k_span(ctx0, il), mctx_cur->get_v_span(ctx0, il), span.raw, span.rows, kq_scale, il);
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    }
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 

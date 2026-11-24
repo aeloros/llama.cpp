@@ -1877,7 +1877,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        // A batch that this model's graph is not built for fails like one whose graph cannot be computed: the memory
+        // module's cells of the batch are taken back by the caller. (An attention that reads the cells of one stream
+        // refuses a sequence that holds cells in two, llama_kv_cache_context::get_k.)
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to build the graph: %s\n", __func__, err.what());
+            gf = nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -5076,6 +5084,14 @@ bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_id, int32_
     }
 
     return mem->seq_set_stream(seq_id, (uint32_t) strm);
+}
+
+bool llama_memory_seq_span_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm) {
+    if (!mem || strm < 0) {
+        return false;
+    }
+
+    return mem->seq_span_stream(seq_id, (uint32_t) strm);
 }
 
 bool llama_memory_get_lazy_info(llama_memory_t mem, llama_memory_lazy_info * info) {

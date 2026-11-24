@@ -332,3 +332,8 @@ size_t llama_memory_hybrid::stream_size(uint32_t strm) const {
 bool llama_memory_hybrid::seq_set_stream(llama_seq_id seq_id, uint32_t strm) {
     return mem_attn->seq_set_stream(seq_id, strm);
 }
+
+// the recurrent state of a sequence is one row whatever streams hold its cells
+bool llama_memory_hybrid::seq_span_stream(llama_seq_id seq_id, uint32_t strm) {
+    return mem_attn->seq_span_stream(seq_id, strm);
+}

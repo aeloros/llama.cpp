@@ -341,6 +341,9 @@ struct llm_attn_mask {
     // the first stream of the K/V tensors that the graph reads and writes
     uint32_t strm = 0;
 
+    // the stream whose cells the mask and the rows are over, -1 for the stream of each sequence
+    int32_t strm_cells = -1;
+
     // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
     bool block_uniform = false;
 };
@@ -386,6 +389,15 @@ public:
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     llm_attn_mask self_attn_mask;
+
+    // over the cells that the sequences of the batch hold in a second stream (llama_kv_cache_context::get_strm_span),
+    // raw is null when none of them holds cells there
+    llm_attn_mask self_attn_mask_span;
+
+    // what set_input and can_reuse do about it, also for the inputs that hold an input of this kind and set it
+    // themselves (llm_graph_input_mem_hybrid)
+    void set_input_span(const llama_kv_cache_context * mctx, const llama_ubatch * ubatch) const;
+    bool can_reuse_span(const llama_kv_cache_context * mctx, const llama_ubatch & ubatch) const;
 
     // note: assumes v_rot^2 == I
     std::vector<ggml_tensor *> self_k_rot;
@@ -1278,6 +1290,20 @@ struct llm_graph_context {
     //
     // attention
     //
+
+    // attention over the cells of two streams, see llama_memory_seq_span_stream
+    ggml_tensor * build_attn_mha_span(
+            ggml_tensor * q,
+            ggml_tensor * k_a,
+            ggml_tensor * v_a,
+            ggml_tensor * kq_mask_a,
+            ggml_tensor * kv_rows_a,
+            ggml_tensor * k_b,
+            ggml_tensor * v_b,
+            ggml_tensor * kq_mask_b,
+            ggml_tensor * kv_rows_b,
+                  float   kq_scale,
+                    int   il) const;
 
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]

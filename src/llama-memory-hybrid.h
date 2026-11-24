@@ -76,6 +76,7 @@ public:
     bool stream_release(uint32_t strm) override;
     size_t stream_size(uint32_t strm) const override;
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
+    bool seq_span_stream(llama_seq_id seq_id, uint32_t strm) override;
 
     bool    lazy_info  (llama_memory_lazy_info & info) const override;
     size_t  lazy_bytes (uint32_t n_cells, uint32_t n_rows) const override;

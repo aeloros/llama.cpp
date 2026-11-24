@@ -159,6 +159,7 @@ public:
     bool stream_release(uint32_t strm) override;
     size_t stream_size(uint32_t strm) const override;
     bool seq_set_stream(llama_seq_id seq_id, uint32_t strm) override;
+    bool seq_span_stream(llama_seq_id seq_id, uint32_t strm) override;
 
     // lazy memory
     bool    lazy_info  (llama_memory_lazy_info & info) const override;
@@ -227,6 +228,18 @@ public:
 
     // padded length of the longest cell list of the slices; 0 if kv_rows are not used (multiple streams)
     uint32_t get_n_kv_rows(const llama_ubatch & ubatch) const;
+
+    // A sequence may hold cells in a stream beside the one that takes its new cells (seq_span_stream). The other
+    // stream that holds cells of a sequence of the ubatch, -1 if there is none. Attention then runs over the cells of
+    // each of the two streams, with a cell list and a mask for each (llm_attn_mask::strm_cells).
+    int32_t get_strm_span(const llama_ubatch & ubatch) const;
+
+    // as get_n_kv, get_n_kv_rows, get_k and get_v, over the cells of one stream of a unified cache
+    uint32_t get_n_kv_strm(uint32_t strm) const;
+    uint32_t get_n_kv_rows(const llama_ubatch & ubatch, uint32_t strm) const;
+
+    ggml_tensor * get_k_strm(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t strm) const;
+    ggml_tensor * get_v_strm(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t strm) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -374,8 +387,12 @@ private:
 
     llama_kv_cells_vec & v_cells;
 
-    // maps from a sequence id to a stream id
+    // maps from a sequence id to a stream id: the stream that takes the new cells of the sequence
     std::vector<uint32_t> seq_to_stream;
+
+    // The streams that hold cells of a sequence, the one of seq_to_stream first, with or without cells. In a unified
+    // cache a sequence may hold cells in a second stream as well (seq_span_stream).
+    std::vector<uint32_t> seq_streams(llama_seq_id seq_id) const;
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
@@ -409,7 +426,9 @@ private:
     };
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+
+    // the ranges of one entry: of one stream, or of the two streams that hold the cells of one sequence
+    void state_write_data(llama_io_write_i & io, const std::vector<cell_ranges_t> & crs) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
@@ -495,12 +514,22 @@ public:
     // the first stream of the current ubatch, get_k / get_v / cpy_k / cpy_v use its tensors
     uint32_t get_strm() const;
 
+    // The second stream that holds cells of a sequence of the current ubatch, -1 if there is none
+    // (llama_kv_cache::get_strm_span), and what attention over those cells needs. An attention that reads the cells of
+    // one stream only says so by leaving span_ok out of get_k and get_v, which then refuse such a ubatch.
+    int32_t  get_strm_span() const;
+    uint32_t get_n_kv_span() const;
+    uint32_t get_n_kv_rows_span() const;
+
+    ggml_tensor * get_k_span(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_span(ggml_context * ctx, int32_t il) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, bool span_ok = false) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, bool span_ok = false) const;
 
     ggml_tensor * get_k_scale(int32_t il) const;
     ggml_tensor * get_v_scale(int32_t il) const;
@@ -569,4 +598,9 @@ private:
 
     // see llama_kv_cache::get_n_kv_rows
     uint32_t n_kv_rows = 0;
+
+    // see get_strm_span
+    int32_t  strm_span      = -1;
+    uint32_t n_kv_span      = 0;
+    uint32_t n_kv_rows_span = 0;
 };

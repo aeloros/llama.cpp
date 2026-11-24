@@ -186,6 +186,225 @@ struct case_streams : ctx_test {
     }
 };
 
+// - decode the prompt and four more tokens into sequence 0, whole in the first stream: the reference
+// - decode the prompt with another first half into sequence 5: how much another context changes the logits
+// - decode the first half of the prompt into sequence 1 in the first stream, let the sequence take its further cells
+//   from a second stream, and decode the rest
+// - verify that it produces the reference's logits, far closer than the other context does, and that the cache answers
+//   for it as for any sequence
+// - without a recurrent state: remove its end, across both streams, decode that again and compare again
+// - copy it to an empty sequence, remove it, and verify that the copy goes on like the reference
+// - decode the prompt into sequence 4, whole in the second stream, and then two tokens of the copy in a batch like
+//   its last one: the graph changes for a batch with cells in two streams when nothing else is different
+// - save the state of the copy, restore it into another sequence, and verify that this one goes on like the reference
+struct case_stream_span : ctx_test {
+    const char * name() const override { return "span"; }
+
+    const char * description() const override {
+        return "a sequence with cells in two streams decodes like one that is whole in the first stream";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 512;
+        opts.n_seq_max  = 6;
+        opts.kv_unified = 1;
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        llama_memory_t mem = llama_get_memory(ctx.get());
+
+        const int32_t strm = llama_memory_stream_add(mem, stream_dev(), 192, true);
+        if (strm < 0) {
+            return case_result::skip("the memory has no streams");
+        }
+
+        const llama_pos n_tokens = (llama_pos) std::min<size_t>(mr.tokens.size(), 80);
+        CTX_REQUIRE(n_tokens >= 16, "the prompt is too short");
+
+        const llama_pos n_half = n_tokens/2;
+        const int       n_more = 4;
+
+        // the prompt, and tokens to go on with
+        llama_tokens tokens(mr.tokens.begin(), mr.tokens.begin() + n_tokens);
+        for (int i = 0; i < n_more; ++i) {
+            tokens.push_back(mr.tokens[(3*i + 1) % n_tokens]);
+        }
+
+        // the reference: the logits after the prompt, and after each of the further tokens
+        std::vector<float> logits_ref[n_more + 1];
+        if (!decode_seq(ctx.get(), tokens, 0, n_tokens - 1, 0, false)) {
+            return case_result::fail();
+        }
+        for (int i = 0; i <= n_more; ++i) {
+            if (!decode_seq(ctx.get(), tokens, n_tokens - 1 + i, n_tokens + i, 0, true) || !get_current_logits(ctx.get(), logits_ref[i])) {
+                return case_result::fail();
+            }
+        }
+
+        // What another context does to the logits after the prompt: other tokens in its first half, those of the
+        // prompt's second half. A sequence that lost the cells of one stream is off by about as much, and one that has
+        // them all by far less.
+        double nmse_other = 0.0;
+        {
+            llama_tokens tokens_other = tokens;
+            for (llama_pos i = 0; i < n_half; ++i) {
+                tokens_other[i] = tokens[n_half + (i*7 + 3) % (n_tokens - n_half)];
+            }
+
+            std::vector<float> logits_other;
+            if (!decode_seq(ctx.get(), tokens_other, 0, n_tokens - 1, 5, false) ||
+                !decode_seq(ctx.get(), tokens_other, n_tokens - 1, n_tokens, 5, true) ||
+                !get_current_logits(ctx.get(), logits_other) ||
+                !seq_rm(ctx.get(), 5)) {
+                return case_result::fail();
+            }
+            nmse_other = compare_logits(logits_ref[0].data(), logits_other.data(), logits_ref[0].size()).nmse();
+        }
+
+        // the reference once more, its last two tokens and the next two as batches of two: for the batches of two below
+        std::vector<float> logits_ref_pair[2];
+        if (!decode_seq(ctx.get(), tokens, 0, n_tokens - 2, 5, false) ||
+            !decode_seq(ctx.get(), tokens, n_tokens - 2, n_tokens, 5, true) ||
+            !get_current_logits(ctx.get(), logits_ref_pair[0]) ||
+            !decode_seq(ctx.get(), tokens, n_tokens, n_tokens + 2, 5, true) ||
+            !get_current_logits(ctx.get(), logits_ref_pair[1]) ||
+            !seq_rm(ctx.get(), 5)) {
+            return case_result::fail();
+        }
+
+        // a model whose logits do not move with its context cannot tell: its sequences are still checked for what the
+        // cache holds of them
+        const bool   can_tell   = nmse_other > 1e-10;
+        const double nmse_limit = can_tell ? std::min(NMSE_THRESHOLD, nmse_other/20) : NMSE_THRESHOLD;
+
+        const auto same = [&](const std::vector<float> & ref, const char * what) -> std::string {
+            std::vector<float> cur;
+            if (!get_current_logits(ctx.get(), cur)) {
+                return std::string(what) + ": no logits";
+            }
+            const logits_diff diff = compare_logits(ref.data(), cur.data(), ref.size());
+            if (diff.nmse() > nmse_limit) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "; another context: nmse %g", nmse_other);
+                return std::string(what) + " produced different logits than the sequence in one stream" + diff_str(diff) + buf;
+            }
+            return "";
+        };
+
+        // the first half in the first stream, the rest in the second
+        if (!decode_seq(ctx.get(), tokens, 0, n_half, 1, false)) {
+            return case_result::fail();
+        }
+        if (!llama_memory_seq_span_stream(mem, 1, strm)) {
+            return case_result::fail("the memory does not let a sequence take its further cells from a second stream");
+        }
+        if (!decode_seq(ctx.get(), tokens, n_half, n_tokens - 1, 1, false)) {
+            // An attention that reads the cells of one stream refuses the batch (llama_kv_cache_context::get_k), and so
+            // does a model without flash attention over the cells of each sequence: nothing of the batch is left, and
+            // the sequence is what it was. (A recurrent state cannot go back, after this failure as after any other.)
+            if (!mr.is_recurrent()) {
+                CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == n_half - 1, "a batch that was refused left cells behind");
+            }
+            CTX_REQUIRE(llama_memory_seq_rm(mem, 1, -1, -1) && llama_memory_seq_set_stream(mem, 1, 0), "seq 1 cannot go back to the first stream");
+            CTX_REQUIRE(llama_memory_stream_release(mem, strm), "the second stream holds cells of a batch that was refused");
+
+            return case_result::skip("the model's attention reads the cells of one stream: the batch was refused");
+        }
+        if (!decode_seq(ctx.get(), tokens, n_tokens - 1, n_tokens, 1, true)) {
+            TLOG_ERR("%s: failed to decode the last token of sequence 1 in the second stream\n", __func__);
+            return case_result::fail();
+        }
+
+        // a recurrent state is the state after the last token: such a memory starts there
+        if (!mr.is_recurrent()) {
+            CTX_REQUIRE(llama_memory_seq_pos_min(mem, 1) == 0, "seq 1 does not start at position 0");
+        }
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == n_tokens - 1, "seq 1 does not hold the prompt");
+        {
+            const std::string why = same(logits_ref[0], "seq 1, with cells in two streams,");
+            CTX_REQUIRE(why.empty(), why);
+        }
+
+        // a removal that reaches into both streams, and the same tokens again (a recurrent state cannot go back so far)
+        if (!mr.is_recurrent()) {
+            CTX_REQUIRE(llama_memory_seq_rm(mem, 1, n_half - 3, -1), "failed to remove the end of seq 1");
+            CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == n_half - 4, "seq 1 holds cells past the removal");
+            if (!decode_seq(ctx.get(), tokens, n_half - 3, n_tokens - 1, 1, false) ||
+                !decode_seq(ctx.get(), tokens, n_tokens - 1, n_tokens, 1, true)) {
+                return case_result::fail();
+            }
+            CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == n_tokens - 1, "seq 1 does not hold the prompt after the removal");
+
+            const std::string why = same(logits_ref[0], "seq 1, after a removal across both streams,");
+            CTX_REQUIRE(why.empty(), why);
+        }
+
+        // a copy shares the cells of both streams, and goes on by itself when the sequence it came from is gone
+        llama_memory_seq_cp(mem, 1, 2, -1, -1);
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 2) == n_tokens - 1, "the copy does not hold the prompt");
+        CTX_REQUIRE(llama_memory_seq_rm(mem, 1, -1, -1), "failed to remove seq 1");
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 1) == -1, "seq 1 holds cells after its removal");
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 2) == n_tokens - 1, "removing seq 1 took cells of its copy");
+
+        // A sequence that is whole in the second stream takes its new cells from the stream that the copy takes its
+        // own from. Its last two tokens are one batch, and so are the copy's next two: all that differs between the
+        // two batches is whether their sequence holds cells in the first stream as well. The second one must not run
+        // in the graph of the first, which reads one stream.
+        CTX_REQUIRE(llama_memory_seq_set_stream(mem, 4, strm), "failed to assign seq 4 to the second stream");
+        if (!decode_seq(ctx.get(), tokens, 0, n_tokens - 2, 4, false) ||
+            !decode_seq(ctx.get(), tokens, n_tokens - 2, n_tokens, 4, true)) {
+            return case_result::fail();
+        }
+        {
+            const std::string why = same(logits_ref_pair[0], "a sequence that is whole in the second stream");
+            CTX_REQUIRE(why.empty(), why);
+        }
+
+        if (!decode_seq(ctx.get(), tokens, n_tokens, n_tokens + 2, 2, true)) {
+            return case_result::fail();
+        }
+        {
+            const std::string why = same(logits_ref_pair[1], "the copy of seq 1, after a batch of its size without cells in the first stream,");
+            CTX_REQUIRE(why.empty(), why);
+        }
+
+        // a state holds the cells of both streams: restored into another sequence, it goes on like the reference
+        std::vector<uint8_t> state;
+        if (!get_seq_state(ctx.get(), 2, LLAMA_STATE_SEQ_FLAGS_NONE, state)) {
+            return case_result::fail("no state of a sequence with cells in two streams");
+        }
+        if (!set_seq_state(ctx.get(), 3, LLAMA_STATE_SEQ_FLAGS_NONE, state)) {
+            return case_result::fail("failed to restore the state of a sequence with cells in two streams");
+        }
+        CTX_REQUIRE(llama_memory_seq_pos_max(mem, 3) == n_tokens + 1, "the restored sequence does not hold what was saved");
+        if (!decode_seq(ctx.get(), tokens, n_tokens + 2, n_tokens + 3, 3, true)) {
+            return case_result::fail();
+        }
+        {
+            const std::string why = same(logits_ref[3], "the restored sequence");
+            CTX_REQUIRE(why.empty(), why);
+        }
+
+        // nothing of the sequences is left behind in either stream: each can go back to the first one, and the second
+        // stream can give its memory back
+        for (llama_seq_id seq_id = 0; seq_id < 6; ++seq_id) {
+            CTX_REQUIRE(llama_memory_seq_rm(mem, seq_id, -1, -1), "failed to remove seq " + std::to_string(seq_id));
+            CTX_REQUIRE(llama_memory_seq_set_stream(mem, seq_id, 0), "seq " + std::to_string(seq_id) + " still holds cells after its removal");
+        }
+        CTX_REQUIRE(llama_memory_stream_release(mem, strm), "the second stream still holds cells after every sequence was removed");
+
+        if (!can_tell) {
+            return case_result::skip("the model's logits do not move with its context: what its sequences hold was checked, their logits could not be");
+        }
+
+        return case_result::pass();
+    }
+};
+
 // - add a second stream to the cache and take the cells of sequence 1 from it
 // - decode the prompt and the reversed prompt alone, as the references
 // - decode the prompt into sequence 0 and the reversed prompt into sequence 1 in the same batches, their tokens interleaved
@@ -1508,6 +1727,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_seq_rm_isolated>());
     cases.push_back(std::make_unique<case_streams>());
     cases.push_back(std::make_unique<case_streams_batch>());
+    cases.push_back(std::make_unique<case_stream_span>());
     cases.push_back(std::make_unique<case_streams_multi>());
     cases.push_back(std::make_unique<case_streams_state>(false));
     cases.push_back(std::make_unique<case_streams_state>(true));

@@ -135,6 +135,13 @@ LLAMA_API size_t llama_memory_stream_size(llama_memory_t mem, int32_t strm);
 // Returns false if the sequence still has cells.
 LLAMA_API bool llama_memory_seq_set_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm);
 
+// Take the further cells of a sequence from a stream, and leave the cells that it has where they are: the sequence
+// then holds cells in two streams. Attention runs over each stream's cells where they are and the two results are
+// combined (ggml_flash_attn_ext_rows_partial), which needs flash attention over the cells of each sequence, as a
+// unified cache has it by default; a batch that cannot have it is refused. A copy and a removal cover both streams,
+// and a state of the sequence holds the cells of both. Returns false if the memory cannot do that.
+LLAMA_API bool llama_memory_seq_span_stream(llama_memory_t mem, llama_seq_id seq_id, int32_t strm);
+
 //
 // Lazy sequence memory (llama_context_params::n_seq_budget)
 //
