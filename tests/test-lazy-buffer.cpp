@@ -35,6 +35,10 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#include <dxgi1_4.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "dxgi.lib")
+#endif
 #endif
 
 static int n_fail = 0;
@@ -917,6 +921,173 @@ static void test_refusals(ggml_backend_dev_t dev) {
     printf("%s: steps that the driver refuses\n", name);
 }
 
+#ifdef _WIN32
+// The system memory that this process has pinned for a GPU, as Windows counts it (the non-local segment group of the
+// adapter), for the adapter with the description of the device. Null where there is none.
+static IDXGIAdapter3 * pinned_meter(ggml_backend_dev_t dev) {
+    IDXGIFactory4 * factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void **) &factory))) {
+        return nullptr;
+    }
+    IDXGIAdapter3 * res = nullptr;
+    IDXGIAdapter1 * a1  = nullptr;
+    for (UINT i = 0; res == nullptr && factory->EnumAdapters1(i, &a1) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 desc;
+        char text[128] = "";
+        if (SUCCEEDED(a1->GetDesc1(&desc))) {
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, text, sizeof(text), nullptr, nullptr);
+        }
+        if (strcmp(text, ggml_backend_dev_description(dev)) == 0) {
+            a1->QueryInterface(__uuidof(IDXGIAdapter3), (void **) &res);
+        }
+        a1->Release();
+    }
+    factory->Release();
+    return res;
+}
+
+static size_t pinned_now(IDXGIAdapter3 * adapter) {
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    if (FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
+        return 0;
+    }
+    return (size_t) info.CurrentUsage;
+}
+#endif
+
+// A read of many tensors with one call pins no system memory for the device while it runs. On Windows every range of
+// system memory that is pinned for a GPU gets page tables in the card's own memory at that moment, one of 4 KiB for
+// every 2 MiB, and the memory manager places them only in gaps it finds by its own rules. A card whose memory is
+// mapped in pieces while the program runs (a lazy buffer) may have none left: then the device is marked as failed and
+// every call to it answers "out of memory", with memory of the card free. A server stopped that way when it saved a
+// state of 1.2 GiB, whose destination the read had registered. What a read needs pinned is there before it starts:
+// the first read of a device may pin it, and no read after that pins more.
+static void test_read_pins_nothing(ggml_backend_dev_t dev) {
+#ifdef _WIN32
+    const char * name = ggml_backend_dev_name(dev);
+    if (strncmp(name, "CUDA", 4) != 0) {
+        return;
+    }
+
+    IDXGIAdapter3 * meter = pinned_meter(dev);
+    CHECK(meter != nullptr);
+    if (!meter) {
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    // the tensors of a state: many small ranges of all sizes, which the device gathers, some of a few MiB, and two
+    // that are larger than anything a read would keep pinned
+    std::vector<size_t> full;
+    for (size_t i = 0; i < 6000; i++) {
+        full.push_back(200 + (i*7919) % 130000); // some are a little over what is gathered
+    }
+    for (size_t i = 0; i < 16; i++) {
+        full.push_back(3*MiB);
+    }
+    for (size_t i = 0; i < 2; i++) {
+        full.push_back(80*MiB + 4096);
+    }
+
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+
+    std::vector<size_t> at;
+    size_t size_buf = 0;
+    for (const size_t s : full) {
+        at.push_back(size_buf);
+        size_buf += GGML_PAD(s, align);
+    }
+
+    ggml_backend_buffer_ptr buf(ggml_backend_buft_alloc_buffer(buft, size_buf));
+    CHECK(buf != nullptr);
+    if (!buf) {
+        meter->Release();
+        return;
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead()*(full.size() + 1), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+
+    char * base = (char *) ggml_backend_buffer_get_base(buf.get());
+
+    // each range is read without its first 32 and last 32 bytes, from a place of its own alignment
+    std::vector<const ggml_tensor *> tensors;
+    std::vector<size_t> offsets;
+    std::vector<size_t> sizes;
+    std::vector<size_t> data_offsets;
+    std::vector<uint8_t> expected;
+    {
+        std::vector<uint8_t> data(*std::max_element(full.begin(), full.end()));
+        for (size_t i = 0; i < full.size(); i++) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, (int64_t) full[i]);
+            CHECK(ggml_backend_tensor_alloc(buf.get(), t, base + at[i]) == GGML_STATUS_SUCCESS);
+            for (size_t j = 0; j < full[i]; j++) {
+                data[j] = (uint8_t) (i*37 + j*3 + (j >> 12) + 11);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, full[i]);
+
+            const size_t skip = 32 + i % 7;
+            tensors.push_back(t);
+            offsets.push_back(skip);
+            sizes.push_back(full[i] - skip - 32);
+            data_offsets.push_back(expected.size());
+            expected.insert(expected.end(), data.begin() + skip, data.begin() + (full[i] - 32));
+        }
+    }
+    const size_t size_host = expected.size();
+
+    const auto read_is_right = [&](std::vector<uint8_t> & back) {
+        ggml_backend_tensor_get_n(tensors.data(), back.data(), offsets.data(), sizes.data(), data_offsets.data(), tensors.size());
+        return back == expected;
+    };
+
+    // the first read of the device may pin what reads go through
+    {
+        std::vector<uint8_t> back(size_host, 0xee);
+        CHECK(read_is_right(back));
+    }
+
+    // and the next one pins nothing: the most that is pinned while it runs is what was pinned before it
+    std::vector<uint8_t> back(size_host, 0xee);
+
+    const size_t pinned_before = pinned_now(meter);
+    std::atomic<size_t> pinned_most{pinned_before};
+    std::atomic<bool>   sampling{true};
+    std::thread sampler([&]() {
+        while (sampling) {
+            const size_t now = pinned_now(meter);
+            size_t most = pinned_most.load();
+            while (now > most && !pinned_most.compare_exchange_weak(most, now)) {
+            }
+        }
+    });
+
+    n_refused_reads = 0;
+    const bool right = read_is_right(back);
+
+    sampling = false;
+    sampler.join();
+
+    CHECK(right);
+    CHECK(n_refused_reads == 0);
+
+    const size_t rise = pinned_most.load() - pinned_before;
+    if (rise >= 8*MiB) {
+        printf("  %s: a read of %zu MiB pinned %zu MiB of system memory for the device while it ran\n", name, size_host/MiB, rise/MiB);
+    }
+    CHECK(rise < 8*MiB);
+
+    meter->Release();
+
+    if (right && rise < 8*MiB) {
+        printf("%s: a read of %zu tensors, %zu MiB, pins nothing while it runs\n", name, tensors.size(), size_host/MiB);
+    }
+#else
+    (void) dev;
+#endif
+}
+
 int main(int argc, char ** argv) {
     ggml_log_set(log_counting, nullptr);
 
@@ -948,6 +1119,7 @@ int main(int argc, char ** argv) {
         test_buft(ggml_backend_dev_buffer_type(dev), backend.get(), name, is_must);
         test_threads(ggml_backend_dev_buffer_type(dev), name);
         test_refusals(dev);
+        test_read_pins_nothing(dev);
     }
 
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {

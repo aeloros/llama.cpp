@@ -3,6 +3,9 @@
 #include "ggml-cpp.h"
 
 #include <climits>
+#include <cstring>
+#include <mutex>
+#include <vector>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 struct ggml_cuda_batch_get_descriptor {
@@ -50,6 +53,74 @@ static __global__ void ggml_cuda_batch_get_kernel(const ggml_cuda_batch_get_desc
     }
 }
 
+#if defined(_WIN32)
+// On Windows a batched read pins no host memory while it runs: it goes through a stage, memory of the host that is
+// pinned and mapped for the device once and kept, and the host copies from there to where the bytes belong.
+//
+// Why: under WDDM the graphics memory manager builds page tables for pinned host memory inside the device's own
+// memory at the moment the memory is pinned, one table of 4 KiB for every 2 MiB, and it places them only in gaps that
+// it finds by rules of its own. A read that registered its destination asked for some hundred to some thousand of
+// them at every call (690 for a state of 1.4 GiB). A device whose memory is mapped in pieces while the program runs
+// (a lazy buffer) fills those gaps; then no place is found for a table, the manager marks the device as failed
+// ("Unrecoverable page in failure", device state D3DKMT_DEVICEEXECUTION_ERROR_OUTOFMEMORY), and every call to the
+// device answers "out of memory" from then on, with gigabytes of it free. A server whose sequence memory was lazy
+// stopped that way in the read of a state. The stage's tables are made once, when the backend of the device is
+// made, and nothing is added for a read.
+struct ggml_cuda_batch_get_stage {
+    std::mutex mutex; // one read of a device goes through its stage at a time
+
+    unsigned char * host = nullptr;   // pinned and mapped: the list of the small ranges, then the bytes
+    unsigned char * device = nullptr; // where the device has it
+    ggml_cuda_batch_get_descriptor * device_copies = nullptr; // the list on the device
+    bool tried = false;
+};
+
+// the bytes of a stage, and the small ranges of one launch of the kernel
+static constexpr size_t ggml_cuda_batch_get_stage_bytes = 64ull * 1024 * 1024;
+static constexpr size_t ggml_cuda_batch_get_stage_copies = 128 * 1024;
+static constexpr size_t ggml_cuda_batch_get_stage_list_bytes = ggml_cuda_batch_get_stage_copies * sizeof(ggml_cuda_batch_get_descriptor);
+
+static ggml_cuda_batch_get_stage & ggml_cuda_batch_get_stage_of(int device) {
+    static ggml_cuda_batch_get_stage stages[GGML_CUDA_MAX_DEVICES];
+    return stages[device];
+}
+
+// With the stage's mutex held and its device current. False when the driver does not give the memory: it is not
+// asked again, and reads of the device take the plain copies.
+static bool ggml_cuda_batch_get_stage_make(ggml_cuda_batch_get_stage & stage) {
+    if (stage.host != nullptr) {
+        return true;
+    }
+    if (stage.tried) {
+        return false;
+    }
+    stage.tried = true;
+
+    void * host = nullptr;
+    cudaError_t err = cudaHostAlloc(&host, ggml_cuda_batch_get_stage_list_bytes + ggml_cuda_batch_get_stage_bytes, cudaHostAllocMapped);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_DEBUG("%s: failed to allocate %.2f MiB of pinned memory: %s\n", __func__,
+                       (ggml_cuda_batch_get_stage_list_bytes + ggml_cuda_batch_get_stage_bytes) / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+
+    void * device = nullptr;
+    void * device_copies = nullptr;
+    if (cudaHostGetDevicePointer(&device, host, 0) != cudaSuccess ||
+            cudaMalloc(&device_copies, ggml_cuda_batch_get_stage_list_bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cudaFreeHost(host);
+        (void) cudaGetLastError();
+        return false;
+    }
+
+    stage.host = static_cast<unsigned char *>(host);
+    stage.device = static_cast<unsigned char *>(device);
+    stage.device_copies = static_cast<ggml_cuda_batch_get_descriptor *>(device_copies);
+    return true;
+}
+#else
 struct ggml_cuda_batch_get_mapping {
     void * host = nullptr;
     unsigned char * device = nullptr;
@@ -80,14 +151,15 @@ struct ggml_cuda_batch_get_mapping {
         }
     }
 };
+#endif // defined(_WIN32)
 
-// The batched read is a faster way to the same bytes, and it asks more of the driver: its destination is registered,
-// and the device writes into it. When the driver refuses a step of it the read declines, and the caller reads the
-// ranges one by one, as it does when the memory cannot be registered. Before, a refusal ended the program: a server
-// on Windows whose system was at its commit limit (ggml_cuda_host_commit_free) got "out of memory" for a copy into
-// the registered memory with 2 GB of the device free, and with plain copies alone it ran on at the same limit.
-// What was queued before the refusal writes into the registered memory, so it is waited for before the registration
-// ends.
+// The batched read is a faster way to the same bytes, and it asks more of the driver: the device writes into pinned
+// memory of the host. When the driver refuses a step of it the read declines, and the caller reads the ranges one by
+// one, as it does when there is no pinned memory to be had. Before, a refusal ended the program: a server on Windows
+// whose system was at its commit limit (ggml_cuda_host_commit_free) got "out of memory" for a copy into the pinned
+// memory with 2 GB of the device free, and with plain copies alone it ran on at the same limit.
+// What was queued before the refusal writes into the pinned memory, so it is waited for before that memory is let
+// go or used again.
 static bool ggml_cuda_batch_get_decline(int device, cudaError_t err, const char * what, size_t n_reads, size_t n_bytes) {
     (void) cudaGetLastError();
     (void) cudaStreamSynchronize(cudaStreamPerThread);
@@ -102,6 +174,18 @@ static bool ggml_cuda_batch_get_decline(int device, cudaError_t err, const char 
     return false;
 }
 #endif
+
+void ggml_cuda_batch_get_prepare(int device) {
+#if defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_set_device(device);
+
+    ggml_cuda_batch_get_stage & stage = ggml_cuda_batch_get_stage_of(device);
+    std::lock_guard<std::mutex> lock(stage.mutex);
+    (void) ggml_cuda_batch_get_stage_make(stage);
+#else
+    GGML_UNUSED(device);
+#endif
+}
 
 bool ggml_cuda_get_tensor_n(int device,
         const ggml_tensor * const * tensors, void * const * data, const size_t * offsets,
@@ -153,6 +237,111 @@ bool ggml_cuda_get_tensor_n(int device,
             return false;
         }
     }
+#if defined(_WIN32)
+    ggml_cuda_batch_get_stage & stage = ggml_cuda_batch_get_stage_of(device);
+    std::lock_guard<std::mutex> lock(stage.mutex);
+    if (!ggml_cuda_batch_get_stage_make(stage)) {
+        return false;
+    }
+
+    auto * copies = reinterpret_cast<ggml_cuda_batch_get_descriptor *>(stage.host);
+    unsigned char * const stage_host = stage.host + ggml_cuda_batch_get_stage_list_bytes;
+    unsigned char * const stage_device = stage.device + ggml_cuda_batch_get_stage_list_bytes;
+
+    // What the device was given for the stage and where its bytes belong; `used` bytes of the stage are spoken for.
+    struct placed {
+        void * dst;
+        size_t at;
+        size_t size;
+    };
+    std::vector<placed> group;
+    size_t used = 0;
+
+    cudaError_t err = cudaSuccess;
+
+    // Waits for the device, then the host copies the group on and the stage is free again.
+    const auto flush = [&]() {
+        err = cudaStreamSynchronize(cudaStreamPerThread);
+        if (err != cudaSuccess) {
+            return false;
+        }
+        for (const placed & p : group) {
+            memcpy(p.dst, stage_host + p.at, p.size);
+        }
+        group.clear();
+        used = 0;
+        return true;
+    };
+
+    // Reads selected for gather; false means all reads use DMA.
+    const bool gather = n_reads_small >= min_batch_reads;
+    if (gather) {
+        const int threads = 256;
+        const size_t nsm = ggml_cuda_info().devices[device].nsm;
+        size_t i = 0;
+        while (i < n_tensors) {
+            // as many small ranges as the list and the stage hold
+            size_t count = 0;
+            for (; i < n_tensors && count < ggml_cuda_batch_get_stage_copies; ++i) {
+                if (sizes[i] == 0 || sizes[i] > max_gather_read_bytes) {
+                    continue;
+                }
+                const size_t at = GGML_PAD(used, 16);
+                if (at + sizes[i] > ggml_cuda_batch_get_stage_bytes) {
+                    break;
+                }
+                copies[count++] = {(const unsigned char *) tensors[i]->data + offsets[i], stage_device + at, sizes[i]};
+                group.push_back({data[i], at, sizes[i]});
+                used = at + sizes[i];
+            }
+            if (count == 0) {
+                break;
+            }
+            const size_t blocks_per_copy = std::min<size_t>(UINT16_MAX, std::max<size_t>(1, (nsm + count - 1) / count));
+            const dim3 blocks((unsigned int) count, (unsigned int) blocks_per_copy);
+            // Stream ordering keeps the kernel behind the copy of its list; the list is written again after the wait.
+            err = cudaMemcpyAsync(stage.device_copies, copies, count * sizeof(copies[0]), cudaMemcpyHostToDevice, cudaStreamPerThread);
+            if (err != cudaSuccess) {
+                return ggml_cuda_batch_get_decline(device, err, "the copy of the list of small ranges", n_reads, payload_bytes);
+            }
+            ggml_cuda_batch_get_kernel<<<blocks, threads, 0, cudaStreamPerThread>>>(stage.device_copies, count);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                return ggml_cuda_batch_get_decline(device, err, "the kernel that gathers the small ranges", n_reads, payload_bytes);
+            }
+            if (!flush()) {
+                return ggml_cuda_batch_get_decline(device, err, "the wait for the small ranges", n_reads, payload_bytes);
+            }
+        }
+    }
+    // The other ranges: copied by the device into the stage, a range that is larger than the stage in parts.
+    size_t n_dma = 0;
+    for (size_t i = 0; i < n_tensors; ++i) {
+        if (sizes[i] == 0 || (gather && sizes[i] <= max_gather_read_bytes)) {
+            continue;
+        }
+        size_t done = 0;
+        while (done < sizes[i]) {
+            if (used == ggml_cuda_batch_get_stage_bytes && !flush()) {
+                return ggml_cuda_batch_get_decline(device, err, "the wait for the copies", n_reads, payload_bytes);
+            }
+            const size_t n = std::min(sizes[i] - done, ggml_cuda_batch_get_stage_bytes - used);
+            err = n_dma > 0 && ggml_cuda_debug_refuse("batch-get") ? cudaErrorMemoryAllocation :
+                cudaMemcpyAsync(stage_host + used, (const char *) tensors[i]->data + offsets[i] + done, n, cudaMemcpyDeviceToHost, cudaStreamPerThread);
+            if (err != cudaSuccess) {
+                return ggml_cuda_batch_get_decline(device, err, "a copy into the pinned memory", n_reads, payload_bytes);
+            }
+            group.push_back({(unsigned char *) data[i] + done, used, n});
+            used += n;
+            done += n;
+            n_dma++;
+        }
+    }
+    if (!group.empty() && !flush()) {
+        return ggml_cuda_batch_get_decline(device, err, "the wait for the copies", n_reads, payload_bytes);
+    }
+    return true;
+#else
     // Find the CPU span to register, including gaps between destinations.
     const uintptr_t begin = ranges.front().first;
     const uintptr_t end = ranges.back().second;
@@ -234,5 +423,6 @@ bool ggml_cuda_get_tensor_n(int device,
         return ggml_cuda_batch_get_decline(device, err, "the wait for the copies", n_reads, payload_bytes);
     }
     return true;
+#endif // defined(_WIN32)
 #endif
 }

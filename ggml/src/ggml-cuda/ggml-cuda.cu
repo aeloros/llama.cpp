@@ -7393,6 +7393,11 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
 
+    // what reads of many tensors go through is pinned now, and not when a state is read
+    if (!ggml_cuda_pinned_memory_disabled()) {
+        ggml_cuda_batch_get_prepare(device);
+    }
+
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
         /* .iface   = */ ggml_backend_cuda_interface,
